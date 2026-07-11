@@ -20,7 +20,7 @@ QFrame#TagChip { background: rgba(236,240,246,210); border-radius: 6px; }
 QLabel#Muted { color: #6f7b8d; }
 QLabel#SectionTitle { font-size: 15px; font-weight: 600; color: #273247; }
 QLabel#Title { font-size: 17px; font-weight: 600; }
-QLabel#BrandTitle { font-size: 38px; font-weight: 700; color: #168fe8; }
+QLabel#BrandTitle { font-size: 30px; font-weight: 700; color: #79cafc; }
 QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     background: rgba(255,255,255,190);
     border: 1px solid rgba(99,115,139,55);
