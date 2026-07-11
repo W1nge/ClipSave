@@ -159,7 +159,7 @@ class NavButton(QPushButton):
         if self.collapsed:
             self.setText("")
             self.setToolTip(self.label)
-            self.setStyleSheet("text-align:center;")
+            self.setStyleSheet("text-align:left;")
         else:
             suffix = f"    {self.count:,}" if self.count is not None else ""
             self.setText(f"{self.label}{suffix}")
@@ -207,6 +207,9 @@ class Sidebar(QWidget):
         self.collapse_button = IconButton("menu", "收起侧栏")
         self.collapse_button.clicked.connect(self.toggle_collapsed)
         header.addWidget(self.collapse_button)
+        self.brand = QLabel("ClipSave")
+        self.brand.setObjectName("Title")
+        header.addWidget(self.brand)
         header.addStretch()
         self.layout_root.addLayout(header)
         self.layout_root.addSpacing(10)
@@ -303,6 +306,7 @@ class Sidebar(QWidget):
 
     def set_collapsed(self, value: bool, animate: bool = True) -> None:
         self.collapsed = value
+        self.brand.setVisible(not value)
         self.collapse_button.setIcon(lucide_icon("panel-left-open" if value else "panel-left-close"))
         self.collection_heading.setVisible(not value)
         self.tag_heading.setVisible(not value)

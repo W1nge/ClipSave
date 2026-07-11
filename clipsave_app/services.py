@@ -20,6 +20,9 @@ from .constants import MARKDOWN_DIR, MAX_IMAGE_PIXELS, PICTURE_DIR
 from .database import LibraryDatabase
 
 
+_TRANSPARENT_SMALL_ICON = None
+
+
 class ClipboardService(QObject):
     captured = Signal(int)
     failed = Signal(str)
@@ -179,7 +182,7 @@ def apply_windows_acrylic(window) -> bool:
             backdrop = ctypes.c_int(3)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
         else:
-            # Windows 10 uses the native acrylic composition policy instead.
+            # Blur-behind avoids the severe resize/drag stalls caused by Win10 acrylic.
             class AccentPolicy(ctypes.Structure):
                 _fields_ = [
                     ("accent_state", ctypes.c_int),
@@ -195,18 +198,28 @@ def apply_windows_acrylic(window) -> bool:
                     ("size", ctypes.c_size_t),
                 ]
 
-            # 0xCC alpha leaves 20% of the blurred desktop visible through the tint.
-            policy = AccentPolicy(4, 2, 0xCCFFFFFF, 0)
+            # The sidebar and toolbar provide their own tint. Keeping the native
+            # layer untinted avoids stacking two white alpha layers.
+            policy = AccentPolicy(3, 0, 0x00FFFFFF, 0)
             data = WindowCompositionAttributeData(19, ctypes.addressof(policy), ctypes.sizeof(policy))
             ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
         corner = ctypes.c_int(2)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner))
         dark = ctypes.c_int(0)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))
-        # Keep the native titlebar controls but clear the app identity at its left edge.
+        # Keep native window controls and taskbar branding, but make the small
+        # titlebar icon fully transparent. Passing NULL makes Windows show its
+        # generic fallback icon instead.
+        global _TRANSPARENT_SMALL_ICON
+        if _TRANSPARENT_SMALL_ICON is None:
+            mask = (ctypes.c_ubyte * 32)(*([0xFF] * 32))
+            pixels = (ctypes.c_ubyte * 32)(*([0x00] * 32))
+            create_icon = ctypes.windll.user32.CreateIcon
+            create_icon.restype = ctypes.c_void_p
+            _TRANSPARENT_SMALL_ICON = create_icon(None, 16, 16, 1, 1, mask, pixels)
         ctypes.windll.user32.SetWindowTextW(hwnd, "")
-        ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, 0)
-        ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, 0)
+        ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, _TRANSPARENT_SMALL_ICON)
+        ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 2, _TRANSPARENT_SMALL_ICON)
         return True
     except (AttributeError, OSError):
         return False

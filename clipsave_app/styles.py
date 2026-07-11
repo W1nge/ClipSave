@@ -36,7 +36,7 @@ QPushButton:hover { background: rgba(39,75,125,18); }
 QPushButton:pressed { background: rgba(39,75,125,30); }
 QPushButton#Primary { background: #2f7df6; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #246be0; }
-QPushButton#NavButton { text-align: left; padding: 9px 12px; border-radius: 6px; }
+QPushButton#NavButton { text-align: left; padding: 9px 7px; border-radius: 6px; }
 QPushButton#NavButton[active="true"] { background: rgba(47,125,246,18); color: #135fc7; font-weight: 600; }
 QPushButton#IconButton { min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px; padding: 0; }
 QPushButton#CaptureStatus { min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px; padding: 0; border-radius: 6px; }
