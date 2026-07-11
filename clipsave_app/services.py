@@ -20,9 +20,6 @@ from .constants import MARKDOWN_DIR, MAX_IMAGE_PIXELS, PICTURE_DIR
 from .database import LibraryDatabase
 
 
-_TRANSPARENT_SMALL_ICON = None
-
-
 class ClipboardService(QObject):
     captured = Signal(int)
     failed = Signal(str)
@@ -207,19 +204,6 @@ def apply_windows_acrylic(window) -> bool:
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner))
         dark = ctypes.c_int(0)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))
-        # Keep native window controls and taskbar branding, but make the small
-        # titlebar icon fully transparent. Passing NULL makes Windows show its
-        # generic fallback icon instead.
-        global _TRANSPARENT_SMALL_ICON
-        if _TRANSPARENT_SMALL_ICON is None:
-            mask = (ctypes.c_ubyte * 32)(*([0xFF] * 32))
-            pixels = (ctypes.c_ubyte * 32)(*([0x00] * 32))
-            create_icon = ctypes.windll.user32.CreateIcon
-            create_icon.restype = ctypes.c_void_p
-            _TRANSPARENT_SMALL_ICON = create_icon(None, 16, 16, 1, 1, mask, pixels)
-        ctypes.windll.user32.SetWindowTextW(hwnd, "")
-        ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, _TRANSPARENT_SMALL_ICON)
-        ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 2, _TRANSPARENT_SMALL_ICON)
         return True
     except (AttributeError, OSError):
         return False

@@ -5,6 +5,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from clipsave_app.app import create_app_icon
@@ -36,6 +37,14 @@ class MainWindowTests(unittest.TestCase):
 
     def test_panels_and_navigation(self):
         self.assertEqual(self.window.windowTitle(), "")
+        self.assertTrue(self.window.windowFlags() & Qt.WindowType.FramelessWindowHint)
+        self.assertEqual(self.window.window_title_bar.height(), 32)
+        self.window.window_title_bar.maximize_button.click()
+        self.app.processEvents()
+        self.assertTrue(self.window.isMaximized())
+        self.window.window_title_bar.maximize_button.click()
+        self.app.processEvents()
+        self.assertFalse(self.window.isMaximized())
         self.assertFalse(hasattr(self.window, "capture_state"))
         self.assertFalse(hasattr(self.window.sidebar, "brand_icon"))
         self.assertEqual(self.window.sidebar.brand.text(), "ClipSave")

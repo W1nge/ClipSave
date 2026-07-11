@@ -5,6 +5,8 @@ LIGHT_STYLESHEET = """
     color: #172033;
 }
 QMainWindow, QWidget#AppRoot { background: transparent; }
+QWidget#WindowBody { background: transparent; }
+QFrame#WindowTitleBar { background: rgba(255, 255, 255, 204); border: 0; }
 QWidget#Sidebar { background: rgba(255, 255, 255, 204); border-right: 1px solid rgba(115, 129, 150, 42); }
 QWidget#ContentSurface { background: transparent; }
 QWidget#DetailPanel { background: rgba(249, 251, 254, 248); border-left: 1px solid rgba(115, 129, 150, 44); }
@@ -39,6 +41,10 @@ QPushButton#Primary:hover { background: #246be0; }
 QPushButton#NavButton { text-align: left; padding: 9px 7px; border-radius: 6px; }
 QPushButton#NavButton[active="true"] { background: rgba(47,125,246,18); color: #135fc7; font-weight: 600; }
 QPushButton#IconButton { min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px; padding: 0; }
+QPushButton#WindowButton { min-width: 46px; max-width: 46px; min-height: 32px; max-height: 32px; padding: 0; border-radius: 0; }
+QPushButton#WindowButton:hover { background: rgba(39,75,125,24); }
+QPushButton#CloseWindowButton { min-width: 46px; max-width: 46px; min-height: 32px; max-height: 32px; padding: 0; border-radius: 0; }
+QPushButton#CloseWindowButton:hover { background: #c42b1c; }
 QPushButton#CaptureStatus { min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px; padding: 0; border-radius: 6px; }
 QPushButton#CaptureStatus:hover { background: rgba(255,255,255,80); }
 QScrollArea { border: 0; background: transparent; }

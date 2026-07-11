@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import threading
+from ctypes import wintypes
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,6 +44,7 @@ from .widgets import (
     MarkdownDialog,
     SettingsDialog,
     Sidebar,
+    WindowTitleBar,
     lucide_icon,
 )
 
@@ -69,6 +72,7 @@ class MainWindow(QMainWindow):
         self.force_quit = False
 
         self.setWindowTitle("")
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.resize(1440, 880)
         self.setMinimumSize(980, 640)
         self.setStyleSheet(LIGHT_STYLESHEET)
@@ -94,9 +98,22 @@ class MainWindow(QMainWindow):
         root = QWidget()
         root.setObjectName("AppRoot")
         self.setCentralWidget(root)
-        root_layout = QHBoxLayout(root)
+        root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
+
+        self.window_title_bar = WindowTitleBar()
+        self.window_title_bar.minimize_button.clicked.connect(self.showMinimized)
+        self.window_title_bar.maximize_button.clicked.connect(self.toggle_maximized)
+        self.window_title_bar.close_button.clicked.connect(self.close)
+        root_layout.addWidget(self.window_title_bar)
+
+        body = QWidget()
+        body.setObjectName("WindowBody")
+        body_layout = QHBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(0)
+        root_layout.addWidget(body, 1)
 
         self.sidebar = Sidebar()
         self.sidebar.navigation_requested.connect(self.navigate)
@@ -104,14 +121,14 @@ class MainWindow(QMainWindow):
         self.sidebar.add_tag_requested.connect(self.add_global_tag)
         self.sidebar.settings_requested.connect(self.open_settings)
         self.sidebar.collapsed_changed.connect(lambda value: self.settings.set("sidebar_collapsed", value))
-        root_layout.addWidget(self.sidebar)
+        body_layout.addWidget(self.sidebar)
 
         middle = QWidget()
         middle.setObjectName("ContentSurface")
         middle_layout = QVBoxLayout(middle)
         middle_layout.setContentsMargins(0, 0, 0, 0)
         middle_layout.setSpacing(0)
-        root_layout.addWidget(middle, 1)
+        body_layout.addWidget(middle, 1)
 
         top_bar = QFrame()
         top_bar.setObjectName("TopBar")
@@ -207,6 +224,46 @@ class MainWindow(QMainWindow):
         self.search_timer.timeout.connect(self.refresh_items)
         self.set_view_mode(self.settings.get("view_mode", "grid"))
         self.sidebar.set_collapsed(bool(self.settings.get("sidebar_collapsed", False)), animate=False)
+
+    def toggle_maximized(self) -> None:
+        self.showNormal() if self.isMaximized() else self.showMaximized()
+        self.window_title_bar.update_maximize_state(self.isMaximized())
+
+    def changeEvent(self, event) -> None:
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "window_title_bar"):
+            self.window_title_bar.update_maximize_state(self.isMaximized())
+        super().changeEvent(event)
+
+    def nativeEvent(self, event_type, message):
+        if os.name == "nt" and event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == 0x0084 and not self.isMaximized():  # WM_NCHITTEST
+                rect = wintypes.RECT()
+                ctypes.windll.user32.GetWindowRect(int(self.winId()), ctypes.byref(rect))
+                x = ctypes.c_short(msg.lParam & 0xFFFF).value
+                y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+                border = max(6, round(6 * self.devicePixelRatioF()))
+                left = x < rect.left + border
+                right = x >= rect.right - border
+                top = y < rect.top + border
+                bottom = y >= rect.bottom - border
+                if top and left:
+                    return True, 13  # HTTOPLEFT
+                if top and right:
+                    return True, 14  # HTTOPRIGHT
+                if bottom and left:
+                    return True, 16  # HTBOTTOMLEFT
+                if bottom and right:
+                    return True, 17  # HTBOTTOMRIGHT
+                if left:
+                    return True, 10  # HTLEFT
+                if right:
+                    return True, 11  # HTRIGHT
+                if top:
+                    return True, 12  # HTTOP
+                if bottom:
+                    return True, 15  # HTBOTTOM
+        return super().nativeEvent(event_type, message)
 
     def build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.app_icon, self)

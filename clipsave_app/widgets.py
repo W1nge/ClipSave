@@ -140,6 +140,57 @@ class CaptureStatusButton(QPushButton):
         self.setToolTip("本地自动捕获已开启" if active else "本地自动捕获已暂停")
 
 
+class WindowTitleBar(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("WindowTitleBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(32)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addStretch(1)
+
+        self.minimize_button = self._window_button("minus", "最小化")
+        self.maximize_button = self._window_button("square", "最大化")
+        self.close_button = self._window_button("x", "关闭")
+        self.close_button.setObjectName("CloseWindowButton")
+        layout.addWidget(self.minimize_button)
+        layout.addWidget(self.maximize_button)
+        layout.addWidget(self.close_button)
+
+    @staticmethod
+    def _window_button(glyph: str, tooltip: str) -> IconButton:
+        button = IconButton(glyph, tooltip)
+        button.setObjectName("WindowButton")
+        button.setFixedSize(46, 32)
+        button.setIconSize(QSize(14, 14))
+        return button
+
+    def update_maximize_state(self, maximized: bool) -> None:
+        self.maximize_button.setIcon(lucide_icon("copy" if maximized else "square", size=14))
+        self.maximize_button.setToolTip("还原" if maximized else "最大化")
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle = self.window().windowHandle()
+            if handle is not None:
+                handle.startSystemMove()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            window = self.window()
+            window.showNormal() if window.isMaximized() else window.showMaximized()
+            self.update_maximize_state(window.isMaximized())
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class NavButton(QPushButton):
     triggered = Signal(str)
 
