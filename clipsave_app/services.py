@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -33,12 +34,14 @@ class ClipboardService(QObject):
         self.timer.timeout.connect(self.poll)
         self.last_text = ""
         self.last_image_key = ""
+        self.last_clipboard_sequence: int | None = None
 
     def start(self) -> None:
         clipboard = QApplication.clipboard()
         self.last_text = clipboard.text()
         image = clipboard.image()
         self.last_image_key = self.image_key(image) if not image.isNull() else ""
+        self.last_clipboard_sequence = self.clipboard_sequence()
         self.timer.start()
         self.state_changed.emit(True)
 
@@ -51,10 +54,25 @@ class ClipboardService(QObject):
 
     @staticmethod
     def image_key(image: QImage) -> str:
-        return f"{image.cacheKey()}:{image.width()}:{image.height()}"
+        normalized = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        digest = hashlib.blake2b(normalized.constBits(), digest_size=16).hexdigest()
+        return f"{digest}:{normalized.width()}:{normalized.height()}"
+
+    @staticmethod
+    def clipboard_sequence() -> int | None:
+        if os.name != "nt":
+            return None
+        try:
+            return int(ctypes.windll.user32.GetClipboardSequenceNumber())
+        except (AttributeError, OSError):
+            return None
 
     def poll(self) -> None:
         try:
+            sequence = self.clipboard_sequence()
+            if sequence is not None and sequence == self.last_clipboard_sequence:
+                return
+            self.last_clipboard_sequence = sequence
             clipboard = QApplication.clipboard()
             mime = clipboard.mimeData()
             if mime.hasImage():
@@ -99,9 +117,11 @@ class ClipboardService(QObject):
 
     def suppress_text(self, text: str) -> None:
         self.last_text = text
+        self.last_clipboard_sequence = self.clipboard_sequence()
 
     def suppress_image(self, image: QImage) -> None:
         self.last_image_key = self.image_key(image)
+        self.last_clipboard_sequence = self.clipboard_sequence()
 
 
 class AIService:

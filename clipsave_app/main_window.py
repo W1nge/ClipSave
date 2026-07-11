@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import threading
+import time
 from ctypes import wintypes
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QStackedLayout,
     QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -37,12 +39,15 @@ from .styles import LIGHT_STYLESHEET
 from .widgets import (
     AssetGrid,
     AssetTable,
+    BrandLabel,
     CaptureStatusButton,
     DateDialog,
     DetailPanel,
+    DraggableBar,
     IconButton,
     MarkdownDialog,
     SettingsDialog,
+    ResizeHandle,
     Sidebar,
     WindowTitleBar,
     lucide_icon,
@@ -69,6 +74,8 @@ class MainWindow(QMainWindow):
         self.current_collection: int | None = None
         self.current_tag: int | None = None
         self.current_sort = settings.get("sort", "newest")
+        self.sort_menu = None
+        self.sort_menu_closed_at = 0.0
         self.force_quit = False
 
         self.setWindowTitle("")
@@ -115,11 +122,8 @@ class MainWindow(QMainWindow):
         body_layout.setSpacing(0)
         root_layout.addWidget(body, 1)
 
-        self.brand_label = QLabel("ClipSave", root)
-        self.brand_label.setObjectName("BrandTitle")
-        self.brand_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.brand_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.brand_label.setGeometry(18, 7, 182, 78)
+        self.brand_label = BrandLabel("ClipSave", "#21a8fb", 0.9, root)
+        self.brand_label.setGeometry(0, 0, 200, 86)
         self.brand_label.raise_()
 
         self.sidebar = Sidebar()
@@ -137,8 +141,9 @@ class MainWindow(QMainWindow):
         middle_layout.setSpacing(0)
         body_layout.addWidget(middle, 1)
 
-        top_bar = QFrame()
+        top_bar = DraggableBar()
         top_bar.setObjectName("TopBar")
+        self.top_bar = top_bar
         top_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(16, 10, 16, 10)
@@ -176,6 +181,7 @@ class MainWindow(QMainWindow):
 
         title_bar = QFrame()
         title_bar.setObjectName("LibraryHeader")
+        title_bar.setFixedHeight(44)
         title_layout = QHBoxLayout(title_bar)
         title_layout.setContentsMargins(20, 12, 20, 6)
         self.page_title = QLabel("全部内容")
@@ -188,8 +194,6 @@ class MainWindow(QMainWindow):
         self.filter_hint = QLabel()
         self.filter_hint.setObjectName("Muted")
         title_layout.addWidget(self.filter_hint)
-        middle_layout.addWidget(title_bar)
-
         content_row = QHBoxLayout()
         content_row.setContentsMargins(0, 0, 0, 0)
         content_row.setSpacing(0)
@@ -202,9 +206,30 @@ class MainWindow(QMainWindow):
         self.table = AssetTable()
         self.table.item_selected.connect(self.select_item)
         self.table.item_activated.connect(self.activate_item)
+        self.table_page = QWidget()
+        table_page_layout = QVBoxLayout(self.table_page)
+        table_page_layout.setContentsMargins(0, 44, 0, 0)
+        table_page_layout.setSpacing(0)
+        table_page_layout.addWidget(self.table)
         self.view_stack.addWidget(self.grid)
-        self.view_stack.addWidget(self.table)
-        content_row.addWidget(self.view_stack, 1)
+        self.view_stack.addWidget(self.table_page)
+
+        self.library_surface = QWidget()
+        library_layers = QStackedLayout(self.library_surface)
+        library_layers.setContentsMargins(0, 0, 0, 0)
+        library_layers.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        library_layers.addWidget(self.view_stack)
+        header_overlay = QWidget()
+        header_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        header_overlay_layout = QVBoxLayout(header_overlay)
+        header_overlay_layout.setContentsMargins(0, 0, 14, 0)
+        header_overlay_layout.setSpacing(0)
+        header_overlay_layout.addWidget(title_bar)
+        header_overlay_layout.addStretch(1)
+        library_layers.addWidget(header_overlay)
+        library_layers.setCurrentWidget(header_overlay)
+        self.library_header = title_bar
+        content_row.addWidget(self.library_surface, 1)
         self.detail = DetailPanel()
         self.detail.setVisible(False)
         self.detail.close_requested.connect(self.hide_detail)
@@ -227,6 +252,48 @@ class MainWindow(QMainWindow):
         self.search_timer.timeout.connect(self.refresh_items)
         self.set_view_mode(self.settings.get("view_mode", "grid"))
         self.sidebar.set_collapsed(bool(self.settings.get("sidebar_collapsed", False)), animate=False)
+        self._create_resize_handles(root)
+
+    def _create_resize_handles(self, parent) -> None:
+        self.resize_handles = {
+            "left": ResizeHandle(Qt.Edge.LeftEdge, Qt.CursorShape.SizeHorCursor, parent),
+            "right": ResizeHandle(Qt.Edge.RightEdge, Qt.CursorShape.SizeHorCursor, parent),
+            "top": ResizeHandle(Qt.Edge.TopEdge, Qt.CursorShape.SizeVerCursor, parent),
+            "bottom": ResizeHandle(Qt.Edge.BottomEdge, Qt.CursorShape.SizeVerCursor, parent),
+            "top_left": ResizeHandle(Qt.Edge.TopEdge | Qt.Edge.LeftEdge, Qt.CursorShape.SizeFDiagCursor, parent),
+            "top_right": ResizeHandle(Qt.Edge.TopEdge | Qt.Edge.RightEdge, Qt.CursorShape.SizeBDiagCursor, parent),
+            "bottom_left": ResizeHandle(Qt.Edge.BottomEdge | Qt.Edge.LeftEdge, Qt.CursorShape.SizeBDiagCursor, parent),
+            "bottom_right": ResizeHandle(Qt.Edge.BottomEdge | Qt.Edge.RightEdge, Qt.CursorShape.SizeFDiagCursor, parent),
+        }
+        self._update_resize_handles()
+
+    def _update_resize_handles(self) -> None:
+        if not hasattr(self, "resize_handles"):
+            return
+        hidden = self.isMaximized() or self.isFullScreen()
+        for handle in self.resize_handles.values():
+            handle.setVisible(not hidden)
+        if hidden:
+            return
+        width, height = self.width(), self.height()
+        edge, corner = 6, 12
+        geometries = {
+            "left": (0, corner, edge, max(0, height - 2 * corner)),
+            "right": (width - edge, corner, edge, max(0, height - 2 * corner)),
+            "top": (corner, 0, max(0, width - 2 * corner), edge),
+            "bottom": (corner, height - edge, max(0, width - 2 * corner), edge),
+            "top_left": (0, 0, corner, corner),
+            "top_right": (width - corner, 0, corner, corner),
+            "bottom_left": (0, height - corner, corner, corner),
+            "bottom_right": (width - corner, height - corner, corner, corner),
+        }
+        for key, geometry in geometries.items():
+            self.resize_handles[key].setGeometry(*geometry)
+            self.resize_handles[key].raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_resize_handles()
 
     def toggle_maximized(self) -> None:
         self.showNormal() if self.isMaximized() else self.showMaximized()
@@ -235,6 +302,7 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event) -> None:
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "window_title_bar"):
             self.window_title_bar.update_maximize_state(self.isMaximized())
+            self._update_resize_handles()
         super().changeEvent(event)
 
     def nativeEvent(self, event_type, message):
@@ -386,18 +454,32 @@ class MainWindow(QMainWindow):
         self.detail_button.setToolTip("显示详情")
 
     def set_view_mode(self, mode: str) -> None:
-        self.view_stack.setCurrentWidget(self.grid if mode == "grid" else self.table)
+        self.view_stack.setCurrentWidget(self.grid if mode == "grid" else self.table_page)
         self.settings.set("view_mode", mode)
         self.grid_button.setStyleSheet("background:rgba(47,125,246,28); color:#1769d2;" if mode == "grid" else "")
         self.list_button.setStyleSheet("background:rgba(47,125,246,28); color:#1769d2;" if mode == "list" else "")
 
     def open_sort_menu(self) -> None:
+        if self.sort_menu is not None and self.sort_menu.isVisible():
+            self.sort_menu.close()
+            return
+        if time.monotonic() - self.sort_menu_closed_at < 0.2:
+            return
         menu = QMenu(self)
+        self.sort_menu = menu
+        menu.aboutToHide.connect(self._sort_menu_hidden)
         entries = [("newest", "捕获时间：最新优先"), ("oldest", "捕获时间：最早优先"), ("name", "名称"), ("size", "文件大小"), ("type", "类型")]
         for key, label in entries:
             action = menu.addAction(("✓  " if key == self.current_sort else "    ") + label)
             action.triggered.connect(lambda _checked=False, value=key, text=label: self.set_sort(value, text))
-        menu.exec(self.sort_button.mapToGlobal(self.sort_button.rect().bottomLeft()))
+        menu.popup(self.sort_button.mapToGlobal(self.sort_button.rect().bottomLeft()))
+
+    def _sort_menu_hidden(self) -> None:
+        self.sort_menu_closed_at = time.monotonic()
+        menu = self.sort_menu
+        self.sort_menu = None
+        if menu is not None:
+            menu.deleteLater()
 
     def set_sort(self, key: str, label: str) -> None:
         self.current_sort = key

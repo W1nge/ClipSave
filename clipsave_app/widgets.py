@@ -4,14 +4,13 @@ import datetime as dt
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEasingCurve, QEvent, QSize, Qt, QPropertyAnimation, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QByteArray, QEasingCurve, QEvent, QSize, Qt, QPropertyAnimation, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QImageReader, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -24,6 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QScrollBar,
     QSizePolicy,
     QStackedWidget,
     QTableWidget,
@@ -66,6 +66,31 @@ GLYPHS = {
     "sparkles": "sparkles",
     "scan": "scan-text",
 }
+
+
+_THUMBNAIL_CACHE: dict[str, QPixmap] = {}
+
+
+def thumbnail_pixmap(path: Path) -> QPixmap:
+    try:
+        stat = path.stat()
+        key = f"{path}:{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        return QPixmap()
+    cached = _THUMBNAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    source_size = reader.size()
+    if source_size.isValid():
+        reader.setScaledSize(source_size.scaled(QSize(360, 180), Qt.AspectRatioMode.KeepAspectRatio))
+    image = reader.read()
+    pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+    if len(_THUMBNAIL_CACHE) >= 256:
+        _THUMBNAIL_CACHE.pop(next(iter(_THUMBNAIL_CACHE)))
+    _THUMBNAIL_CACHE[key] = pixmap
+    return pixmap
 
 
 def lucide_icon(name: str, color: str = "#354052", size: int = 20, fill: str = "none") -> QIcon:
@@ -123,6 +148,58 @@ class IconButton(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
+class ResizeHandle(QWidget):
+    def __init__(self, edges: Qt.Edge, cursor: Qt.CursorShape, parent=None):
+        super().__init__(parent)
+        self.edges = edges
+        self.setCursor(cursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle = self.window().windowHandle()
+            if handle is not None and handle.startSystemResize(self.edges):
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
+class BrandLabel(QWidget):
+    def __init__(self, text: str, color: str, vertical_scale: float = 0.8, parent=None):
+        super().__init__(parent)
+        self.text = text
+        self.color = QColor(color)
+        self.vertical_scale = vertical_scale
+        self.setObjectName("BrandTitle")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+    def paintEvent(self, event) -> None:
+        source = QPixmap(self.size())
+        source.fill(Qt.GlobalColor.transparent)
+        source_painter = QPainter(source)
+        source_painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        source_painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        font = QFont("Segoe UI")
+        font.setPixelSize(30)
+        font.setWeight(QFont.Weight.DemiBold)
+        font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 90)
+        source_painter.setFont(font)
+        source_painter.setPen(self.color)
+        source_painter.drawText(source.rect(), Qt.AlignmentFlag.AlignCenter, self.text)
+        source_painter.end()
+
+        target_height = max(1, round(self.height() * self.vertical_scale))
+        compressed = source.scaled(
+            self.width(),
+            target_height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        painter = QPainter(self)
+        painter.drawPixmap(0, (self.height() - target_height) // 2, compressed)
+        painter.end()
+
+
 class CaptureStatusButton(QPushButton):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,6 +215,43 @@ class CaptureStatusButton(QPushButton):
         self.setIcon(QIcon(color_dot(color, 10)))
         self.setIconSize(QSize(10, 10))
         self.setToolTip("本地自动捕获已开启" if active else "本地自动捕获已暂停")
+
+
+class AutoHideScrollBar(QScrollBar):
+    def __init__(self, orientation=Qt.Orientation.Vertical, parent=None):
+        super().__init__(orientation, parent)
+        self.setObjectName("AutoHideScrollBar")
+        self.active = False
+        self.setProperty("active", False)
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.setInterval(1000)
+        self.hide_timer.timeout.connect(lambda: self.set_active(False))
+        self.valueChanged.connect(lambda _value: self.reveal_temporarily())
+        self.sliderPressed.connect(self._slider_pressed)
+        self.sliderReleased.connect(self.reveal_temporarily)
+
+    def set_active(self, active: bool) -> None:
+        visible = active and self.maximum() > self.minimum()
+        self.active = visible
+        self.setProperty("active", visible)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        if self.active:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(244, 246, 249))
+        painter.end()
+
+    def reveal_temporarily(self) -> None:
+        self.set_active(True)
+        self.hide_timer.start()
+
+    def _slider_pressed(self) -> None:
+        self.hide_timer.stop()
+        self.set_active(True)
 
 
 class WindowTitleBar(QFrame):
@@ -191,6 +305,41 @@ class WindowTitleBar(QFrame):
         super().mouseDoubleClickEvent(event)
 
 
+class DraggableBar(QFrame):
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle = self.window().windowHandle()
+            if handle is not None and handle.startSystemMove():
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            window = self.window()
+            window.showNormal() if window.isMaximized() else window.showMaximized()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class DialogTitleBar(DraggableBar):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("DialogTitleBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(46)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 0, 6, 0)
+        heading = QLabel(title)
+        heading.setObjectName("SectionTitle")
+        heading.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(heading)
+        layout.addStretch(1)
+        self.close_button = IconButton("close", "关闭")
+        layout.addWidget(self.close_button)
+
+
 class NavButton(QPushButton):
     triggered = Signal(str)
 
@@ -212,8 +361,9 @@ class NavButton(QPushButton):
             self.setToolTip(self.label)
             self.setStyleSheet("text-align:left;")
         else:
-            suffix = f"    {self.count:,}" if self.count is not None else ""
-            self.setText(f"{self.label}{suffix}")
+            gap = "    "
+            suffix = f"{gap}{self.count:,}" if self.count is not None else ""
+            self.setText(f"{gap}{self.label}{suffix}")
             self.setToolTip("")
             self.setStyleSheet("text-align:left;")
         self.setIcon(lucide_icon(self.glyph, "#2f6fca" if self.property("active") else "#4d596b"))
@@ -253,12 +403,10 @@ class Sidebar(QWidget):
         self.layout_root.setSpacing(4)
 
         header = QHBoxLayout()
-        header.setContentsMargins(10, 0, 0, 0)
-        self.collapse_button = IconButton("menu", "收起侧栏")
-        self.collapse_button.setIconSize(QSize(20, 20))
+        header.setContentsMargins(0, 0, 0, 0)
+        self.collapse_button = NavButton("collapse", "panel-left-close", "收起侧栏")
         self.collapse_button.clicked.connect(self.toggle_collapsed)
-        header.addWidget(self.collapse_button)
-        header.addStretch()
+        header.addWidget(self.collapse_button, 1)
         self.layout_root.addLayout(header)
         self.layout_root.addSpacing(10)
 
@@ -354,8 +502,9 @@ class Sidebar(QWidget):
 
     def set_collapsed(self, value: bool, animate: bool = True) -> None:
         self.collapsed = value
-        self.collapse_button.setIcon(lucide_icon("panel-left-open" if value else "panel-left-close"))
-        self.collapse_button.setIconSize(QSize(20, 20))
+        self.collapse_button.label = "展开侧栏" if value else "收起侧栏"
+        self.collapse_button.glyph = "panel-left-open" if value else "panel-left-close"
+        self.collapse_button.set_collapsed(value)
         self.collection_heading.setVisible(not value)
         self.tag_heading.setVisible(not value)
         for button in [*self.nav_buttons.values(), *self.collection_buttons, *self.tag_buttons, *self.footer_buttons]:
@@ -372,7 +521,6 @@ class Sidebar(QWidget):
             self.animation.start()
         else:
             self.setMaximumWidth(end)
-        self.collapse_button.setToolTip("展开侧栏" if value else "收起侧栏")
         self.collapsed_changed.emit(value)
 
     def toggle_collapsed(self) -> None:
@@ -417,9 +565,9 @@ class AssetCard(QFrame):
         preview.setFixedHeight(150)
         preview.setWordWrap(True)
         preview.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.preview = preview
+        self.preview_width = width
         if item["kind"] == "image" and item["path"] and Path(item["path"]).exists():
-            pixmap = QPixmap(item["path"])
-            preview.setPixmap(pixmap.scaled(QSize(max(180, width - 20), 150), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             preview.setStyleSheet("background:rgba(237,241,247,150); border-radius:5px;")
         else:
             content = item["content"].strip() or item["title"]
@@ -433,12 +581,28 @@ class AssetCard(QFrame):
         title.setWordWrap(False)
         title.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         font = title.font()
-        font.setWeight(QFont.Weight.DemiBold)
+        font.setWeight(QFont.Weight.Medium)
         title.setFont(font)
         layout.addWidget(title)
         detail = QLabel(self._detail_text())
         detail.setObjectName("Muted")
         layout.addWidget(detail)
+
+    def load_preview(self) -> None:
+        if self.item["kind"] != "image" or not self.item["path"]:
+            return
+        path = Path(self.item["path"])
+        if not path.exists():
+            return
+        pixmap = thumbnail_pixmap(path)
+        if not pixmap.isNull():
+            self.preview.setPixmap(
+                pixmap.scaled(
+                    QSize(max(180, self.preview_width - 20), 150),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
 
     def _detail_text(self) -> str:
         if self.item["kind"] == "image" and self.item["width"]:
@@ -470,9 +634,10 @@ class AssetGrid(QScrollArea):
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBar(AutoHideScrollBar())
         self.container = QWidget()
         self.layout_root = QVBoxLayout(self.container)
-        self.layout_root.setContentsMargins(20, 16, 20, 24)
+        self.layout_root.setContentsMargins(20, 60, 20, 24)
         self.layout_root.setSpacing(16)
         self.layout_root.addStretch()
         self.setWidget(self.container)
@@ -480,19 +645,31 @@ class AssetGrid(QScrollArea):
         self.cards: dict[int, AssetCard] = {}
         self.selected_id: int | None = None
         self.columns = 0
+        self.pending_previews: list[AssetCard] = []
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setInterval(8)
+        self.preview_timer.timeout.connect(self._load_next_preview)
+        self.rebuild_timer = QTimer(self)
+        self.rebuild_timer.setSingleShot(True)
+        self.rebuild_timer.timeout.connect(self.rebuild)
 
     def set_items(self, items) -> None:
         self.items = list(items)
-        self.rebuild()
+        self._schedule_rebuild(0)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         columns = max(1, self.viewport().width() // 245)
         if columns != self.columns:
             self.columns = columns
-            self.rebuild()
+            self._schedule_rebuild(90)
+
+    def _schedule_rebuild(self, delay: int) -> None:
+        self.rebuild_timer.start(delay)
 
     def _clear(self) -> None:
+        self.preview_timer.stop()
+        self.pending_previews.clear()
         while self.layout_root.count():
             item = self.layout_root.takeAt(0)
             if item.widget():
@@ -547,12 +724,22 @@ class AssetGrid(QScrollArea):
                 card.favorite_requested.connect(self.favorite_requested)
                 grid.addWidget(card, index // columns, index % columns)
                 self.cards[item["id"]] = card
+                if item["kind"] == "image" and item["path"]:
+                    self.pending_previews.append(card)
             for col in range(columns):
                 grid.setColumnStretch(col, 1)
             self.layout_root.addLayout(grid)
         self.layout_root.addStretch()
         if self.selected_id in self.cards:
             self.cards[self.selected_id].set_selected(True)
+        if self.pending_previews:
+            self.preview_timer.start()
+
+    def _load_next_preview(self) -> None:
+        if not self.pending_previews:
+            self.preview_timer.stop()
+            return
+        self.pending_previews.pop(0).load_preview()
 
     def select_item(self, item_id: int) -> None:
         if self.selected_id in self.cards:
@@ -569,13 +756,20 @@ class AssetTable(QTableWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setVerticalScrollBar(AutoHideScrollBar())
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setShowGrid(False)
+        self.setAlternatingRowColors(True)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setColumnCount(5)
         self.setHorizontalHeaderLabels(["名称", "类型", "标签", "捕获时间", "大小"])
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.verticalHeader().hide()
+        self.verticalHeader().setDefaultSectionSize(44)
         self.horizontalHeader().setStretchLastSection(False)
+        self.horizontalHeader().setFixedHeight(40)
         self.horizontalHeader().setSectionResizeMode(0, self.horizontalHeader().ResizeMode.Stretch)
         self.setColumnWidth(1, 90)
         self.setColumnWidth(2, 170)
@@ -618,6 +812,7 @@ class DetailPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("DetailPanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setMinimumWidth(300)
         self.setMaximumWidth(370)
         self.current_item = None
@@ -736,7 +931,7 @@ class DetailPanel(QWidget):
         self.type_badge.setText(TYPE_LABELS.get(item["kind"], item["kind"]))
         self.title.setText(item["title"])
         if item["kind"] == "image" and item["path"] and Path(item["path"]).exists():
-            pixmap = QPixmap(item["path"])
+            pixmap = thumbnail_pixmap(Path(item["path"]))
             self.image_preview.setPixmap(pixmap.scaled(330, 230, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             self.preview_stack.setCurrentWidget(self.image_preview)
         else:
@@ -819,17 +1014,38 @@ class DateDialog(QDialog):
     def __init__(self, days, parent=None):
         super().__init__(parent)
         self.setWindowTitle("按日期打开")
-        self.resize(360, 520)
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("选择一天查看当天保存的全部内容"))
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setObjectName("FluentDialog")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.resize(420, 560)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        title_bar = DialogTitleBar("按日期打开")
+        title_bar.close_button.clicked.connect(self.reject)
+        root.addWidget(title_bar)
+
+        content = QWidget()
+        content.setObjectName("DialogContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(22, 18, 22, 22)
+        layout.setSpacing(12)
+        description = QLabel("选择一天，查看当天保存的全部内容")
+        description.setObjectName("Muted")
+        layout.addWidget(description)
         list_widget = QListWidget()
+        list_widget.setObjectName("DateList")
+        list_widget.setVerticalScrollBar(AutoHideScrollBar())
+        list_widget.setSpacing(2)
         for day, amount in days:
             item = QListWidgetItem(f"{friendly_day(day)}    {amount} 项")
             item.setData(Qt.ItemDataRole.UserRole, day)
+            item.setSizeHint(QSize(0, 44))
             list_widget.addItem(item)
         list_widget.itemActivated.connect(lambda item: self._choose(item.data(Qt.ItemDataRole.UserRole)))
         list_widget.itemClicked.connect(lambda item: self._choose(item.data(Qt.ItemDataRole.UserRole)))
         layout.addWidget(list_widget)
+        root.addWidget(content, 1)
 
     def _choose(self, day: str) -> None:
         self.day_selected.emit(day)
@@ -843,8 +1059,28 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("ClipSave 设置")
-        self.resize(560, 560)
-        layout = QVBoxLayout(self)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setObjectName("FluentDialog")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.resize(620, 650)
+        self.setMinimumSize(520, 520)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        title_bar = DialogTitleBar("设置")
+        title_bar.close_button.clicked.connect(self.reject)
+        root.addWidget(title_bar)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("DialogScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBar(AutoHideScrollBar())
+        content = QWidget()
+        content.setObjectName("DialogContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 20, 24, 24)
+        layout.setSpacing(10)
         heading = QLabel("常规")
         heading.setObjectName("SectionTitle")
         layout.addWidget(heading)
@@ -865,10 +1101,13 @@ class SettingsDialog(QDialog):
         storage.setObjectName("Muted")
         layout.addWidget(storage)
         self.import_button = QPushButton("导入文件")
+        self.import_button.setObjectName("SettingsAction")
         self.import_button.setIcon(lucide_icon("plus"))
         self.import_button.clicked.connect(self.import_requested.emit)
         layout.addWidget(self.import_button)
         open_storage = QPushButton("打开本地资料库")
+        open_storage.setObjectName("SettingsAction")
+        open_storage.setIcon(lucide_icon("folder"))
         open_storage.clicked.connect(lambda: os.startfile(str(LIBRARY_DIR)))
         layout.addWidget(open_storage)
         layout.addSpacing(14)
@@ -893,10 +1132,22 @@ class SettingsDialog(QDialog):
         privacy.setWordWrap(True)
         layout.addWidget(privacy)
         layout.addStretch()
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+
+        footer = QFrame()
+        footer.setObjectName("DialogFooter")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(16, 10, 16, 12)
+        footer_layout.addStretch(1)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        footer_layout.addWidget(cancel)
+        save = QPushButton("保存")
+        save.setObjectName("Primary")
+        save.clicked.connect(self.accept)
+        footer_layout.addWidget(save)
+        root.addWidget(footer)
 
     def accept(self) -> None:
         self.settings.data.update({
