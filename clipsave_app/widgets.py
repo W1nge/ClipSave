@@ -249,7 +249,7 @@ class Sidebar(QWidget):
         self.tag_buttons: list[NavButton] = []
         self.footer_buttons: list[NavButton] = []
         self.layout_root = QVBoxLayout(self)
-        self.layout_root.setContentsMargins(10, 12, 10, 12)
+        self.layout_root.setContentsMargins(10, 4, 10, 12)
         self.layout_root.setSpacing(4)
 
         header = QHBoxLayout()

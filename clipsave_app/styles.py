@@ -7,7 +7,7 @@ LIGHT_STYLESHEET = """
 QMainWindow, QWidget#AppRoot { background: transparent; }
 QWidget#WindowBody { background: transparent; }
 QFrame#WindowTitleBar { background: rgba(255, 255, 255, 204); border: 0; }
-QWidget#Sidebar { background: rgba(255, 255, 255, 204); border-right: 1px solid rgba(115, 129, 150, 42); }
+QWidget#Sidebar { background: rgba(255, 255, 255, 204); border: 0; }
 QWidget#ContentSurface { background: transparent; }
 QWidget#DetailPanel { background: rgba(249, 251, 254, 248); border-left: 1px solid rgba(115, 129, 150, 44); }
 QFrame#TopBar { background: rgba(255, 255, 255, 204); border-bottom: 1px solid rgba(115,129,150,38); }
