@@ -217,7 +217,7 @@ class NavButton(QPushButton):
             self.setToolTip("")
             self.setStyleSheet("text-align:left;")
         self.setIcon(lucide_icon(self.glyph, "#2f6fca" if self.property("active") else "#4d596b"))
-        self.setIconSize(QSize(18, 18))
+        self.setIconSize(QSize(20, 20))
 
     def set_collapsed(self, value: bool) -> None:
         self.collapsed = value
@@ -249,18 +249,15 @@ class Sidebar(QWidget):
         self.tag_buttons: list[NavButton] = []
         self.footer_buttons: list[NavButton] = []
         self.layout_root = QVBoxLayout(self)
-        self.layout_root.setContentsMargins(10, 4, 10, 12)
+        self.layout_root.setContentsMargins(10, 72, 10, 12)
         self.layout_root.setSpacing(4)
 
         header = QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
-        header.setSpacing(7)
+        header.setContentsMargins(10, 0, 0, 0)
         self.collapse_button = IconButton("menu", "收起侧栏")
+        self.collapse_button.setIconSize(QSize(20, 20))
         self.collapse_button.clicked.connect(self.toggle_collapsed)
         header.addWidget(self.collapse_button)
-        self.brand = QLabel("ClipSave")
-        self.brand.setObjectName("Title")
-        header.addWidget(self.brand)
         header.addStretch()
         self.layout_root.addLayout(header)
         self.layout_root.addSpacing(10)
@@ -357,8 +354,8 @@ class Sidebar(QWidget):
 
     def set_collapsed(self, value: bool, animate: bool = True) -> None:
         self.collapsed = value
-        self.brand.setVisible(not value)
         self.collapse_button.setIcon(lucide_icon("panel-left-open" if value else "panel-left-close"))
+        self.collapse_button.setIconSize(QSize(20, 20))
         self.collection_heading.setVisible(not value)
         self.tag_heading.setVisible(not value)
         for button in [*self.nav_buttons.values(), *self.collection_buttons, *self.tag_buttons, *self.footer_buttons]:
@@ -840,11 +837,13 @@ class DateDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
+    import_requested = Signal()
+
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("ClipSave 设置")
-        self.resize(560, 520)
+        self.resize(560, 560)
         layout = QVBoxLayout(self)
         heading = QLabel("常规")
         heading.setObjectName("SectionTitle")
@@ -865,6 +864,10 @@ class SettingsDialog(QDialog):
         storage.setWordWrap(True)
         storage.setObjectName("Muted")
         layout.addWidget(storage)
+        self.import_button = QPushButton("导入文件")
+        self.import_button.setIcon(lucide_icon("plus"))
+        self.import_button.clicked.connect(self.import_requested.emit)
+        layout.addWidget(self.import_button)
         open_storage = QPushButton("打开本地资料库")
         open_storage.clicked.connect(lambda: os.startfile(str(LIBRARY_DIR)))
         layout.addWidget(open_storage)

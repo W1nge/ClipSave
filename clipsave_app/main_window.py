@@ -115,6 +115,13 @@ class MainWindow(QMainWindow):
         body_layout.setSpacing(0)
         root_layout.addWidget(body, 1)
 
+        self.brand_label = QLabel("ClipSave", root)
+        self.brand_label.setObjectName("BrandTitle")
+        self.brand_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.brand_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.brand_label.setGeometry(18, 7, 182, 78)
+        self.brand_label.raise_()
+
         self.sidebar = Sidebar()
         self.sidebar.navigation_requested.connect(self.navigate)
         self.sidebar.add_collection_requested.connect(self.add_collection)
@@ -136,10 +143,6 @@ class MainWindow(QMainWindow):
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(16, 10, 16, 10)
         top_layout.setSpacing(8)
-        import_button = QPushButton("导入")
-        import_button.setIcon(lucide_icon("plus"))
-        import_button.clicked.connect(self.import_files)
-        top_layout.addWidget(import_button)
         top_layout.addStretch(1)
         self.search = __import__("PySide6.QtWidgets", fromlist=["QLineEdit"]).QLineEdit()
         self.search.setPlaceholderText("搜索剪贴板内容、文件名、标签、OCR 或 AI 描述  (Ctrl+K)")
@@ -501,8 +504,8 @@ class MainWindow(QMainWindow):
         self.refresh_items()
         self.show_status("集合已更新")
 
-    def import_files(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(self, "导入内容", "", "支持的文件 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.md)")
+    def import_files(self, parent=None) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(parent or self, "导入内容", "", "支持的文件 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.md)")
         added = 0
         for filename in paths:
             added += int(self.database.import_file(Path(filename), copy_to_library=True))
@@ -511,7 +514,9 @@ class MainWindow(QMainWindow):
             self.show_status(f"已导入 {added} 项，跳过 {len(paths) - added} 项重复内容")
 
     def open_settings(self) -> None:
-        SettingsDialog(self.settings, self).exec()
+        dialog = SettingsDialog(self.settings, self)
+        dialog.import_requested.connect(lambda: self.import_files(dialog))
+        dialog.exec()
 
     def generate_ai_description(self, item_id: int) -> None:
         item = self.database.get_item(item_id)

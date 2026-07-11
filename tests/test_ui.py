@@ -12,6 +12,7 @@ from clipsave_app.app import create_app_icon
 from clipsave_app.database import LibraryDatabase
 from clipsave_app.main_window import MainWindow
 from clipsave_app.settings import Settings
+from clipsave_app.widgets import SettingsDialog
 
 
 class MainWindowTests(unittest.TestCase):
@@ -39,6 +40,9 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.windowTitle(), "")
         self.assertTrue(self.window.windowFlags() & Qt.WindowType.FramelessWindowHint)
         self.assertEqual(self.window.window_title_bar.height(), 32)
+        self.assertEqual(self.window.brand_label.text(), "ClipSave")
+        self.assertEqual(self.window.brand_label.objectName(), "BrandTitle")
+        self.assertEqual(self.window.brand_label.geometry().height(), 78)
         self.window.window_title_bar.maximize_button.click()
         self.app.processEvents()
         self.assertTrue(self.window.isMaximized())
@@ -47,18 +51,24 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.isMaximized())
         self.assertFalse(hasattr(self.window, "capture_state"))
         self.assertFalse(hasattr(self.window.sidebar, "brand_icon"))
-        self.assertEqual(self.window.sidebar.brand.text(), "ClipSave")
-        self.assertTrue(self.window.sidebar.brand.isVisible())
+        self.assertFalse(hasattr(self.window.sidebar, "brand"))
         self.assertFalse(self.window.detail.isVisible())
         self.window.sidebar.set_collapsed(True, animate=False)
         self.assertTrue(self.window.sidebar.collapsed)
-        self.assertFalse(self.window.sidebar.brand.isVisible())
         self.window.open_day(self.database.days()[0][0])
         self.assertEqual(len(self.window.current_items), 1)
         self.window.select_item(self.window.current_items[0]["id"])
         self.window.toggle_detail()
         self.app.processEvents()
         self.assertTrue(self.window.detail.isVisible())
+
+        dialog = SettingsDialog(self.settings, self.window)
+        self.assertEqual(dialog.import_button.text(), "导入文件")
+        import_requests = []
+        dialog.import_requested.connect(lambda: import_requests.append(True))
+        dialog.import_button.click()
+        self.assertEqual(import_requests, [True])
+        dialog.close()
 
 
 if __name__ == "__main__":

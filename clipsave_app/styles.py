@@ -20,6 +20,7 @@ QFrame#TagChip { background: rgba(236,240,246,210); border-radius: 6px; }
 QLabel#Muted { color: #6f7b8d; }
 QLabel#SectionTitle { font-size: 15px; font-weight: 600; color: #273247; }
 QLabel#Title { font-size: 17px; font-weight: 600; }
+QLabel#BrandTitle { font-size: 38px; font-weight: 700; color: #168fe8; }
 QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     background: rgba(255,255,255,190);
     border: 1px solid rgba(99,115,139,55);
@@ -38,7 +39,7 @@ QPushButton:hover { background: rgba(39,75,125,18); }
 QPushButton:pressed { background: rgba(39,75,125,30); }
 QPushButton#Primary { background: #2f7df6; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #246be0; }
-QPushButton#NavButton { text-align: left; padding: 9px 7px; border-radius: 6px; }
+QPushButton#NavButton { text-align: left; padding: 9px 16px; border-radius: 6px; }
 QPushButton#NavButton[active="true"] { background: rgba(47,125,246,18); color: #135fc7; font-weight: 600; }
 QPushButton#IconButton { min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px; padding: 0; }
 QPushButton#WindowButton { min-width: 46px; max-width: 46px; min-height: 32px; max-height: 32px; padding: 0; border-radius: 0; }
