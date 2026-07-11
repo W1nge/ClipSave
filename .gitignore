@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build output
+build/
+dist/
+*.spec
+ClipSave.exe
+
+# User data and secrets
+data/
+Picture/
+Markdown/
+clipsave.db*
+settings.json
+clipsave_history.json
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.log
+
+# Local-only migration and test artifacts
+clipsave_legacy.py
+test_out.txt
+*.lnk
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
