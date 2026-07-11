@@ -55,7 +55,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         with patch("clipsave_app.database.PICTURE_DIR", managed):
             self.assertTrue(self.database.import_file(source, "image", copy_to_library=True))
         imported = self.database.query_items()[0]
-        self.assertTrue(Path(imported["path"]).is_relative_to(managed))
+        self.assertTrue(Path(imported["path"]).resolve().is_relative_to(managed.resolve()))
         self.assertTrue(Path(imported["path"]).exists())
         self.assertTrue(source.exists())
 
