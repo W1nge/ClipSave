@@ -35,6 +35,10 @@ class MainWindowTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_panels_and_navigation(self):
+        self.assertEqual(self.window.windowTitle(), "")
+        self.assertFalse(hasattr(self.window, "capture_state"))
+        self.assertFalse(hasattr(self.window.sidebar, "brand_icon"))
+        self.assertFalse(hasattr(self.window.sidebar, "brand"))
         self.assertFalse(self.window.detail.isVisible())
         self.window.sidebar.set_collapsed(True, animate=False)
         self.assertTrue(self.window.sidebar.collapsed)

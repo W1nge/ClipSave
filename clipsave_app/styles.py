@@ -4,11 +4,13 @@ LIGHT_STYLESHEET = """
     font-size: 13px;
     color: #172033;
 }
-QMainWindow, QWidget#AppRoot { background: rgba(247, 249, 252, 224); }
-QWidget#Sidebar { background: rgba(242, 246, 251, 205); border-right: 1px solid rgba(115, 129, 150, 42); }
-QWidget#ContentSurface { background: rgba(255, 255, 255, 188); }
-QWidget#DetailPanel { background: rgba(249, 251, 254, 232); border-left: 1px solid rgba(115, 129, 150, 44); }
-QFrame#TopBar { background: rgba(255,255,255,120); border-bottom: 1px solid rgba(115,129,150,38); }
+QMainWindow, QWidget#AppRoot { background: transparent; }
+QWidget#Sidebar { background: rgba(255, 255, 255, 204); border-right: 1px solid rgba(115, 129, 150, 42); }
+QWidget#ContentSurface { background: transparent; }
+QWidget#DetailPanel { background: rgba(249, 251, 254, 248); border-left: 1px solid rgba(115, 129, 150, 44); }
+QFrame#TopBar { background: rgba(255, 255, 255, 204); border-bottom: 1px solid rgba(115,129,150,38); }
+QFrame#LibraryHeader { background: rgba(249, 251, 254, 250); }
+QStackedWidget#ViewStack { background: rgba(249, 251, 254, 250); }
 QFrame#Card { background: rgba(255,255,255,218); border: 1px solid rgba(105,121,145,40); border-radius: 7px; }
 QFrame#Card:hover { background: rgba(255,255,255,245); border-color: rgba(47,125,246,100); }
 QFrame#Card[selected="true"] { background: rgba(234,243,255,245); border: 2px solid #2f7df6; }
@@ -37,6 +39,8 @@ QPushButton#Primary:hover { background: #246be0; }
 QPushButton#NavButton { text-align: left; padding: 9px 12px; border-radius: 6px; }
 QPushButton#NavButton[active="true"] { background: rgba(47,125,246,18); color: #135fc7; font-weight: 600; }
 QPushButton#IconButton { min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px; padding: 0; }
+QPushButton#CaptureStatus { min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px; padding: 0; border-radius: 6px; }
+QPushButton#CaptureStatus:hover { background: rgba(255,255,255,80); }
 QScrollArea { border: 0; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QTableWidget { background: transparent; border: 0; gridline-color: rgba(115,129,150,35); selection-background-color: rgba(47,125,246,30); }

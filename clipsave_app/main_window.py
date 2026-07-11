@@ -35,6 +35,7 @@ from .styles import LIGHT_STYLESHEET
 from .widgets import (
     AssetGrid,
     AssetTable,
+    CaptureStatusButton,
     DateDialog,
     DetailPanel,
     IconButton,
@@ -67,8 +68,7 @@ class MainWindow(QMainWindow):
         self.current_sort = settings.get("sort", "newest")
         self.force_quit = False
 
-        self.setWindowTitle(APP_NAME)
-        self.setWindowIcon(app_icon)
+        self.setWindowTitle("")
         self.resize(1440, 880)
         self.setMinimumSize(980, 640)
         self.setStyleSheet(LIGHT_STYLESHEET)
@@ -115,6 +115,7 @@ class MainWindow(QMainWindow):
 
         top_bar = QFrame()
         top_bar.setObjectName("TopBar")
+        top_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(16, 10, 16, 10)
         top_layout.setSpacing(8)
@@ -139,9 +140,6 @@ class MainWindow(QMainWindow):
         self.sort_button = QPushButton("按时间排序  ▾")
         self.sort_button.clicked.connect(self.open_sort_menu)
         top_layout.addWidget(self.sort_button)
-        self.monitor_button = IconButton("pause", "暂停剪贴板监听")
-        self.monitor_button.clicked.connect(self.toggle_monitor)
-        top_layout.addWidget(self.monitor_button)
         self.grid_button = IconButton("grid", "网格视图")
         self.grid_button.clicked.connect(lambda: self.set_view_mode("grid"))
         top_layout.addWidget(self.grid_button)
@@ -151,9 +149,13 @@ class MainWindow(QMainWindow):
         self.detail_button = IconButton("info", "显示详情")
         self.detail_button.clicked.connect(self.toggle_detail)
         top_layout.addWidget(self.detail_button)
+        self.capture_status = CaptureStatusButton()
+        self.capture_status.clicked.connect(self.toggle_monitor)
+        top_layout.addWidget(self.capture_status)
         middle_layout.addWidget(top_bar)
 
         title_bar = QFrame()
+        title_bar.setObjectName("LibraryHeader")
         title_layout = QHBoxLayout(title_bar)
         title_layout.setContentsMargins(20, 12, 20, 6)
         self.page_title = QLabel("全部内容")
@@ -172,6 +174,7 @@ class MainWindow(QMainWindow):
         content_row.setContentsMargins(0, 0, 0, 0)
         content_row.setSpacing(0)
         self.view_stack = QStackedWidget()
+        self.view_stack.setObjectName("ViewStack")
         self.grid = AssetGrid()
         self.grid.item_selected.connect(self.select_item)
         self.grid.item_activated.connect(self.activate_item)
@@ -197,19 +200,6 @@ class MainWindow(QMainWindow):
         self.detail.ocr_requested.connect(self.generate_ocr)
         content_row.addWidget(self.detail)
         middle_layout.addLayout(content_row, 1)
-
-        footer = QFrame()
-        footer.setObjectName("TopBar")
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(18, 6, 18, 6)
-        self.status = QLabel("就绪")
-        self.status.setObjectName("Muted")
-        footer_layout.addWidget(self.status)
-        footer_layout.addStretch()
-        self.capture_state = QLabel("● 本地自动捕获：已开启")
-        self.capture_state.setStyleSheet("color:#169c55;")
-        footer_layout.addWidget(self.capture_state)
-        middle_layout.addWidget(footer)
 
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -360,10 +350,7 @@ class MainWindow(QMainWindow):
         self.settings.set("monitoring", self.clipboard_service.timer.isActive())
 
     def update_monitor_button(self, active: bool) -> None:
-        self.monitor_button.setIcon(lucide_icon("pause" if active else "play"))
-        self.monitor_button.setToolTip("暂停剪贴板监听" if active else "继续剪贴板监听")
-        self.capture_state.setText("● 本地自动捕获：已开启" if active else "○ 本地自动捕获：已暂停")
-        self.capture_state.setStyleSheet("color:#169c55;" if active else "color:#7b8798;")
+        self.capture_status.set_active(active)
         if hasattr(self, "tray_monitor_action"):
             self.tray_monitor_action.setText("暂停监听" if active else "继续监听")
             self.tray.setToolTip("ClipSave - " + ("正在监听剪贴板" if active else "监听已暂停"))
@@ -619,11 +606,12 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def show_status(self, text: str) -> None:
-        self.status.setText(text)
-        QTimer.singleShot(2800, lambda: self.status.setText("就绪"))
+        active = self.clipboard_service.timer.isActive() if hasattr(self, "clipboard_service") else True
+        self.capture_status.setToolTip(text)
+        QTimer.singleShot(2800, lambda: self.capture_status.setToolTip("本地自动捕获已开启" if active else "本地自动捕获已暂停"))
 
     def show_error_status(self, text: str) -> None:
-        self.status.setText(f"剪贴板读取失败：{text[:80]}")
+        self.capture_status.setToolTip(f"剪贴板读取失败：{text[:80]}")
 
     def quit_application(self) -> None:
         self.force_quit = True

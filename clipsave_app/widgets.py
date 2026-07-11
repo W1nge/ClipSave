@@ -123,6 +123,23 @@ class IconButton(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
+class CaptureStatusButton(QPushButton):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CaptureStatus")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(28, 28)
+        self.active = True
+        self.set_active(True)
+
+    def set_active(self, active: bool) -> None:
+        self.active = active
+        color = "#20a464" if active else "#d44c4c"
+        self.setIcon(QIcon(color_dot(color, 10)))
+        self.setIconSize(QSize(10, 10))
+        self.setToolTip("本地自动捕获已开启" if active else "本地自动捕获已暂停")
+
+
 class NavButton(QPushButton):
     triggered = Signal(str)
 
@@ -172,6 +189,7 @@ class Sidebar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("Sidebar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setMinimumWidth(72)
         self.setMaximumWidth(242)
         self.collapsed = False
@@ -184,15 +202,12 @@ class Sidebar(QWidget):
         self.layout_root.setSpacing(4)
 
         header = QHBoxLayout()
-        self.brand_icon = QLabel()
-        self.brand_icon.setPixmap(lucide_icon("copy", "#2f7df6", 22).pixmap(22, 22))
-        header.addWidget(self.brand_icon)
-        self.brand = QLabel("ClipSave")
-        self.brand.setObjectName("Title")
-        header.addWidget(self.brand)
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(7)
         self.collapse_button = IconButton("menu", "收起侧栏")
         self.collapse_button.clicked.connect(self.toggle_collapsed)
         header.addWidget(self.collapse_button)
+        header.addStretch()
         self.layout_root.addLayout(header)
         self.layout_root.addSpacing(10)
 
@@ -288,8 +303,7 @@ class Sidebar(QWidget):
 
     def set_collapsed(self, value: bool, animate: bool = True) -> None:
         self.collapsed = value
-        self.brand.setVisible(not value)
-        self.brand_icon.setVisible(not value)
+        self.collapse_button.setIcon(lucide_icon("panel-left-open" if value else "panel-left-close"))
         self.collection_heading.setVisible(not value)
         self.tag_heading.setVisible(not value)
         for button in [*self.nav_buttons.values(), *self.collection_buttons, *self.tag_buttons, *self.footer_buttons]:
