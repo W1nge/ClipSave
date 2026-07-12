@@ -368,7 +368,11 @@ class StorageTests(unittest.TestCase):
             path, desired_access, creation_disposition, flags=None, share_mode=None
         ):
             nonlocal swapped
-            if Path(path) == target and not swapped:
+            if (
+                storage.normalized_absolute_path(Path(path))
+                == storage.normalized_absolute_path(target)
+                and not swapped
+            ):
                 swapped = True
                 parent.rmdir()
                 result = subprocess.run(

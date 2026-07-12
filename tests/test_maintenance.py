@@ -84,7 +84,10 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(len(recycled), 1)
         recycled_path = Path(recycled[0])
         self.assertEqual(recycled_path.name, duplicate.name)
-        self.assertEqual(recycled_path.parent.parent, duplicate.parent)
+        self.assertEqual(
+            recycled_path.parent.parent,
+            duplicate.parent.resolve(),
+        )
         self.assertTrue(recycled_path.parent.name.startswith(".clipsave-recycle-"))
         self.assertFalse(duplicate.exists())
 

@@ -667,7 +667,11 @@ class LibraryDatabaseTests(unittest.TestCase):
         swaps_blocked = []
 
         def connect_while_sidecars_are_swapped(database_path, *args, **kwargs):
-            if Path(database_path) == path and not swaps_blocked:
+            if (
+                storage_module.normalized_absolute_path(Path(database_path))
+                == storage_module.normalized_absolute_path(path)
+                and not swaps_blocked
+            ):
                 for sidecar, outside in ((wal, outside_wal), (shm, outside_shm)):
                     replacement = self.root / f"{sidecar.name}.replacement"
                     os.link(outside, replacement)
@@ -1625,7 +1629,11 @@ class LibraryDatabaseTests(unittest.TestCase):
         replacement_attempted = []
 
         def connect_while_replacement_is_attempted(database, *args, **kwargs):
-            if Path(database) == path and not replacement_attempted:
+            if (
+                storage_module.normalized_absolute_path(Path(database))
+                == storage_module.normalized_absolute_path(path)
+                and not replacement_attempted
+            ):
                 try:
                     os.replace(parent, moved_parent)
                 except OSError:
@@ -1681,7 +1689,11 @@ class LibraryDatabaseTests(unittest.TestCase):
         linked = []
 
         def connect_while_hardlink_is_added(database_path, *args, **kwargs):
-            if Path(database_path) == path and not linked:
+            if (
+                storage_module.normalized_absolute_path(Path(database_path))
+                == storage_module.normalized_absolute_path(path)
+                and not linked
+            ):
                 os.link(path, outside)
                 linked.append(True)
             return real_connect(database_path, *args, **kwargs)
@@ -1706,7 +1718,11 @@ class LibraryDatabaseTests(unittest.TestCase):
         linked = []
 
         def connect_while_hardlink_is_added(database_path, *args, **kwargs):
-            if Path(database_path) == path and not linked:
+            if (
+                storage_module.normalized_absolute_path(Path(database_path))
+                == storage_module.normalized_absolute_path(path)
+                and not linked
+            ):
                 os.link(path, outside)
                 linked.append(True)
             return real_connect(database_path, *args, **kwargs)
