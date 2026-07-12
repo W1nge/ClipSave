@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+from ctypes import wintypes
 import datetime as dt
 import hashlib
 import io
@@ -14,8 +15,10 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -323,8 +326,14 @@ class WindowsClipboardNotifier(QObject, QAbstractNativeEventFilter):
         self._installed = False
 
     @staticmethod
+    @lru_cache(maxsize=1)
     def _user32():
-        return ctypes.windll.user32
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.AddClipboardFormatListener.argtypes = [wintypes.HWND]
+        user32.AddClipboardFormatListener.restype = wintypes.BOOL
+        user32.RemoveClipboardFormatListener.argtypes = [wintypes.HWND]
+        user32.RemoveClipboardFormatListener.restype = wintypes.BOOL
+        return user32
 
     @property
     def active(self) -> bool:
@@ -504,11 +513,12 @@ class ClipboardService(QObject):
             return None
 
     @staticmethod
+    @lru_cache(maxsize=1)
     def _windows_clipboard_apis():
         from ctypes import wintypes
 
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         user32.OpenClipboard.argtypes = [wintypes.HWND]
         user32.OpenClipboard.restype = wintypes.BOOL
         user32.CloseClipboard.argtypes = []
@@ -1132,6 +1142,26 @@ class AIService:
     def configured(self) -> bool:
         return bool(self.base_url and self.vision_model)
 
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int | None]:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme.lower() == "https" else 80 if parsed.scheme.lower() == "http" else None
+        return parsed.scheme.lower(), (parsed.hostname or "").lower(), port
+
+    class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            target = urllib.parse.urljoin(req.full_url, newurl)
+            if AIService._origin(req.full_url) != AIService._origin(target):
+                raise RuntimeError("AI service cross-origin redirect refused")
+            return super().redirect_request(req, fp, code, msg, headers, target)
+
+    @staticmethod
+    def _open_request(request, timeout: float):
+        opener = urllib.request.build_opener(AIService._SameOriginRedirectHandler())
+        return opener.open(request, timeout=timeout)
+
     def _post(self, path: str, payload: dict, cancel_event: threading.Event | None = None) -> dict:
         _raise_if_cancelled(cancel_event)
         deadline = time.monotonic() + 10.0
@@ -1145,14 +1175,15 @@ class AIService:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with self._open_request(request, timeout=1.0) as response:
                 chunks: list[bytes] = []
                 remaining = MAX_AI_RESPONSE_BYTES + 1
+                read_chunk = getattr(response, "read1", response.read)
                 while remaining:
                     _raise_if_cancelled(cancel_event)
                     if time.monotonic() >= deadline:
                         raise TimeoutError("AI service request timed out")
-                    chunk = response.read(min(64 * 1024, remaining))
+                    chunk = read_chunk(min(64 * 1024, remaining))
                     if not chunk:
                         break
                     chunks.append(chunk)
@@ -1206,15 +1237,33 @@ class AIService:
             values.append(number)
         return values
 
-    def describe_image(self, path: Path, cancel_event: threading.Event | None = None) -> str:
+    def describe_image(
+        self,
+        source: Path | ImageFileSnapshot,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
         _raise_if_cancelled(cancel_event)
-        snapshot = preflight_image_file(path)
-        with Image.open(snapshot.path) as image:
+        snapshot = source if isinstance(source, ImageFileSnapshot) else preflight_image_file(source)
+        with open_managed_binary(
+            snapshot.path, "rb", PICTURE_DIR, identity_locked=True
+        ) as handle:
+            current = os.fstat(handle.fileno())
+            if (
+                current.st_size != snapshot.size_bytes
+                or current.st_mtime_ns != snapshot.modified_ns
+                or current.st_dev != snapshot.device
+                or current.st_ino != snapshot.inode
+            ):
+                raise RuntimeError("Image changed before AI processing")
+            with Image.open(handle) as image:
+                image.load()
+                if image.size != (snapshot.width, snapshot.height):
+                    raise RuntimeError("Image dimensions changed before AI processing")
+                image.thumbnail((1024, 1024))
+                with io.BytesIO() as stream:
+                    image.convert("RGB").save(stream, "JPEG", quality=82)
+                    encoded = base64.b64encode(stream.getvalue()).decode("ascii")
             snapshot.require_current()
-            image.thumbnail((1024, 1024))
-            with io.BytesIO() as stream:
-                image.convert("RGB").save(stream, "JPEG", quality=82)
-                encoded = base64.b64encode(stream.getvalue()).decode("ascii")
         _raise_if_cancelled(cancel_event)
         result = self._post(
             "/chat/completions",
@@ -1253,43 +1302,79 @@ class AIService:
         return dot / norm if norm else -1.0
 
 
+class _AccentPolicy(ctypes.Structure):
+    _fields_ = [
+        ("accent_state", ctypes.c_int),
+        ("accent_flags", ctypes.c_int),
+        ("gradient_color", ctypes.c_uint32),
+        ("animation_id", ctypes.c_int),
+    ]
+
+
+class _WindowCompositionAttributeData(ctypes.Structure):
+    _fields_ = [
+        ("attribute", ctypes.c_int),
+        ("data", ctypes.c_void_p),
+        ("size", ctypes.c_size_t),
+    ]
+
+
+@lru_cache(maxsize=1)
+def _windows_effect_apis():
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+    user32.SetWindowCompositionAttribute.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(_WindowCompositionAttributeData),
+    ]
+    user32.SetWindowCompositionAttribute.restype = wintypes.BOOL
+    dwmapi.DwmSetWindowAttribute.argtypes = [
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+    return user32, dwmapi
+
+
+def _dwm_attribute(dwmapi, hwnd: int, attribute: int, value: ctypes._SimpleCData) -> bool:
+    return int(
+        dwmapi.DwmSetWindowAttribute(
+            hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
+        )
+    ) >= 0
+
+
 def apply_windows_acrylic(window, dark: bool = False) -> bool:
     if os.name != "nt":
         return False
     hwnd = int(window.winId())
     try:
-        # Windows 11 exposes a native transient backdrop attribute.
+        user32, dwmapi = _windows_effect_apis()
         build = sys.getwindowsversion().build
-        if build >= 22000:
+        backdrop_applied = False
+        # DWMWA_SYSTEMBACKDROP_TYPE is supported starting with Windows 11 22H2.
+        if build >= 22621:
             backdrop = ctypes.c_int(3)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
-        else:
-            class AccentPolicy(ctypes.Structure):
-                _fields_ = [
-                    ("accent_state", ctypes.c_int),
-                    ("accent_flags", ctypes.c_int),
-                    ("gradient_color", ctypes.c_uint32),
-                    ("animation_id", ctypes.c_int),
-                ]
-
-            class WindowCompositionAttributeData(ctypes.Structure):
-                _fields_ = [
-                    ("attribute", ctypes.c_int),
-                    ("data", ctypes.c_void_p),
-                    ("size", ctypes.c_size_t),
-                ]
-
+            backdrop_applied = _dwm_attribute(dwmapi, hwnd, 38, backdrop)
+        if not backdrop_applied:
             # Keep the stable blur-behind layer used by the light theme. The Qt
             # sidebar and toolbar provide the requested light or dark 80% tint.
-            policy = AccentPolicy(3, 0, 0x00FFFFFF, 0)
-            data = WindowCompositionAttributeData(19, ctypes.addressof(policy), ctypes.sizeof(policy))
-            ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
+            policy = _AccentPolicy(3, 0, 0x00FFFFFF, 0)
+            data = _WindowCompositionAttributeData(
+                19, ctypes.addressof(policy), ctypes.sizeof(policy)
+            )
+            backdrop_applied = bool(
+                user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
+            )
         corner = ctypes.c_int(2)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner))
+        _dwm_attribute(dwmapi, hwnd, 33, corner)
+        if build >= 22000:
+            no_border = ctypes.c_uint32(0xFFFFFFFE)
+            _dwm_attribute(dwmapi, hwnd, 34, no_border)
         dark_mode = ctypes.c_int(1 if dark else 0)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, 20, ctypes.byref(dark_mode), ctypes.sizeof(dark_mode)
-        )
-        return True
-    except (AttributeError, OSError):
+        _dwm_attribute(dwmapi, hwnd, 20, dark_mode)
+        return backdrop_applied
+    except (AttributeError, OSError, TypeError, ValueError):
         return False

@@ -566,9 +566,9 @@ def _is_link_or_junction(path: Path) -> bool:
         if is_junction and is_junction():
             return True
         if os.name == "nt":
-            get_attributes = ctypes.windll.kernel32.GetFileAttributesW
-            get_attributes.argtypes = [wintypes.LPCWSTR]
-            get_attributes.restype = wintypes.DWORD
+            get_attributes = _kernel32_function(
+                "GetFileAttributesW", [wintypes.LPCWSTR], wintypes.DWORD
+            )
             attributes = int(get_attributes(str(path)))
             if attributes != 0xFFFFFFFF and attributes & 0x400:
                 return True
@@ -630,9 +630,9 @@ def _is_remote_or_unc_path(path: Path) -> bool:
         return False
     try:
         root = f"{path.drive}\\"
-        get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
-        get_drive_type.argtypes = [wintypes.LPCWSTR]
-        get_drive_type.restype = wintypes.UINT
+        get_drive_type = _kernel32_function(
+            "GetDriveTypeW", [wintypes.LPCWSTR], wintypes.UINT
+        )
         return int(get_drive_type(root)) == 4  # DRIVE_REMOTE
     except (AttributeError, OSError, TypeError, ValueError):
         return True

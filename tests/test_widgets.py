@@ -9,10 +9,10 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QByteArray, QEvent, QPoint, QPointF, QPropertyAnimation, QRect, QThread, Qt, QUrl
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QPointF, QPropertyAnimation, QRect, QSize, QThread, Qt, QUrl
 from PySide6.QtGui import QColor, QEnterEvent, QImage, QPainter, QPixmap, QTextDocument, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QScrollArea, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QWidget
+from PySide6.QtWidgets import QApplication, QFrame, QScrollArea, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QWidget
 
 import clipsave_app.widgets as widgets_module
 from clipsave_app.app import create_app_icon
@@ -558,7 +558,9 @@ class ThumbnailPixmapTests(unittest.TestCase):
         settings = Mock()
         settings.get.side_effect = lambda _key, default=None: default
         dialog = SettingsDialog(settings)
-        self.assertEqual(dialog.height(), 750)
+        self.assertEqual(dialog.size(), QSize(620, 560))
+        self.assertEqual(dialog.layout().contentsMargins().left(), 1)
+        self.assertTrue(dialog.property("settingsDialog"))
         self.assertTrue(dialog.follow_system_theme.isChecked())
         self.assertFalse(dialog.dark_theme_switch.isEnabled())
         dialog.follow_system_theme.setChecked(False)
@@ -566,9 +568,25 @@ class ThumbnailPixmapTests(unittest.TestCase):
         dialog.show()
         self.app.processEvents()
         scroll = dialog.findChild(QScrollArea, "DialogScroll")
-        self.assertIsNotNone(scroll)
-        self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
+        self.assertIsNone(scroll)
+        content = dialog.findChild(QWidget, "DialogContent")
+        self.assertIsNotNone(content)
+        self.assertLessEqual(content.sizeHint().height(), content.height())
         dialog.close()
+
+    def test_sidebar_brand_divider_matches_toolbar_height(self):
+        sidebar = Sidebar()
+        sidebar.resize(242, 700)
+        sidebar.show()
+        self.app.processEvents()
+
+        divider = sidebar.brand_divider_rect()
+        self.assertEqual(divider.y(), Sidebar.BRAND_AREA_HEIGHT - 1)
+        self.assertEqual(divider.width(), sidebar.width())
+        self.assertIsNone(sidebar.findChild(QFrame, "SidebarBrandDivider"))
+        self.assertTrue(sidebar.collapse_button.prominent_icon)
+        self.assertFalse(sidebar.collapse_button.icon().isNull())
+        sidebar.close()
 
     def test_application_icon_contains_multiple_raster_sizes(self):
         sizes = {(size.width(), size.height()) for size in create_app_icon().availableSizes()}

@@ -143,6 +143,7 @@ class MainWindow(QMainWindow):
         self._semantic_ordered_ids: list[int] = []
         self._session_hidden_item_ids: set[int] = set()
         self._startup_scan_request: tuple[object, AsyncSignals] | None = None
+        self.startup_scan_error: str | None = None
         self._import_request: tuple[object, AsyncSignals] | None = None
         self._copy_request: tuple[object, AsyncSignals, int] | None = None
         self._backup_request: tuple[object, AsyncSignals] | None = None
@@ -252,12 +253,8 @@ class MainWindow(QMainWindow):
         self.sidebar.add_tag_requested.connect(self.add_global_tag)
         self.sidebar.settings_requested.connect(self.open_settings)
         self.sidebar.collapsed_changed.connect(lambda value: self._save_setting("sidebar_collapsed", value))
-        self.sidebar.width_animation_started.connect(
-            lambda: self.grid.set_layout_updates_suspended(True)
-        )
-        self.sidebar.width_animation_finished.connect(
-            lambda: self.grid.set_layout_updates_suspended(False)
-        )
+        self.sidebar.width_animation_started.connect(self._begin_sidebar_animation)
+        self.sidebar.width_animation_finished.connect(self._end_sidebar_animation)
         body_layout.addWidget(self.sidebar)
 
         middle = QWidget()
@@ -269,6 +266,7 @@ class MainWindow(QMainWindow):
 
         top_bar = DraggableBar()
         top_bar.setObjectName("TopBar")
+        top_bar.setFixedHeight(Sidebar.BRAND_AREA_HEIGHT)
         self.top_bar = top_bar
         top_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         top_layout = QHBoxLayout(top_bar)
@@ -539,6 +537,15 @@ class MainWindow(QMainWindow):
         self._interactive_resize_active = False
         self.grid.set_layout_updates_suspended(False)
         QTimer.singleShot(0, self._constrain_to_available_screen)
+
+    def _begin_sidebar_animation(self) -> None:
+        self.grid.set_layout_updates_suspended(True)
+        self.table.setUpdatesEnabled(False)
+
+    def _end_sidebar_animation(self) -> None:
+        self.grid.set_layout_updates_suspended(False)
+        self.table.setUpdatesEnabled(True)
+        self.table.viewport().update()
 
     def build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.app_icon, self)
@@ -1203,6 +1210,7 @@ class MainWindow(QMainWindow):
         return handle
 
     def _start_startup_scan(self, full_scan: bool, reconcile_images: bool) -> None:
+        self.startup_scan_error = None
         token = object()
         signals = AsyncSignals()
         self._async_signals.add(signals)
@@ -1295,6 +1303,7 @@ class MainWindow(QMainWindow):
         if self._closing or self._startup_scan_request != (token, signals):
             return
         self._startup_scan_request = None
+        self.startup_scan_error = None
         self.refresh_library()
         if imported:
             self.show_status(f"已导入 {imported} 个现有文件")
@@ -1304,6 +1313,7 @@ class MainWindow(QMainWindow):
         if self._closing or self._startup_scan_request != (token, signals):
             return
         self._startup_scan_request = None
+        self.startup_scan_error = message
         self.show_error_status(f"启动扫描失败：{message}")
 
     def _cancel_async_token(self, token: object) -> None:
@@ -1498,7 +1508,7 @@ class MainWindow(QMainWindow):
 
         def work(cancel_event: threading.Event) -> None:
             try:
-                description = service.describe_image(Path(item["path"]), cancel_event)
+                description = service.describe_image(image_snapshot, cancel_event)
                 embedding = service.embed(description, cancel_event)
                 if not cancel_event.is_set():
                     signals.succeeded.emit(item_id, description, embedding)
@@ -1912,6 +1922,15 @@ class MainWindow(QMainWindow):
         self._ocr_requests.clear()
         self._copy_request = None
 
+        if not self.clipboard_service.wait_for_idle(remaining()):
+            return abort(monitoring_was_active)
+        if remaining() <= 0:
+            return abort(monitoring_was_active)
+        try:
+            self.database.create_backup()
+        except Exception as exc:
+            self.database.recovery_report["backup_error"] = str(exc)
+            return abort(monitoring_was_active)
         if not self.clipboard_service.shutdown(timeout=remaining()):
             return abort(monitoring_was_active)
 
@@ -1920,6 +1939,7 @@ class MainWindow(QMainWindow):
         shutdown_ai_ocr_task_executor(timeout=min(remaining(), 0.1))
         self.grid.shutdown_thumbnail_loader(timeout_ms=0)
         self.detail.shutdown_thumbnail_loader(timeout_ms=0)
+        self.database.close()
         self.tray.hide()
         application = QApplication.instance()
         if application is not None:

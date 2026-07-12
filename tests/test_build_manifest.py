@@ -9,7 +9,7 @@ class BuildManifestTests(unittest.TestCase):
     def test_manifest_is_utf8_without_bom_and_uses_lf_for_unicode_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            payload = root / "双击启动.vbs"
+            payload = root / "中文文件名.txt"
             payload.write_bytes(b"payload")
             manifest = root / "SHA256SUMS.txt"
 
@@ -18,7 +18,7 @@ class BuildManifestTests(unittest.TestCase):
             raw = manifest.read_bytes()
             self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
             self.assertNotIn(b"\r\n", raw)
-            self.assertIn("双击启动.vbs", raw.decode("utf-8"))
+            self.assertIn("中文文件名.txt", raw.decode("utf-8"))
 
 
 if __name__ == "__main__":

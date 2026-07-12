@@ -62,7 +62,6 @@ jobs:
           $required = @(
             'build\release\ClipSave\ClipSave.exe',
             'build\release\ClipSave\_internal',
-            'build\release\双击启动.vbs',
             'build\release\LICENSE',
             'build\release\THIRD_PARTY_NOTICES.md',
             'build\release\THIRD_PARTY_LICENSES',
@@ -95,14 +94,14 @@ jobs:
           try {
             $entryNames = @($zipFile.Entries | ForEach-Object FullName)
             if (($entryNames | Group-Object | Where-Object Count -gt 1)) { throw 'Archive contains duplicate paths' }
-            $allowedRootFiles = @('双击启动.vbs','LICENSE','THIRD_PARTY_NOTICES.md','README.md','BUILD_INFO.txt','SHA256SUMS.txt')
+            $allowedRootFiles = @('LICENSE','THIRD_PARTY_NOTICES.md','README.md','BUILD_INFO.txt','SHA256SUMS.txt')
             foreach ($entry in $entryNames) {
               $normalized = $entry.Replace('\','/').TrimEnd('/')
               if (-not $normalized) { continue }
               if ($normalized -notlike 'ClipSave/*' -and $normalized -notlike 'THIRD_PARTY_LICENSES/*' -and $normalized -notin $allowedRootFiles) { throw "Unexpected archive path: $entry" }
             }
           } finally { $zipFile.Dispose() }
-          foreach ($name in @('双击启动.vbs','LICENSE','THIRD_PARTY_NOTICES.md','README.md','BUILD_INFO.txt','SHA256SUMS.txt')) {
+          foreach ($name in @('LICENSE','THIRD_PARTY_NOTICES.md','README.md','BUILD_INFO.txt','SHA256SUMS.txt')) {
             $path = Join-Path $extract $name
             if (-not (Test-Path -LiteralPath $path) -or (Get-Item -LiteralPath $path).Length -eq 0) { throw "Missing archived file $name" }
           }

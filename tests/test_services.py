@@ -1,10 +1,12 @@
 import json
 import os
 import ctypes
+from ctypes import wintypes
 import tempfile
 import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -15,6 +17,7 @@ from PySide6.QtCore import QBuffer, QIODevice
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
 
+import clipsave_app.services as services_module
 from clipsave_app.constants import (
     MAX_AI_RESPONSE_BYTES,
     MAX_CLIPBOARD_IMAGE_BYTES,
@@ -84,6 +87,9 @@ class FakeResponse:
         chunk = self.data[self.offset:self.offset + limit]
         self.offset += len(chunk)
         return chunk
+
+    def read1(self, limit):
+        return self.read(limit)
 
 
 class ClipboardServiceTests(unittest.TestCase):
@@ -713,10 +719,10 @@ class AIServiceTests(unittest.TestCase):
         service = AIService("http://127.0.0.1:11434/v1", "", "vision", "embedding")
         response = FakeResponse(json.dumps({"ok": True}).encode("utf-8"))
 
-        with patch("clipsave_app.services.urllib.request.urlopen", return_value=response) as urlopen:
+        with patch.object(service, "_open_request", return_value=response) as open_request:
             self.assertEqual(service._post("/test", {}), {"ok": True})
 
-        request = urlopen.call_args.args[0]
+        request = open_request.call_args.args[0]
         self.assertTrue(service.configured)
         self.assertIsNone(request.get_header("Authorization"))
         self.assertLessEqual(response.read_limit, 64 * 1024)
@@ -724,7 +730,7 @@ class AIServiceTests(unittest.TestCase):
     def test_ai_response_size_and_shape_are_validated(self):
         service = AIService("http://localhost/v1", "", "vision", "embedding")
         response = FakeResponse(lambda limit: b"x" * limit)
-        with patch("clipsave_app.services.urllib.request.urlopen", return_value=response):
+        with patch.object(service, "_open_request", return_value=response):
             with self.assertRaisesRegex(RuntimeError, "响应过大"):
                 service._post("/test", {})
 
@@ -732,8 +738,9 @@ class AIServiceTests(unittest.TestCase):
             path = Path(temp) / "image.png"
             PILImage.new("RGB", (4, 4), "white").save(path)
             service._post = lambda _path, _payload, _cancel_event=None: {"choices": []}
-            with self.assertRaisesRegex(RuntimeError, "choices"):
-                service.describe_image(path)
+            with patch("clipsave_app.services.PICTURE_DIR", Path(temp)):
+                with self.assertRaisesRegex(RuntimeError, "choices"):
+                    service.describe_image(path)
 
     def test_embedding_must_be_numeric_finite_and_bounded(self):
         service = AIService("http://localhost/v1", "", "vision", "embedding")
@@ -755,10 +762,62 @@ class AIServiceTests(unittest.TestCase):
         service = AIService("http://localhost/v1", "", "vision", "embedding")
         cancel_event = threading.Event()
         cancel_event.set()
-        with patch("clipsave_app.services.urllib.request.urlopen") as urlopen:
+        with patch.object(service, "_open_request") as open_request:
             with self.assertRaises(OperationCancelled):
                 service._post("/test", {}, cancel_event)
-        urlopen.assert_not_called()
+        open_request.assert_not_called()
+
+    def test_ai_response_uses_interruptible_single_read_chunks(self):
+        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        cancel_event = threading.Event()
+
+        class InterruptibleResponse(FakeResponse):
+            def read(self, _limit):
+                raise AssertionError("buffer-filling read must not be used")
+
+            def read1(self, limit):
+                cancel_event.set()
+                return b"x" * min(limit, 8)
+
+        with patch.object(
+            service, "_open_request", return_value=InterruptibleResponse(b"")
+        ):
+            with self.assertRaises(OperationCancelled):
+                service._post("/test", {}, cancel_event)
+
+    def test_cross_origin_ai_redirect_is_refused_before_forwarding_headers(self):
+        service = AIService("https://api.example/v1", "secret", "vision", "")
+        request = urllib.request.Request(
+            "https://api.example/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+        )
+        handler = service._SameOriginRedirectHandler()
+        with self.assertRaisesRegex(RuntimeError, "cross-origin"):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "https://other.example/collect",
+            )
+
+    def test_describe_image_rejects_replacement_after_snapshot(self):
+        service = AIService("http://localhost/v1", "", "vision", "")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "image.png"
+            PILImage.new("RGB", (8, 8), "red").save(path)
+            snapshot = preflight_image_file(path)
+            replacement = root / "replacement.png"
+            PILImage.new("RGB", (8, 8), "blue").save(replacement)
+            os.replace(replacement, path)
+            with patch("clipsave_app.services.PICTURE_DIR", root), patch.object(
+                service, "_post"
+            ) as post:
+                with self.assertRaisesRegex(RuntimeError, "changed"):
+                    service.describe_image(snapshot)
+            post.assert_not_called()
 
     def test_describe_image_preflights_pixels_before_posting(self):
         service = AIService("http://localhost/v1", "", "vision", "embedding")
@@ -834,6 +893,12 @@ class PreflightTests(unittest.TestCase):
 
 
 class AcrylicTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows effects are Windows-only")
+    def test_windows_effect_api_signatures_initialize(self):
+        user32, dwmapi = services_module._windows_effect_apis()
+        self.assertEqual(user32.SetWindowCompositionAttribute.restype, wintypes.BOOL)
+        self.assertEqual(dwmapi.DwmSetWindowAttribute.restype, ctypes.c_long)
+
     def test_windows_10_uses_stable_blur_behind_for_both_themes(self):
         class AccentPolicy(ctypes.Structure):
             _fields_ = [
@@ -862,14 +927,15 @@ class AcrylicTests(unittest.TestCase):
 
         user32 = Mock()
         user32.SetWindowCompositionAttribute.side_effect = set_composition
-        windll = Mock(user32=user32, dwmapi=Mock())
+        dwmapi = Mock()
+        dwmapi.DwmSetWindowAttribute.return_value = 0
         version = Mock(build=19044)
         window = Mock()
         window.winId.return_value = 123
 
         with patch("clipsave_app.services.os.name", "nt"), patch(
             "clipsave_app.services.sys.getwindowsversion", return_value=version
-        ), patch("clipsave_app.services.ctypes.windll", windll):
+        ), patch("clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)):
             self.assertTrue(apply_windows_acrylic(window, False))
             self.assertTrue(apply_windows_acrylic(window, True))
 
@@ -880,6 +946,43 @@ class AcrylicTests(unittest.TestCase):
                 (19, 3, 0, 0x00FFFFFF),
             ],
         )
+
+    def test_windows_11_22h2_uses_system_backdrop_and_checks_hresult(self):
+        user32 = Mock()
+        dwmapi = Mock()
+        dwmapi.DwmSetWindowAttribute.return_value = 0
+        version = Mock(build=22621)
+        window = Mock()
+        window.winId.return_value = 456
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ):
+            self.assertTrue(apply_windows_acrylic(window, True))
+
+        attributes = [call.args[1] for call in dwmapi.DwmSetWindowAttribute.call_args_list]
+        self.assertEqual(attributes, [38, 33, 34, 20])
+        user32.SetWindowCompositionAttribute.assert_not_called()
+
+    def test_failed_backdrop_falls_back_and_reports_total_failure(self):
+        user32 = Mock()
+        user32.SetWindowCompositionAttribute.return_value = 0
+        dwmapi = Mock()
+        dwmapi.DwmSetWindowAttribute.return_value = -1
+        version = Mock(build=22621)
+        window = Mock()
+        window.winId.return_value = 789
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ):
+            self.assertFalse(apply_windows_acrylic(window, False))
+
+        user32.SetWindowCompositionAttribute.assert_called_once()
 
 
 class BoundedTaskExecutorTests(unittest.TestCase):

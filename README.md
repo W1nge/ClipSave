@@ -43,9 +43,9 @@ python -m venv .venv
 .\.venv\Scripts\python.exe clipsave.py
 ```
 
-也可以运行 `install.bat` 安装并校验依赖，再双击 `run.vbs`。`run.vbs` 是明确的源码启动器，只会运行 `.venv` 中的 Python 和当前 `clipsave.py`，不会优先启动目录中可能存在的旧 `ClipSave.exe`。
+也可以运行 `install.bat` 安装并校验依赖，然后使用 `.venv\Scripts\pythonw.exe clipsave.py` 启动源码版本。
 
-发布包用户应使用 `双击启动.vbs`；该入口只启动 `ClipSave\ClipSave.exe`，缺少完整应用目录时会直接提示错误。
+发布包用户应直接运行 `ClipSave\ClipSave.exe`，并保持相邻的 `ClipSave\_internal` 目录完整。
 
 ## 构建 EXE
 

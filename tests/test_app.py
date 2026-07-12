@@ -67,6 +67,35 @@ class _LocalConnection:
 
 
 class AppTests(unittest.TestCase):
+    def test_smoke_failure_reports_startup_and_callback_errors(self):
+        window = MagicMock()
+        window.startup_scan_error = "scan failed"
+        self.assertEqual(
+            app._smoke_failure(window, []), "startup_scan_error=scan failed"
+        )
+        self.assertEqual(
+            app._smoke_failure(window, ["ZeroDivisionError: division by zero"]),
+            "uncaught_exception=ZeroDivisionError: division by zero",
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows DPI awareness is Windows-only")
+    def test_dpi_awareness_prefers_per_monitor_v2(self):
+        user32 = MagicMock()
+        user32.SetProcessDpiAwarenessContext.return_value = 1
+        with patch.object(app.ctypes, "WinDLL", return_value=user32):
+            self.assertTrue(app._configure_windows_dpi_awareness())
+        user32.SetProcessDpiAwarenessContext.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "Windows DPI awareness is Windows-only")
+    def test_dpi_awareness_falls_back_for_older_windows(self):
+        user32 = MagicMock()
+        user32.SetProcessDpiAwarenessContext.side_effect = AttributeError
+        shcore = MagicMock()
+        shcore.SetProcessDpiAwareness.return_value = 0
+        with patch.object(app.ctypes, "WinDLL", side_effect=[user32, shcore]):
+            self.assertTrue(app._configure_windows_dpi_awareness())
+        shcore.SetProcessDpiAwareness.assert_called_once_with(2)
+
     def test_smoke_profile_override_requires_ready_file(self):
         fallback = Path("C:/fallback")
         with patch.object(constants, "_local_appdata", return_value=fallback), patch.object(

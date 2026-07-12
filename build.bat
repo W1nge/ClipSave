@@ -108,8 +108,6 @@ if not exist "%stagedExe%" (
   goto :missing_output
 )
 
-.venv\Scripts\python.exe -c "from pathlib import Path; import shutil; name='\u53cc\u51fb\u542f\u52a8.vbs'; shutil.copy2(Path(r'%~dp0.') / name, Path(r'%releaseDir%') / name)"
-if errorlevel 1 goto :failed
 copy /y "%~dp0LICENSE" "%releaseDir%\LICENSE" >nul
 if errorlevel 1 goto :failed
 copy /y "%~dp0THIRD_PARTY_NOTICES.md" "%releaseDir%\THIRD_PARTY_NOTICES.md" >nul
@@ -148,7 +146,7 @@ if defined ImageRelease >>"%releaseDir%\BUILD_INFO.txt" echo GitHub runner image
 .venv\Scripts\python.exe build_manifest.py "%releaseDir%" "%releaseDir%\SHA256SUMS.txt"
 if errorlevel 1 goto :failed
 set "releaseArchive=%releaseDir%\ClipSave-%appVersion%%archiveLabel%-windows-x64.zip"
-powershell -NoProfile -Command "Compress-Archive -Path '%appDir%','%releaseDir%\*.vbs','%releaseDir%\LICENSE','%releaseDir%\THIRD_PARTY_NOTICES.md','%releaseDir%\THIRD_PARTY_LICENSES','%releaseDir%\README.md','%releaseDir%\BUILD_INFO.txt','%releaseDir%\SHA256SUMS.txt' -DestinationPath '%releaseArchive%' -Force"
+powershell -NoProfile -Command "Compress-Archive -Path '%appDir%','%releaseDir%\LICENSE','%releaseDir%\THIRD_PARTY_NOTICES.md','%releaseDir%\THIRD_PARTY_LICENSES','%releaseDir%\README.md','%releaseDir%\BUILD_INFO.txt','%releaseDir%\SHA256SUMS.txt' -DestinationPath '%releaseArchive%' -Force"
 if errorlevel 1 goto :failed
 powershell -NoProfile -Command "$hash=(Get-FileHash -LiteralPath '%releaseArchive%' -Algorithm SHA256).Hash; Set-Content -LiteralPath ('%releaseArchive%' + '.sha256') -Value ($hash + '  ' + [IO.Path]::GetFileName('%releaseArchive%')) -Encoding ASCII"
 if errorlevel 1 goto :failed

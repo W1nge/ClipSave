@@ -1,6 +1,6 @@
 # Code Audit
 
-Audit date: 2026-07-12
+Audit date: 2026-07-13
 
 This audit covered local storage boundaries, settings recovery, single-instance IPC,
 SQLite integrity, clipboard capture, OCR and AI service handling, Qt UI state and
@@ -123,20 +123,36 @@ performance, packaging, CI, dependencies, and release documentation.
   selection clears its keyboard current index, and large Markdown avoids synchronous rich parsing.
 - Markdown viewers reject local, network, and embedded `data:` resources so compressed inline images
   cannot expand into unbounded Qt pixmaps.
+- Windows frameless resizing restores the native sizing frame, removes its visual non-client area,
+  preserves the taskbar work area when maximized, and uses real per-window DPI for all eight hit zones.
+- Sidebar animation no longer restacks a divider child on every frame, settings render without a
+  hidden overflow scrollbar, and the brand/header boundary remains aligned in both themes.
+- Windows effects, clipboard listeners, global hotkeys, known-folder lookup, and storage drive/path
+  checks now use explicit pointer-sized ctypes signatures. Per-Monitor-V2 DPI awareness is preferred.
+- Windows 11 system backdrops are gated to 22H2, failed DWM calls fall back to blur-behind, and the
+  application reports total backdrop failure instead of silently claiming success.
+- Legacy VBS source and release launchers were removed. Release archives now contain only the actual
+  application directory, documentation, checksums, and required license material.
+- Windows session-end shutdown now waits for clipboard persistence, creates the final validated
+  backup, and closes SQLite before allowing logoff to continue.
+- AI image requests encode the exact identity-locked snapshot approved by the user, reject
+  cross-origin redirects before credentials can be forwarded, and use bounded single-read chunks
+  so cancellation and deadlines are rechecked while receiving a response.
+- Frozen startup readiness now fails on reconciliation errors and uncaught Qt callback exceptions;
+  final test validation also scans stderr for tracebacks instead of trusting the process exit code alone.
 
 ## Verification
 
-- 319 unit and regression tests pass.
+- 350 unit and regression tests pass with no background callback tracebacks.
 - Python bytecode compilation, `pip check`, and `git diff --check` pass.
 - A live SQLite snapshot of the real database migrated from schema v2 to v3 with all
   81 item rows and relationship counts unchanged, `PRAGMA quick_check` returning `ok`,
   and no foreign-key violations.
-- The release EXE reports product version 0.3.0, its checksum and the release ZIP checksum
-  recompute correctly, all 301 manifested files match the ZIP, the archive contains 64
-  third-party license/metadata files, and OCR import, isolated-profile startup/clean-shutdown,
-  and frozen dual-instance exclusion smoke tests exit successfully.
-- The final local verification archive is explicitly labeled `UNOFFICIAL`; its SHA-256 is
-  `074CFE05B14CE5CACB83A82D5B3C1EC8242D6DA0DFB07B0B752163514BFCC119`.
+- The release EXE reports product version 0.3.0, executable/archive checksums recompute correctly,
+  the manifest exactly matches the ZIP file set, and OCR import, isolated-profile
+  startup/clean-shutdown, and frozen dual-instance exclusion smoke tests exit successfully.
+- Local verification archives are explicitly labeled `UNOFFICIAL`, and their generated SHA-256
+  sidecars are recomputed during release validation rather than recorded as permanent evidence.
 - The packaged application starts in about one second on the audit machine, remains
   responsive, settles to zero measured CPU over a five-second idle sample, and rejects
   a second visible instance.
@@ -172,5 +188,5 @@ performance, packaging, CI, dependencies, and release documentation.
 - Runtime and build wheels are version-pinned and hash-locked for Windows x64 across Python
   3.11-3.13. The local verified build currently uses a conda-derived Python runtime; official
   CI packaging is restricted to a fixed official CPython 3.13.5 host.
-- Cross-user IPC, multi-monitor DWM behavior, OCR language packs, and recycle-bin behavior still
-  need clean-machine end-to-end testing in addition to unit tests.
+- Cross-user IPC, mixed-DPI multi-monitor transitions, OCR language packs, and recycle-bin behavior
+  still need clean-machine end-to-end testing in addition to unit tests and the real-HWND probe.

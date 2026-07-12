@@ -4,8 +4,8 @@ ClipSave is a local-first Windows clipboard library for text, images, and Markdo
 
 ## Run
 
-Keep the complete extracted directory together, then double-click `双击启动.vbs`.
-The application executable is `ClipSave\ClipSave.exe`; its `_internal` directory is required.
+Keep the complete extracted directory together, then run `ClipSave\ClipSave.exe`.
+The adjacent `ClipSave\_internal` directory is required and must not be moved separately.
 
 ## Local data
 

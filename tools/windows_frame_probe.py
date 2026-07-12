@@ -18,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from PySide6.QtWidgets import QApplication
 
-from clipsave_app.app import create_app_icon
+from clipsave_app.app import _configure_windows_dpi_awareness, create_app_icon
 from clipsave_app.database import LibraryDatabase
 from clipsave_app.main_window import MainWindow
 from clipsave_app.settings import Settings
@@ -183,6 +183,7 @@ def run_probe() -> dict:
     if os.name != "nt":
         raise RuntimeError("The native frame probe only runs on Windows")
     os.environ.pop("QT_QPA_PLATFORM", None)
+    _configure_windows_dpi_awareness()
     app = QApplication.instance() or QApplication([])
     if app.platformName().lower() != "windows":
         raise RuntimeError(f"Expected the Windows Qt platform, got {app.platformName()!r}")

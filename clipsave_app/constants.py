@@ -1,12 +1,22 @@
 import sys
 import os
 import ctypes
+from ctypes import wintypes
 from pathlib import Path
 
 
 def _windows_local_appdata() -> Path:
     buffer = ctypes.create_unicode_buffer(32768)
-    result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x001C, None, 0, buffer)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.SHGetFolderPathW.argtypes = [
+        wintypes.HWND,
+        ctypes.c_int,
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+    ]
+    shell32.SHGetFolderPathW.restype = ctypes.c_long
+    result = shell32.SHGetFolderPathW(None, 0x001C, None, 0, buffer)
     if result != 0 or not buffer.value:
         raise OSError(f"SHGetFolderPathW(CSIDL_LOCAL_APPDATA) failed: {result}")
     return Path(buffer.value)

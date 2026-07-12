@@ -85,19 +85,13 @@ class ReleaseContractTests(unittest.TestCase):
             self.assertRegex(build_info, r"Commit .*?-dirty")
             self.assertIn("-UNOFFICIAL-windows-x64.zip", completed.stdout)
 
-    def test_release_launcher_checks_critical_runtime_files(self):
-        launcher = Path("双击启动.vbs").read_text(encoding="utf-8")
-        for required in (
-            "_internal",
-            "base_library.zip",
-            "python3.dll",
-            "Qt6Core.dll",
-            "Qt6Gui.dll",
-            "Qt6Widgets.dll",
-            "hasVersionedPython",
-        ):
-            self.assertIn(required, launcher)
-        self.assertLess(launcher.index("fs.FolderExists(internalDir)"), launcher.index("shell.Run"))
+    def test_release_uses_the_application_executable_without_legacy_launchers(self):
+        script = Path("build.bat").read_text(encoding="ascii")
+        release_readme = Path("README_RELEASE.md").read_text(encoding="utf-8")
+        self.assertFalse(Path("run.vbs").exists())
+        self.assertFalse(Path("双击启动.vbs").exists())
+        self.assertNotIn("*.vbs", script)
+        self.assertIn("ClipSave\\ClipSave.exe", release_readme)
 
     def test_ci_pins_runner_and_waits_before_second_instance(self):
         workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")

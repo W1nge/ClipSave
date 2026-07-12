@@ -701,7 +701,15 @@ class DialogTitleBar(DraggableBar):
 class NavButton(QPushButton):
     triggered = Signal(str)
 
-    def __init__(self, key: str, glyph: str, label: str, count: int | None = None, parent=None):
+    def __init__(
+        self,
+        key: str,
+        glyph: str,
+        label: str,
+        count: int | None = None,
+        parent=None,
+        prominent_icon: bool = False,
+    ):
         super().__init__(parent)
         self.key = key
         self.glyph = GLYPHS.get(glyph, glyph)
@@ -709,6 +717,7 @@ class NavButton(QPushButton):
         self.count = count
         self.collapsed = False
         self.custom_icon: QIcon | None = None
+        self.prominent_icon = prominent_icon
         self.setObjectName("NavButton")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName(label)
@@ -726,7 +735,11 @@ class NavButton(QPushButton):
             self.setText(f"{gap}{self.label}{suffix}")
             self.setToolTip("")
             self.setStyleSheet("text-align:left;")
-        inactive = "#c6ccd5" if dark_theme_active() else "#4d596b"
+        inactive = (
+            theme_icon_color()
+            if self.prominent_icon
+            else "#c6ccd5" if dark_theme_active() else "#4d596b"
+        )
         self.setIcon(self.custom_icon or lucide_icon(self.glyph, "#64b5f6" if self.property("active") else inactive))
         self.setIconSize(QSize(20, 20))
 
@@ -746,6 +759,7 @@ class NavButton(QPushButton):
 
 
 class Sidebar(QWidget):
+    BRAND_AREA_HEIGHT = 54
     navigation_requested = Signal(str, object)
     add_collection_requested = Signal()
     add_tag_requested = Signal()
@@ -776,7 +790,12 @@ class Sidebar(QWidget):
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
-        self.collapse_button = NavButton("collapse", "panel-left-close", "收起侧栏")
+        self.collapse_button = NavButton(
+            "collapse",
+            "panel-left-close",
+            "收起侧栏",
+            prominent_icon=True,
+        )
         self.collapse_button.clicked.connect(self.toggle_collapsed)
         header.addWidget(self.collapse_button, 1)
         self.layout_root.addLayout(header)
@@ -874,6 +893,7 @@ class Sidebar(QWidget):
 
     def set_active(self, key: str) -> None:
         self.active_key = key
+        self.collapse_button.refresh_text()
         for button in [
             *self.nav_buttons.values(),
             *self.collection_buttons,
@@ -915,6 +935,20 @@ class Sidebar(QWidget):
 
     def toggle_collapsed(self) -> None:
         self.set_collapsed(not self.collapsed)
+
+    def brand_divider_rect(self) -> QRect:
+        return QRect(0, self.BRAND_AREA_HEIGHT - 1, self.width(), 1)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.fillRect(
+            self.brand_divider_rect(),
+            QColor("#3c3c3c")
+            if dark_theme_active()
+            else QColor(115, 129, 150, 38),
+        )
+        painter.end()
 
 
 class AssetGridDelegate(QStyledItemDelegate):
@@ -1891,27 +1925,21 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("ClipSave 设置")
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setObjectName("FluentDialog")
+        self.setProperty("settingsDialog", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.resize(620, 750)
-        self.setMinimumSize(480, 400)
+        self.setFixedSize(620, 560)
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
+        root.setContentsMargins(1, 1, 1, 1)
         root.setSpacing(0)
         title_bar = DialogTitleBar("设置")
         title_bar.close_button.clicked.connect(self.reject)
         root.addWidget(title_bar)
 
-        scroll = QScrollArea()
-        scroll.setObjectName("DialogScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBar(AutoHideScrollBar())
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         content = QWidget()
         content.setObjectName("DialogContent")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(24, 20, 24, 24)
-        layout.setSpacing(10)
+        layout.setContentsMargins(24, 8, 24, 8)
+        layout.setSpacing(5)
         heading = QLabel("常规")
         heading.setObjectName("SectionTitle")
         layout.addWidget(heading)
@@ -1939,7 +1967,7 @@ class SettingsDialog(QDialog):
             hotkey_text = "全局唤醒快捷键：Ctrl + Alt + V"
         self.hotkey_status = QLabel(hotkey_text)
         layout.addWidget(self.hotkey_status)
-        layout.addSpacing(14)
+        layout.addSpacing(6)
         from .constants import DATA_DIR, LIBRARY_DIR
 
         storage_heading = QLabel("本地存储")
@@ -1960,7 +1988,7 @@ class SettingsDialog(QDialog):
         open_storage.clicked.connect(lambda: _startfile_or_warn(self, LIBRARY_DIR))
         self.open_storage_button = open_storage
         layout.addWidget(open_storage)
-        layout.addSpacing(14)
+        layout.addSpacing(6)
         ai_heading = QLabel("OpenAI-compatible AI 服务（独立的主动功能）")
         ai_heading.setObjectName("SectionTitle")
         layout.addWidget(ai_heading)
@@ -1982,8 +2010,7 @@ class SettingsDialog(QDialog):
         privacy.setWordWrap(True)
         layout.addWidget(privacy)
         layout.addStretch()
-        scroll.setWidget(content)
-        root.addWidget(scroll, 1)
+        root.addWidget(content, 1)
 
         footer = QFrame()
         footer.setObjectName("DialogFooter")

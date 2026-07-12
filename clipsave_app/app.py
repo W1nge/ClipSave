@@ -25,6 +25,43 @@ from .storage import ensure_storage_directories, migrate_legacy_layout
 SHOW_MESSAGE = b"show\n"
 
 
+def _configure_windows_dpi_awareness() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        ctypes.set_last_error(0)
+        if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return True
+        if ctypes.get_last_error() == 5:  # ERROR_ACCESS_DENIED: already configured.
+            return True
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    try:
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+        shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+        return int(shcore.SetProcessDpiAwareness(2)) >= 0
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def _windows_hotkey_api():
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.RegisterHotKey.argtypes = [
+        wintypes.HWND,
+        ctypes.c_int,
+        wintypes.UINT,
+        wintypes.UINT,
+    ]
+    user32.RegisterHotKey.restype = wintypes.BOOL
+    user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.UnregisterHotKey.restype = wintypes.BOOL
+    return user32
+
+
 def _current_user_identity() -> str:
     if os.name == "nt":
         return _windows_user_sid()
@@ -151,6 +188,15 @@ def _should_scan_library(migration_result: dict[str, int], database) -> bool:
     except (AttributeError, sqlite3.Error):
         return False
     return row is None
+
+
+def _smoke_failure(window, uncaught_exceptions: list[str]) -> str | None:
+    if uncaught_exceptions:
+        return f"uncaught_exception={uncaught_exceptions[0]}"
+    startup_error = getattr(window, "startup_scan_error", None)
+    if startup_error:
+        return f"startup_scan_error={startup_error}"
+    return None
 
 
 def create_app_icon() -> QIcon:
@@ -404,11 +450,7 @@ def main() -> int:
         del sys.argv[index : index + 2]
     if smoke_profile_path is not None and smoke_ready_path is None:
         return 2
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except (AttributeError, OSError):
-            pass
+    _configure_windows_dpi_awareness()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_NAME)
@@ -469,10 +511,25 @@ def main() -> int:
     app.installNativeEventFilter(hotkey_filter)
     registered = False
     if os.name == "nt":
-        registered = bool(ctypes.windll.user32.RegisterHotKey(None, 0xC51A, 0x0002 | 0x0001, ord("V")))
+        registered = bool(
+            _windows_hotkey_api().RegisterHotKey(
+                None, 0xC51A, 0x0002 | 0x0001, ord("V")
+            )
+        )
     window.global_hotkey_registered = registered
     if os.name == "nt" and not registered:
         window.show_error_status("全局快捷键 Ctrl+Alt+V 注册失败，可能已被其他软件占用")
+
+    original_excepthook = sys.excepthook
+    smoke_uncaught_exceptions: list[str] = []
+    if smoke_ready_path is not None:
+        def smoke_excepthook(exception_type, exception, traceback) -> None:
+            smoke_uncaught_exceptions.append(
+                f"{exception_type.__name__}: {exception}"
+            )
+            original_excepthook(exception_type, exception, traceback)
+
+        sys.excepthook = smoke_excepthook
 
     window.show()
     if smoke_ready_path is not None:
@@ -496,6 +553,16 @@ def main() -> int:
         def mark_smoke_ready() -> None:
             nonlocal smoke_attempts
             smoke_attempts += 1
+            failure = _smoke_failure(window, smoke_uncaught_exceptions)
+            if failure:
+                try:
+                    smoke_status_path.write_text(
+                        failure + "\n", encoding="utf-8", newline="\n"
+                    )
+                except OSError:
+                    pass
+                app.exit(1)
+                return
             try:
                 check = database.connection.execute("PRAGMA quick_check").fetchone()[0]
                 if (
@@ -516,13 +583,17 @@ def main() -> int:
 
         QTimer.singleShot(250, mark_smoke_ready)
     exit_code = app.exec()
+    failure = _smoke_failure(window, smoke_uncaught_exceptions)
+    if failure:
+        exit_code = exit_code or 1
     if smoke_ready_path is not None:
         try:
             with smoke_status_path.open("a", encoding="ascii", newline="\n") as handle:
                 handle.write(f"event_loop_exited={exit_code}\n")
         except OSError:
             pass
+        sys.excepthook = original_excepthook
     if registered:
-        ctypes.windll.user32.UnregisterHotKey(None, 0xC51A)
+        _windows_hotkey_api().UnregisterHotKey(None, 0xC51A)
     single.close()
     return exit_code

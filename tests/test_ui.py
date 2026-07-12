@@ -16,7 +16,7 @@ from clipsave_app.app import create_app_icon
 from clipsave_app.database import ImportFileResult, LibraryDatabase
 from clipsave_app.main_window import AsyncSignals, MainWindow
 from clipsave_app.settings import Settings
-from clipsave_app.widgets import DateDialog, DraggableBar, MarkdownDialog, SettingsDialog
+from clipsave_app.widgets import DateDialog, DraggableBar, MarkdownDialog, SettingsDialog, Sidebar
 
 
 class MainWindowTests(unittest.TestCase):
@@ -66,6 +66,7 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertTrue(self.window.detail.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
         self.assertEqual(self.window.library_header.height(), 44)
+        self.assertEqual(self.window.top_bar.height(), Sidebar.BRAND_AREA_HEIGHT)
         self.assertIsInstance(self.window.top_bar, DraggableBar)
         if os.name == "nt":
             self.assertEqual(self.window.resize_handles, {})
@@ -111,6 +112,7 @@ class MainWindowTests(unittest.TestCase):
         dialog = SettingsDialog(self.settings, self.window)
         self.assertTrue(dialog.windowFlags() & Qt.WindowType.FramelessWindowHint)
         self.assertEqual(dialog.objectName(), "FluentDialog")
+        self.assertEqual(dialog.layout().contentsMargins().left(), 1)
         self.assertEqual(dialog.import_button.text(), "导入文件")
         self.assertTrue(dialog.follow_system_theme.isChecked())
         self.assertFalse(dialog.dark_theme_switch.isEnabled())
@@ -145,6 +147,19 @@ class MainWindowTests(unittest.TestCase):
             self.window._end_interactive_resize()
 
         self.assertEqual([call.args for call in suspended.call_args_list], [(True,), (False,)])
+
+    def test_sidebar_animation_suspends_grid_and_table_repaints(self):
+        with patch.object(self.window.grid, "set_layout_updates_suspended") as grid, patch.object(
+            self.window.table, "setUpdatesEnabled"
+        ) as table_updates, patch.object(self.window.table.viewport(), "update") as viewport_update:
+            self.window._begin_sidebar_animation()
+            self.window._end_sidebar_animation()
+
+        self.assertEqual([call.args for call in grid.call_args_list], [(True,), (False,)])
+        self.assertEqual(
+            [call.args for call in table_updates.call_args_list], [(False,), (True,)]
+        )
+        viewport_update.assert_called_once_with()
 
     def test_windows_resize_hit_test_only_uses_narrow_l_shaped_edges(self):
         hit = self.window._windows_resize_hit_test
@@ -968,6 +983,36 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window._quit_in_progress)
         self.assertTrue(self.window.centralWidget().isEnabled())
         self.assertTrue(all(shortcut.isEnabled() for shortcut in self.window.shortcuts))
+
+    def test_successful_session_shutdown_creates_backup_and_closes_database(self):
+        application = QApplication.instance()
+        with patch.object(
+            self.window.clipboard_service, "wait_for_idle", return_value=True
+        ), patch.object(
+            self.window.clipboard_service, "shutdown", return_value=True
+        ), patch.object(
+            self.database, "create_backup"
+        ) as create_backup, patch.object(
+            self.database, "close"
+        ) as database_close, patch.object(
+            application, "exit"
+        ) as exit_app:
+            self.assertTrue(self.window.quit_application_for_session_end(1.0))
+
+        create_backup.assert_called_once_with()
+        database_close.assert_called_once_with()
+        exit_app.assert_called_once_with(0)
+
+    def test_startup_scan_failure_is_preserved_for_smoke_readiness(self):
+        token = object()
+        signals = AsyncSignals()
+        self.window._startup_scan_request = (token, signals)
+        self.window._async_signals.add(signals)
+
+        self.window._startup_scan_failed(token, signals, "scan failed")
+
+        self.assertIsNone(self.window._startup_scan_request)
+        self.assertEqual(self.window.startup_scan_error, "scan failed")
 
     def test_session_shutdown_note_write_respects_deadline(self):
         item_id = self.window.current_items[0]["id"]
