@@ -28,7 +28,9 @@ from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, 
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -359,7 +361,8 @@ class _ThumbnailDecodeQueue(QObject):
             self.capacity_available.emit()
 
 
-def lucide_icon(name: str, color: str = "#354052", size: int = 20, fill: str = "none") -> QIcon:
+def lucide_icon(name: str, color: str | None = None, size: int = 20, fill: str = "none") -> QIcon:
+    color = color or theme_icon_color()
     icon = QIcon()
     for pixel_size in sorted({size, size * 2, size * 3}):
         svg = _render_icon(name, pixel_size, stroke=color, fill=fill, stroke_width="1.8")
@@ -371,6 +374,15 @@ def lucide_icon(name: str, color: str = "#354052", size: int = 20, fill: str = "
         painter.end()
         icon.addPixmap(pixmap)
     return icon
+
+
+def dark_theme_active() -> bool:
+    app = QApplication.instance()
+    return bool(app and app.property("darkTheme"))
+
+
+def theme_icon_color() -> str:
+    return "#e6e6e6" if dark_theme_active() else "#354052"
 
 
 def human_size(value: int) -> str:
@@ -411,11 +423,53 @@ class IconButton(QPushButton):
     def __init__(self, glyph: str, tooltip: str = "", parent=None):
         super().__init__(parent)
         self.setObjectName("IconButton")
-        self.setIcon(lucide_icon(GLYPHS.get(glyph, glyph)))
+        self.glyph = GLYPHS.get(glyph, glyph)
+        self.refresh_theme()
         self.setIconSize(QSize(18, 18))
         self.setToolTip(tooltip)
         self.setAccessibleName(tooltip)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_glyph(self, glyph: str) -> None:
+        self.glyph = GLYPHS.get(glyph, glyph)
+        self.refresh_theme()
+
+    def refresh_theme(self) -> None:
+        self.setIcon(lucide_icon(self.glyph, theme_icon_color()))
+
+
+class ToggleSwitch(QCheckBox):
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self.setObjectName("ToggleSwitch")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(30)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        track = QRect(0, (self.height() - 22) // 2, 40, 22)
+        painter.setPen(Qt.PenStyle.NoPen)
+        if not self.isEnabled():
+            track_color = QColor("#55585e" if dark_theme_active() else "#b7bcc4")
+        else:
+            track_color = QColor("#2f7df6") if self.isChecked() else QColor("#737b87")
+        painter.setBrush(track_color)
+        painter.drawRoundedRect(track, 11, 11)
+        knob_x = track.right() - 18 if self.isChecked() else track.left() + 3
+        painter.setBrush(QColor("#9a9da3") if not self.isEnabled() else QColor("#ffffff"))
+        painter.drawEllipse(knob_x, track.top() + 3, 16, 16)
+        if not self.isEnabled():
+            text_color = QColor("#777b82")
+        else:
+            text_color = QColor("#f2f2f2") if dark_theme_active() else QColor("#172033")
+        painter.setPen(text_color)
+        painter.drawText(
+            self.rect().adjusted(52, 0, 0, 0),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            self.text(),
+        )
+        painter.end()
 
 
 class ResizeHandle(QWidget):
@@ -455,7 +509,12 @@ class BrandLabel(QWidget):
         font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 90)
         source_painter.setFont(font)
         source_painter.setPen(self.color)
-        source_painter.drawText(source.rect(), Qt.AlignmentFlag.AlignCenter, self.text)
+        text_rect = source.rect().adjusted(16, 0, 0, 0)
+        source_painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            self.text,
+        )
         source_painter.end()
 
         target_height = max(1, round(self.height() * self.vertical_scale))
@@ -513,7 +572,7 @@ class AutoHideScrollBar(QScrollBar):
             super().paintEvent(event)
             return
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(244, 246, 249))
+        painter.fillRect(self.rect(), QColor("#202020" if dark_theme_active() else "#f4f6f9"))
         painter.end()
 
     def reveal_temporarily(self) -> None:
@@ -554,7 +613,7 @@ class WindowTitleBar(QFrame):
         return button
 
     def update_maximize_state(self, maximized: bool) -> None:
-        self.maximize_button.setIcon(lucide_icon("copy" if maximized else "square", size=14))
+        self.maximize_button.set_glyph("copy" if maximized else "square")
         label = "还原" if maximized else "最大化"
         self.maximize_button.setToolTip(label)
         self.maximize_button.setAccessibleName(label)
@@ -641,10 +700,8 @@ class NavButton(QPushButton):
             self.setText(f"{gap}{self.label}{suffix}")
             self.setToolTip("")
             self.setStyleSheet("text-align:left;")
-        self.setIcon(
-            self.custom_icon
-            or lucide_icon(self.glyph, "#2f6fca" if self.property("active") else "#4d596b")
-        )
+        inactive = "#c6ccd5" if dark_theme_active() else "#4d596b"
+        self.setIcon(self.custom_icon or lucide_icon(self.glyph, "#64b5f6" if self.property("active") else inactive))
         self.setIconSize(QSize(20, 20))
 
     def set_custom_icon(self, icon: QIcon) -> None:
@@ -668,6 +725,8 @@ class Sidebar(QWidget):
     add_tag_requested = Signal()
     settings_requested = Signal()
     collapsed_changed = Signal(bool)
+    width_animation_started = Signal()
+    width_animation_finished = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -684,6 +743,7 @@ class Sidebar(QWidget):
         self.animation.setDuration(190)
         self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.animation.finished.connect(self._finish_width_animation)
+        self._width_animation_active = False
         self.layout_root = QVBoxLayout(self)
         self.layout_root.setContentsMargins(10, 72, 10, 12)
         self.layout_root.setSpacing(4)
@@ -743,10 +803,10 @@ class Sidebar(QWidget):
             ("all", "all", "全部内容", counts.get("all", 0)),
             ("favorite", "favorite", "收藏", counts.get("favorite", 0)),
             ("recent", "recent", "最近使用", None),
-            ("date", "calendar", "按日期打开", None),
             ("image", "image", "图片", counts.get("image", 0)),
             ("text", "text", "文字", counts.get("text", 0)),
             ("markdown", "markdown", "Markdown", counts.get("markdown", 0)),
+            ("date", "calendar", "按日期打开", None),
         ]
         for key, glyph, label, count in entries:
             button = NavButton(key, glyph, label, count)
@@ -810,6 +870,8 @@ class Sidebar(QWidget):
         self.animation.stop()
         self.setMinimumWidth(72)
         if animate:
+            self._width_animation_active = True
+            self.width_animation_started.emit()
             self.animation.setStartValue(start)
             self.animation.setEndValue(end)
             self.animation.start()
@@ -821,6 +883,9 @@ class Sidebar(QWidget):
     def _finish_width_animation(self) -> None:
         self.setMaximumWidth(72 if self.collapsed else 242)
         self.setMinimumWidth(72 if self.collapsed else 200)
+        if self._width_animation_active:
+            self._width_animation_active = False
+            self.width_animation_finished.emit()
 
     def toggle_collapsed(self) -> None:
         self.set_collapsed(not self.collapsed)
@@ -854,12 +919,13 @@ class AssetGridDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#2f7df6") if selected else QColor("#dfe4eb"), 1))
-        painter.setBrush(QColor("#eef4ff") if selected else QColor("#ffffff"))
+        dark = dark_theme_active()
+        painter.setPen(QPen(QColor("#4da3ff") if selected else QColor("#4a4a4a" if dark else "#dfe4eb"), 1))
+        painter.setBrush(QColor("#26384d") if selected and dark else QColor("#eef4ff") if selected else QColor("#292929" if dark else "#ffffff"))
         painter.drawRoundedRect(card, 6, 6)
 
-        muted = QColor("#7a8699")
-        primary = QColor("#172033")
+        muted = QColor("#a7adb7" if dark else "#7a8699")
+        primary = QColor("#f2f2f2" if dark else "#172033")
         left = card.left() + 10
         right = card.right() - 10
         kind = TYPE_LABELS.get(record["kind"], record["kind"])
@@ -882,7 +948,11 @@ class AssetGridDelegate(QStyledItemDelegate):
 
         preview = QRect(left, card.top() + 42, card.width() - 20, 150)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#edf1f7") if record["kind"] == "image" else QColor("#f7f9fc"))
+        painter.setBrush(
+            QColor("#303030" if record["kind"] == "image" else "#262626")
+            if dark
+            else QColor("#edf1f7") if record["kind"] == "image" else QColor("#f7f9fc")
+        )
         painter.drawRoundedRect(preview, 5, 5)
         path = record["path"] if record["kind"] == "image" else None
         if path and self.view.preview_loading_enabled and self.view.isVisible():
@@ -902,7 +972,7 @@ class AssetGridDelegate(QStyledItemDelegate):
                 painter.drawPixmap(target, scaled)
         elif record["kind"] != "image":
             content = str(record["content"] or "").strip() or str(record["title"])
-            painter.setPen(QColor("#354052"))
+            painter.setPen(QColor("#dedede" if dark else "#354052"))
             painter.drawText(
                 preview.adjusted(10, 9, -10, -9),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
@@ -947,7 +1017,7 @@ class AssetGrid(QListView):
         self.setVerticalScrollBar(AutoHideScrollBar())
         self.setViewportMargins(14, 48, 14, 18)
         self.setSpacing(0)
-        self.setStyleSheet("QListView { background: rgb(244,246,249); border: 0; outline: 0; }")
+        self.setObjectName("AssetGrid")
         self._asset_model = AssetItemModel(self)
         self.setModel(self._asset_model)
         self.delegate = AssetGridDelegate(self)
@@ -957,6 +1027,8 @@ class AssetGrid(QListView):
         self.columns = 0
         self.preview_loading_enabled = True
         self.rebuild_pending = False
+        self._layout_updates_suspended = False
+        self._layout_update_pending = False
         self._thumbnail_generation = 0
         self._thumbnail_loader = _ThumbnailDecodeQueue(self)
         self._thumbnail_loader.decoded.connect(self._thumbnail_decoded)
@@ -986,8 +1058,21 @@ class AssetGrid(QListView):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if self._layout_updates_suspended:
+            self._layout_update_pending = True
+            return
         self._update_grid_size()
         self._thumbnail_refresh_timer.start()
+
+    def set_layout_updates_suspended(self, suspended: bool) -> None:
+        if suspended == self._layout_updates_suspended:
+            return
+        self._layout_updates_suspended = suspended
+        if not suspended and self._layout_update_pending:
+            self._layout_update_pending = False
+            self._update_grid_size()
+            self._thumbnail_refresh_timer.start()
+            self.viewport().update()
 
     def _update_grid_size(self) -> None:
         available = max(210, self.viewport().width())
@@ -1080,7 +1165,7 @@ class AssetGrid(QListView):
         super().paintEvent(event)
         if self._asset_model.rowCount() == 0:
             painter = QPainter(self.viewport())
-            painter.setPen(QColor("#7a8699"))
+            painter.setPen(QColor("#a7adb7" if dark_theme_active() else "#7a8699"))
             painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, "没有找到符合条件的内容")
             painter.end()
 
@@ -1189,13 +1274,7 @@ class AssetTable(QTableView):
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setWordWrap(False)
-        self.setStyleSheet(
-            "QTableView { background: rgb(244,246,249); alternate-background-color: rgb(240,243,247); "
-            "border: 0; gridline-color: transparent; outline: 0; selection-color: #172033; "
-            "selection-background-color: rgba(47,125,246,30); }"
-            "QTableView::item { padding: 8px 10px; border-bottom: 1px solid rgba(115,129,150,24); }"
-            "QTableView::item:selected { color: #172033; background: rgba(47,125,246,30); }"
-        )
+        self.setObjectName("AssetTable")
         self._asset_model = AssetItemModel(self)
         self.setModel(self._asset_model)
         self.verticalHeader().hide()
@@ -1309,7 +1388,8 @@ class DetailPanel(QScrollArea):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setMinimumWidth(280)
-        self.setMaximumWidth(370)
+        self.setMaximumWidth(340)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self.current_item = None
         self._thumbnail_generation = 0
         self._thumbnail_loader = _ThumbnailDecodeQueue(self)
@@ -1336,7 +1416,7 @@ class DetailPanel(QScrollArea):
         self.image_preview = QLabel()
         self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_preview.setMinimumHeight(190)
-        self.image_preview.setStyleSheet("background:rgba(235,239,245,160); border-radius:6px;")
+        self.image_preview.setObjectName("DetailPreview")
         self.text_preview = _SafeMarkdownBrowser()
         self.text_preview.setOpenExternalLinks(False)
         self.text_preview.setMinimumHeight(190)
@@ -1671,10 +1751,11 @@ class DateDialog(QDialog):
         self.setWindowTitle("按日期打开")
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setObjectName("FluentDialog")
+        self.setProperty("dateDialog", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.resize(420, 560)
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
+        root.setContentsMargins(1, 1, 1, 1)
         root.setSpacing(0)
         title_bar = DialogTitleBar("按日期打开")
         title_bar.close_button.clicked.connect(self.reject)
@@ -1717,7 +1798,7 @@ class SettingsDialog(QDialog):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setObjectName("FluentDialog")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.resize(620, 650)
+        self.resize(620, 750)
         self.setMinimumSize(480, 400)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1731,6 +1812,7 @@ class SettingsDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBar(AutoHideScrollBar())
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         content = QWidget()
         content.setObjectName("DialogContent")
         layout = QVBoxLayout(content)
@@ -1744,6 +1826,16 @@ class SettingsDialog(QDialog):
         self.close_to_tray.addItem("关闭窗口时退出", False)
         self.close_to_tray.setCurrentIndex(0 if settings.get("close_to_tray", True) else 1)
         layout.addWidget(self.close_to_tray)
+        self.follow_system_theme = ToggleSwitch("跟随 Windows 深浅色主题")
+        self.follow_system_theme.setChecked(settings.get("follow_system_theme", True))
+        layout.addWidget(self.follow_system_theme)
+        self.dark_theme_switch = ToggleSwitch("使用深色主题")
+        self.dark_theme_switch.setChecked(settings.get("theme_mode", "light") == "dark")
+        self.dark_theme_switch.setEnabled(not self.follow_system_theme.isChecked())
+        self.follow_system_theme.toggled.connect(
+            lambda checked: self.dark_theme_switch.setEnabled(not checked)
+        )
+        layout.addWidget(self.dark_theme_switch)
         hotkey_state = getattr(parent, "global_hotkey_registered", None)
         if hotkey_state is False:
             hotkey_text = "全局唤醒快捷键：Ctrl + Alt + V（注册失败，可能已被占用）"
@@ -1816,6 +1908,8 @@ class SettingsDialog(QDialog):
     def accept(self) -> None:
         values = {
             "close_to_tray": self.close_to_tray.currentData(),
+            "follow_system_theme": self.follow_system_theme.isChecked(),
+            "theme_mode": "dark" if self.dark_theme_switch.isChecked() else "light",
             "ai_base_url": self.base_url.text().strip(),
             "ai_api_key": self.api_key.text().strip(),
             "ai_vision_model": self.vision_model.text().strip(),

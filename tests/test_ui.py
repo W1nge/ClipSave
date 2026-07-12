@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QRect, Qt
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -47,9 +47,10 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.window_title_bar.height(), 32)
         self.assertEqual(self.window.brand_label.text, "ClipSave")
         self.assertEqual(self.window.brand_label.objectName(), "BrandTitle")
-        self.assertEqual(self.window.brand_label.geometry().width(), 200)
+        self.assertEqual(self.window.brand_label.geometry().x(), 10)
+        self.assertEqual(self.window.brand_label.geometry().width(), 190)
         self.assertEqual(self.window.brand_label.geometry().height(), 86)
-        self.assertEqual(self.window.brand_label.vertical_scale, 0.9)
+        self.assertEqual(self.window.brand_label.vertical_scale, 0.86)
         self.window.window_title_bar.maximize_button.click()
         self.app.processEvents()
         self.assertTrue(self.window.isMaximized())
@@ -59,6 +60,10 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(hasattr(self.window, "capture_state"))
         self.assertFalse(hasattr(self.window.sidebar, "brand_icon"))
         self.assertFalse(hasattr(self.window.sidebar, "brand"))
+        self.assertEqual(
+            list(self.window.sidebar.nav_buttons),
+            ["all", "favorite", "recent", "image", "text", "markdown", "date"],
+        )
         self.assertTrue(self.window.detail.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
         self.assertEqual(self.window.library_header.height(), 44)
         self.assertIsInstance(self.window.top_bar, DraggableBar)
@@ -102,6 +107,8 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(dialog.windowFlags() & Qt.WindowType.FramelessWindowHint)
         self.assertEqual(dialog.objectName(), "FluentDialog")
         self.assertEqual(dialog.import_button.text(), "导入文件")
+        self.assertTrue(dialog.follow_system_theme.isChecked())
+        self.assertFalse(dialog.dark_theme_switch.isEnabled())
         import_requests = []
         dialog.import_requested.connect(lambda: import_requests.append(True))
         dialog.import_button.click()
@@ -111,9 +118,67 @@ class MainWindowTests(unittest.TestCase):
         date_dialog = DateDialog(self.database.days(), self.window)
         self.assertTrue(date_dialog.windowFlags() & Qt.WindowType.FramelessWindowHint)
         self.assertEqual(date_dialog.objectName(), "FluentDialog")
+        self.assertTrue(date_dialog.property("dateDialog"))
+        self.assertEqual(date_dialog.layout().contentsMargins().left(), 1)
         date_dialog.close()
         self.assertFalse(self.window.table.showGrid())
         self.assertTrue(self.window.table.alternatingRowColors())
+
+    def test_window_geometry_is_kept_inside_the_available_screen(self):
+        screen = Mock()
+        screen.availableGeometry.return_value = QRect(0, 0, 1000, 700)
+        self.window.setGeometry(900, 650, 500, 500)
+        with patch.object(self.window, "screen", return_value=screen):
+            self.window._constrain_to_available_screen()
+        self.assertEqual(self.window.geometry(), QRect(200, 200, 800, 500))
+
+    def test_theme_follows_system_and_can_be_disabled_in_settings(self):
+        self.settings.data["follow_system_theme"] = True
+        with patch("clipsave_app.main_window.system_uses_dark_theme", return_value=True), patch(
+            "clipsave_app.main_window.apply_windows_acrylic"
+        ) as acrylic:
+            self.window.apply_theme(force=True)
+            self.app.processEvents()
+        self.assertTrue(self.window.dark_theme)
+        self.assertTrue(self.app.property("darkTheme"))
+        self.assertIn("#202020", self.window.styleSheet())
+        self.assertIn("rgba(32,32,32,204)", self.window.styleSheet())
+        self.assertIn(
+            "QWidget#ContentSurface { background: transparent; }",
+            self.window.styleSheet(),
+        )
+        self.assertNotIn(
+            "QWidget#ContentSurface { background: #202020; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "QScrollBar#AutoHideScrollBar::add-page:vertical, "
+            "QScrollBar#AutoHideScrollBar::sub-page:vertical { background: #202020; }",
+            self.window.styleSheet(),
+        )
+        self.assertNotIn("rgba(0,0,0,204)", self.window.styleSheet())
+        acrylic.assert_called_with(self.window, True)
+
+        self.settings.data["follow_system_theme"] = False
+        self.settings.data["theme_mode"] = "light"
+        self.window.apply_theme(force=True)
+        self.assertFalse(self.window.dark_theme)
+        self.assertFalse(self.app.property("darkTheme"))
+        self.assertNotIn(
+            "QWidget#ContentSurface { background: #202020; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "QScrollBar#AutoHideScrollBar::add-page:vertical, "
+            "QScrollBar#AutoHideScrollBar::sub-page:vertical { background: rgb(244,246,249); }",
+            self.window.styleSheet(),
+        )
+
+        self.settings.data["theme_mode"] = "dark"
+        self.window.apply_theme(force=True)
+        self.assertTrue(self.window.dark_theme)
+        self.settings.data["theme_mode"] = "light"
+        self.window.apply_theme(force=True)
 
     def test_saved_sort_mode_initializes_sort_button_label(self):
         self.window.close()

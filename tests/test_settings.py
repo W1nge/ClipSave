@@ -20,6 +20,8 @@ class SettingsTests(unittest.TestCase):
         settings = Settings(self.path)
 
         self.assertFalse(settings.get("monitoring"))
+        self.assertTrue(settings.get("follow_system_theme"))
+        self.assertEqual(settings.get("theme_mode"), "light")
 
     def test_invalid_and_unknown_values_are_ignored(self):
         self.path.write_text(
@@ -93,6 +95,8 @@ class SettingsTests(unittest.TestCase):
             settings.set("monitoring", 1)
         with self.assertRaises(KeyError):
             settings.set("unknown", "value")
+        with self.assertRaises(TypeError):
+            settings.set("follow_system_theme", "yes")
 
     def test_current_sort_options_pass_validation(self):
         settings = Settings(self.path)
@@ -101,6 +105,15 @@ class SettingsTests(unittest.TestCase):
             with self.subTest(sort=sort):
                 settings.set("sort", sort)
                 self.assertEqual(settings.get("sort"), sort)
+
+    def test_manual_theme_options_pass_validation(self):
+        settings = Settings(self.path)
+        settings.set("follow_system_theme", False)
+        settings.set("theme_mode", "dark")
+        self.assertFalse(settings.get("follow_system_theme"))
+        self.assertEqual(settings.get("theme_mode"), "dark")
+        with self.assertRaises(TypeError):
+            settings.set("theme_mode", "system")
 
     def test_setting_same_value_does_not_rewrite_file(self):
         settings = Settings(self.path)

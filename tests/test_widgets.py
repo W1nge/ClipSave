@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QByteArray, QPropertyAnimation, QRect, QThread, Qt, QUrl
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QTextDocument
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QWidget
+from PySide6.QtWidgets import QApplication, QScrollArea, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QWidget
 
 import clipsave_app.widgets as widgets_module
 from clipsave_app.app import create_app_icon
@@ -466,11 +466,28 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
     def test_detail_panel_scrolls_in_a_small_work_area(self):
         panel = DetailPanel()
+        self.assertEqual(panel.maximumWidth(), 340)
         panel.resize(340, 300)
         panel.show()
         self.assertTrue(wait_for(lambda: panel.verticalScrollBar().maximum() > 0))
         self.assertGreater(panel.content_widget.sizeHint().height(), panel.viewport().height())
         panel.close()
+
+    def test_settings_default_size_does_not_scroll(self):
+        settings = Mock()
+        settings.get.side_effect = lambda _key, default=None: default
+        dialog = SettingsDialog(settings)
+        self.assertEqual(dialog.height(), 750)
+        self.assertTrue(dialog.follow_system_theme.isChecked())
+        self.assertFalse(dialog.dark_theme_switch.isEnabled())
+        dialog.follow_system_theme.setChecked(False)
+        self.assertTrue(dialog.dark_theme_switch.isEnabled())
+        dialog.show()
+        self.app.processEvents()
+        scroll = dialog.findChild(QScrollArea, "DialogScroll")
+        self.assertIsNotNone(scroll)
+        self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
+        dialog.close()
 
     def test_application_icon_contains_multiple_raster_sizes(self):
         sizes = {(size.width(), size.height()) for size in create_app_icon().availableSizes()}
@@ -599,15 +616,38 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
     def test_sidebar_reuses_one_animation_without_expand_width_jump(self):
         sidebar = Sidebar()
+        started = []
+        finished = []
+        sidebar.width_animation_started.connect(lambda: started.append(True))
+        sidebar.width_animation_finished.connect(lambda: finished.append(True))
         sidebar.set_collapsed(True, animate=False)
         sidebar.set_collapsed(False, animate=True)
 
         self.assertEqual(sidebar.minimumWidth(), 72)
         self.assertEqual(len(sidebar.findChildren(QPropertyAnimation)), 1)
         self.assertTrue(wait_for(lambda: sidebar.minimumWidth() == 200))
+        self.assertEqual(started, [True])
+        self.assertEqual(finished, [True])
         sidebar.set_collapsed(True, animate=True)
         self.assertEqual(len(sidebar.findChildren(QPropertyAnimation)), 1)
         sidebar.close()
+
+    def test_grid_defers_layout_recalculation_during_sidebar_animation(self):
+        grid = AssetGrid()
+        grid.resize(600, 400)
+        grid.show()
+        self.app.processEvents()
+
+        with patch.object(grid, "_update_grid_size") as update_grid_size:
+            grid.set_layout_updates_suspended(True)
+            grid.resize(760, 400)
+            self.app.processEvents()
+            update_grid_size.assert_not_called()
+
+            grid.set_layout_updates_suspended(False)
+            update_grid_size.assert_called_once_with()
+
+        grid.close()
 
     def test_large_markdown_uses_plain_text_instead_of_blocking_rich_parse(self):
         content = "# heading\n" + ("x" * (MAX_RICH_MARKDOWN_BYTES + 1))

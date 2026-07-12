@@ -44,7 +44,7 @@ from .services import (
 from .ocr_service import WindowsOCRService
 from .settings import Settings
 from .storage import is_under_local_store, recycle_managed_file
-from .styles import LIGHT_STYLESHEET
+from .styles import DARK_STYLESHEET, LIGHT_STYLESHEET
 from .widgets import (
     AssetGrid,
     AssetTable,
@@ -70,6 +70,26 @@ SORT_BUTTON_LABELS = {
     "size": "排序：大小",
     "type": "排序：类型",
 }
+
+
+def system_uses_dark_theme() -> bool:
+    scheme = QApplication.styleHints().colorScheme()
+    if scheme == Qt.ColorScheme.Dark:
+        return True
+    if scheme == Qt.ColorScheme.Light:
+        return False
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            ) as key:
+                return int(winreg.QueryValueEx(key, "AppsUseLightTheme")[0]) == 0
+        except (OSError, ValueError):
+            pass
+    return False
 
 
 class AsyncSignals(QObject):
@@ -121,15 +141,22 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._quit_in_progress = False
         self.global_hotkey_registered: bool | None = None
+        self.dark_theme = self._desired_dark_theme()
+        app = QApplication.instance()
+        if app is not None:
+            app.setProperty("darkTheme", self.dark_theme)
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.resize(1440, 880)
         self.setMinimumSize(800, 440)
-        self.setStyleSheet(LIGHT_STYLESHEET)
+        self.setStyleSheet(DARK_STYLESHEET if self.dark_theme else LIGHT_STYLESHEET)
         self.build_ui()
         self.build_tray()
         self.build_shortcuts()
+        color_scheme_changed = getattr(QApplication.styleHints(), "colorSchemeChanged", None)
+        if color_scheme_changed is not None:
+            color_scheme_changed.connect(self._system_color_scheme_changed)
 
         self.clipboard_service = ClipboardService(database, self)
         self.clipboard_service.captured.connect(self.on_captured)
@@ -148,7 +175,36 @@ class MainWindow(QMainWindow):
         self.backup_timer.timeout.connect(self._start_periodic_backup)
         self.backup_timer.start()
         QTimer.singleShot(0, self._show_database_recovery_state)
-        QTimer.singleShot(100, lambda: apply_windows_acrylic(self))
+        QTimer.singleShot(100, lambda: apply_windows_acrylic(self, self.dark_theme))
+
+    def _desired_dark_theme(self) -> bool:
+        if self.settings.get("follow_system_theme", True):
+            return system_uses_dark_theme()
+        return self.settings.get("theme_mode", "light") == "dark"
+
+    def _system_color_scheme_changed(self, _scheme) -> None:
+        if self.settings.get("follow_system_theme", True):
+            self.apply_theme()
+
+    def apply_theme(self, force: bool = False) -> None:
+        dark = self._desired_dark_theme()
+        if not force and dark == self.dark_theme:
+            return
+        self.dark_theme = dark
+        app = QApplication.instance()
+        if app is not None:
+            app.setProperty("darkTheme", dark)
+        self.setStyleSheet(DARK_STYLESHEET if dark else LIGHT_STYLESHEET)
+        for button in self.findChildren(IconButton):
+            button.refresh_theme()
+        self.window_title_bar.update_maximize_state(self.isMaximized())
+        self.sidebar.set_active(getattr(self.sidebar, "active_key", ""))
+        self.semantic_button.setIcon(lucide_icon("sparkles"))
+        self.detail.ai_button.setIcon(lucide_icon("sparkles"))
+        self.detail.ocr_button.setIcon(lucide_icon("scan-text"))
+        self.grid.viewport().update()
+        self.table.viewport().update()
+        QTimer.singleShot(0, lambda: apply_windows_acrylic(self, dark))
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -171,8 +227,8 @@ class MainWindow(QMainWindow):
         body_layout.setSpacing(0)
         root_layout.addWidget(body, 1)
 
-        self.brand_label = BrandLabel("ClipSave", "#21a8fb", 0.9, root)
-        self.brand_label.setGeometry(0, 0, 200, 86)
+        self.brand_label = BrandLabel("ClipSave", "#21a8fb", 0.86, root)
+        self.brand_label.setGeometry(10, 0, 190, 86)
         self.brand_label.raise_()
 
         self.sidebar = Sidebar()
@@ -181,6 +237,12 @@ class MainWindow(QMainWindow):
         self.sidebar.add_tag_requested.connect(self.add_global_tag)
         self.sidebar.settings_requested.connect(self.open_settings)
         self.sidebar.collapsed_changed.connect(lambda value: self._save_setting("sidebar_collapsed", value))
+        self.sidebar.width_animation_started.connect(
+            lambda: self.grid.set_layout_updates_suspended(True)
+        )
+        self.sidebar.width_animation_finished.connect(
+            lambda: self.grid.set_layout_updates_suspended(False)
+        )
         body_layout.addWidget(self.sidebar)
 
         middle = QWidget()
@@ -565,6 +627,7 @@ class MainWindow(QMainWindow):
         else:
             self.detail.setVisible(True)
             self.detail_button.setToolTip("收起详情")
+            QTimer.singleShot(0, self._constrain_to_available_screen)
             if self.current_item_id:
                 self.update_detail(self.current_item_id)
 
@@ -581,8 +644,11 @@ class MainWindow(QMainWindow):
         active_view.selected_id = self.current_item_id
         active_view.sync_selection_from_selected_id()
         self._save_setting("view_mode", mode)
-        self.grid_button.setStyleSheet("background:rgba(47,125,246,28); color:#1769d2;" if mode == "grid" else "")
-        self.list_button.setStyleSheet("background:rgba(47,125,246,28); color:#1769d2;" if mode == "list" else "")
+        self.grid_button.setProperty("viewSelected", mode == "grid")
+        self.list_button.setProperty("viewSelected", mode == "list")
+        for button in (self.grid_button, self.list_button):
+            button.style().unpolish(button)
+            button.style().polish(button)
 
     def open_sort_menu(self) -> None:
         if self.sort_menu is not None and self.sort_menu.isVisible():
@@ -1008,9 +1074,16 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "文件导入失败", message)
 
     def open_settings(self) -> None:
+        previous_follow_system = self.settings.get("follow_system_theme", True)
+        previous_theme_mode = self.settings.get("theme_mode", "light")
         dialog = SettingsDialog(self.settings, self)
         dialog.import_requested.connect(lambda: self.import_files(dialog))
-        self._exec_transient_dialog(dialog)
+        result = self._exec_transient_dialog(dialog)
+        if result and (
+            self.settings.get("follow_system_theme", True) != previous_follow_system
+            or self.settings.get("theme_mode", "light") != previous_theme_mode
+        ):
+            self.apply_theme(force=True)
 
     def _start_async_task(self, token: object, target) -> threading.Event:
         cancel_event = threading.Event()
@@ -1597,6 +1670,25 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self.grid.set_preview_loading_enabled(self.view_stack.currentWidget() is self.grid)
+        QTimer.singleShot(0, self._constrain_to_available_screen)
+
+    def _constrain_to_available_screen(self) -> None:
+        if self.isMaximized() or self.isFullScreen():
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        width = min(self.width(), available.width())
+        height = min(self.height(), available.height())
+        x = min(max(self.x(), available.left()), available.right() - width + 1)
+        y = min(max(self.y(), available.top()), available.bottom() - height + 1)
+        if (
+            not available.contains(self.geometry())
+            or width != self.width()
+            or height != self.height()
+        ):
+            self.setGeometry(x, y, width, height)
 
     def hideEvent(self, event) -> None:
         self.grid.set_preview_loading_enabled(False)

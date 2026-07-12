@@ -15,6 +15,8 @@ DEFAULTS = {
     "view_mode": "grid",
     "sort": "newest",
     "close_to_tray": True,
+    "follow_system_theme": True,
+    "theme_mode": "light",
     "ai_base_url": "",
     "ai_api_key": "",
     "ai_vision_model": "",
@@ -28,7 +30,7 @@ _STRING_LIMITS = {
     "ai_embedding_model": 512,
 }
 
-_BOOLEAN_KEYS = {"sidebar_collapsed", "monitoring", "close_to_tray"}
+_BOOLEAN_KEYS = {"sidebar_collapsed", "monitoring", "close_to_tray", "follow_system_theme"}
 _STRING_KEYS = {
     "ai_base_url",
     "ai_api_key",
@@ -38,6 +40,7 @@ _STRING_KEYS = {
 _CHOICES = {
     "view_mode": {"grid", "list"},
     "sort": {"newest", "oldest", "name", "size", "type"},
+    "theme_mode": {"light", "dark"},
 }
 
 

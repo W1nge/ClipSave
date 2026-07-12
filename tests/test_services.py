@@ -30,6 +30,7 @@ from clipsave_app.services import (
     TaskCapacityExceeded,
     WindowsClipboardNotifier,
     ai_ocr_task_executor,
+    apply_windows_acrylic,
     preflight_image_file,
     shutdown_ai_ocr_task_executor,
 )
@@ -830,6 +831,55 @@ class PreflightTests(unittest.TestCase):
             PILImage.new("RGB", (11, 11), "white").save(path)
             with self.assertRaisesRegex(ValueError, "尺寸过大"):
                 preflight_image_file(path, max_pixels=100)
+
+
+class AcrylicTests(unittest.TestCase):
+    def test_windows_10_uses_stable_blur_behind_for_both_themes(self):
+        class AccentPolicy(ctypes.Structure):
+            _fields_ = [
+                ("accent_state", ctypes.c_int),
+                ("accent_flags", ctypes.c_int),
+                ("gradient_color", ctypes.c_uint32),
+                ("animation_id", ctypes.c_int),
+            ]
+
+        class CompositionData(ctypes.Structure):
+            _fields_ = [
+                ("attribute", ctypes.c_int),
+                ("data", ctypes.c_void_p),
+                ("size", ctypes.c_size_t),
+            ]
+
+        captured = []
+
+        def set_composition(_hwnd, data_pointer):
+            data = ctypes.cast(data_pointer, ctypes.POINTER(CompositionData)).contents
+            policy = ctypes.cast(data.data, ctypes.POINTER(AccentPolicy)).contents
+            captured.append(
+                (data.attribute, policy.accent_state, policy.accent_flags, policy.gradient_color)
+            )
+            return 1
+
+        user32 = Mock()
+        user32.SetWindowCompositionAttribute.side_effect = set_composition
+        windll = Mock(user32=user32, dwmapi=Mock())
+        version = Mock(build=19044)
+        window = Mock()
+        window.winId.return_value = 123
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch("clipsave_app.services.ctypes.windll", windll):
+            self.assertTrue(apply_windows_acrylic(window, False))
+            self.assertTrue(apply_windows_acrylic(window, True))
+
+        self.assertEqual(
+            captured,
+            [
+                (19, 3, 0, 0x00FFFFFF),
+                (19, 3, 0, 0x00FFFFFF),
+            ],
+        )
 
 
 class BoundedTaskExecutorTests(unittest.TestCase):

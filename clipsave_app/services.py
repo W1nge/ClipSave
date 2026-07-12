@@ -1253,7 +1253,7 @@ class AIService:
         return dot / norm if norm else -1.0
 
 
-def apply_windows_acrylic(window) -> bool:
+def apply_windows_acrylic(window, dark: bool = False) -> bool:
     if os.name != "nt":
         return False
     hwnd = int(window.winId())
@@ -1264,7 +1264,6 @@ def apply_windows_acrylic(window) -> bool:
             backdrop = ctypes.c_int(3)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
         else:
-            # Blur-behind avoids the severe resize/drag stalls caused by Win10 acrylic.
             class AccentPolicy(ctypes.Structure):
                 _fields_ = [
                     ("accent_state", ctypes.c_int),
@@ -1280,15 +1279,17 @@ def apply_windows_acrylic(window) -> bool:
                     ("size", ctypes.c_size_t),
                 ]
 
-            # The sidebar and toolbar provide their own tint. Keeping the native
-            # layer untinted avoids stacking two white alpha layers.
+            # Keep the stable blur-behind layer used by the light theme. The Qt
+            # sidebar and toolbar provide the requested light or dark 80% tint.
             policy = AccentPolicy(3, 0, 0x00FFFFFF, 0)
             data = WindowCompositionAttributeData(19, ctypes.addressof(policy), ctypes.sizeof(policy))
             ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
         corner = ctypes.c_int(2)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner))
-        dark = ctypes.c_int(0)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))
+        dark_mode = ctypes.c_int(1 if dark else 0)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 20, ctypes.byref(dark_mode), ctypes.sizeof(dark_mode)
+        )
         return True
     except (AttributeError, OSError):
         return False
