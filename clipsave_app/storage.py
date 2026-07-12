@@ -145,6 +145,26 @@ def _final_path_from_handle(handle: int) -> str:
     return ntpath.normcase(ntpath.abspath(path))
 
 
+def _normalized_requested_path(path: Path) -> str:
+    """Normalize an existing Windows path without resolving reparse points."""
+    requested = ntpath.abspath(str(path))
+    if os.name != "nt":
+        return ntpath.normcase(requested)
+    get_long_path = _kernel32_function(
+        "GetLongPathNameW",
+        [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD],
+        wintypes.DWORD,
+    )
+    required = get_long_path(requested, None, 0)
+    if not required:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_unicode_buffer(required + 1)
+    written = get_long_path(requested, buffer, len(buffer))
+    if not written or written >= len(buffer):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return ntpath.normcase(ntpath.abspath(buffer.value))
+
+
 def _file_information(handle: int) -> _ByHandleFileInformation:
     get_information = _kernel32_function(
         "GetFileInformationByHandle",
@@ -238,7 +258,7 @@ def _verified_windows_handle(
         if root_information.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
             raise RuntimeError(f"Managed root is a reparse point: {root}")
         final_root = _final_path_from_handle(root_handle)
-        requested_root = ntpath.normcase(ntpath.abspath(str(root)))
+        requested_root = _normalized_requested_path(root)
         if final_root != requested_root:
             raise RuntimeError(f"Managed root contains a reparse point: {root}")
 
@@ -338,7 +358,7 @@ def hold_managed_directory(path: Path, managed_root: Path | None = None):
         information = _file_information(handle)
         if information.file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
             raise RuntimeError(f"Managed directory is a reparse point: {candidate}")
-        expected_path = ntpath.normcase(ntpath.abspath(str(candidate)))
+        expected_path = _normalized_requested_path(candidate)
         if _final_path_from_handle(handle) != expected_path:
             raise RuntimeError(f"Managed directory contains a reparse point: {candidate}")
         try:

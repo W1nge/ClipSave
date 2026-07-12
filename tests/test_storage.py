@@ -1,3 +1,4 @@
+import ctypes
 import os
 import shutil
 import sqlite3
@@ -5,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from ctypes import wintypes
 from unittest.mock import Mock, patch
 
 from clipsave_app import storage
@@ -298,6 +300,27 @@ class StorageTests(unittest.TestCase):
 
         self.assertEqual(target.read_bytes(), b"replacement")
         self.assertFalse(moved_original.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle validation")
+    def test_managed_directory_accepts_equivalent_short_path(self):
+        get_short_path = storage._kernel32_function(
+            "GetShortPathNameW",
+            [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD],
+            wintypes.DWORD,
+        )
+        required = get_short_path(str(self.root), None, 0)
+        if not required:
+            self.skipTest("8.3 short paths are unavailable")
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = get_short_path(str(self.root), buffer, len(buffer))
+        if not written or written >= len(buffer) or buffer.value == str(self.root):
+            self.skipTest("test directory has no distinct 8.3 short path")
+
+        with storage.hold_managed_directory(Path(buffer.value)) as held:
+            self.assertEqual(
+                storage._normalized_requested_path(held),
+                storage._normalized_requested_path(self.root),
+            )
 
     @unittest.skipUnless(os.name == "nt", "Windows handle validation")
     def test_handle_open_rejects_existing_symlink_before_payload_write(self):

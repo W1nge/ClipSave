@@ -190,7 +190,7 @@ class _SQLiteLeafLock:
                 (int(information.file_index_high) << 32)
                 | int(information.file_index_low),
             )
-            expected_path = ntpath.normcase(ntpath.abspath(str(candidate)))
+            expected_path = storage._normalized_requested_path(candidate)
             if storage._final_path_from_handle(self.handle) != expected_path:
                 raise RuntimeError(
                     f"SQLite database leaf identity changed during open: {candidate}"
