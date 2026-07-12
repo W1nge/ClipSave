@@ -10,24 +10,184 @@ permissions:
 
 jobs:
   windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: |
+          python -m pip install --require-hashes -r requirements-windows.lock
+          python -m pip install --require-hashes -r build-requirements-windows.lock
       - name: Check dependency consistency
         run: python -m pip check
       - name: Compile
         run: python -m compileall -q clipsave.py clipsave_app tests
       - name: Test
         run: python -m unittest discover -s tests -v
+
+  package:
+    runs-on: windows-2022
+    needs: windows
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.5"
+          cache: pip
+      - name: Create clean build environment
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-windows.lock
+      - name: Verify real OCR projections
+        run: .\.venv\Scripts\python.exe -c "from clipsave_app.ocr_service import WindowsOCRService; WindowsOCRService._winrt_types()"
+      - name: Build release bundle
+        shell: cmd
+        run: set CLIPSAVE_OFFICIAL_BUILD=1&& echo.|build.bat
+      - name: Validate PyInstaller warnings
+        run: .\.venv\Scripts\python.exe check_pyinstaller_warnings.py build\work\ClipSave\warn-ClipSave.txt
+      - name: Validate release contents and version
+        shell: powershell
+        run: |
+          $required = @(
+            'build\release\ClipSave\ClipSave.exe',
+            'build\release\ClipSave\_internal',
+            'build\release\双击启动.vbs',
+            'build\release\LICENSE',
+            'build\release\THIRD_PARTY_NOTICES.md',
+            'build\release\THIRD_PARTY_LICENSES',
+            'build\release\BUILD_INFO.txt',
+            'build\release\SHA256SUMS.txt'
+          )
+          foreach ($path in $required) { if (-not (Test-Path -LiteralPath $path)) { throw "Missing $path" } }
+          $looseExe = '.\build\release\ClipSave\ClipSave.exe'
+          $version = (Get-Item $looseExe).VersionInfo
+          $expectedVersion = .\.venv\Scripts\python.exe -c "from clipsave_app.constants import APP_VERSION; print(APP_VERSION)"
+          if ($version.ProductVersion -ne $expectedVersion -or $version.ProductName -ne 'ClipSave') { throw 'Incorrect PE version metadata' }
+          $archive = Get-Item "build\release\ClipSave-$expectedVersion-windows-x64.zip"
+          if (-not $archive) { throw 'Missing release archive' }
+          if (Get-ChildItem build\release\*UNOFFICIAL*.zip) { throw 'Official CI produced an unofficial archive' }
+          $exeHash = (Get-FileHash $looseExe -Algorithm SHA256).Hash
+          foreach ($line in Get-Content .\build\release\SHA256SUMS.txt -Encoding UTF8) {
+            if ($line -notmatch '^([A-Fa-f0-9]{64})  (.+)$') { throw "Malformed checksum line: $line" }
+            $path = Join-Path '.\build\release' ($Matches[2] -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $path) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $Matches[1]) { throw "Application file checksum mismatch: $path" }
+          }
+          $archiveHash = (Get-FileHash $archive.FullName -Algorithm SHA256).Hash
+          $expectedArchiveHash = (Get-Content ($archive.FullName + '.sha256')).Split()[0]
+          if ($archiveHash -ne $expectedArchiveHash) { throw 'Archive checksum mismatch' }
+          $extract = Join-Path $PWD 'build\archive-check'
+          Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
+          .\.venv\Scripts\python.exe -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" $archive.FullName $extract
+          if ($LASTEXITCODE -ne 0) { throw 'Could not extract release archive' }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipFile = [IO.Compression.ZipFile]::OpenRead($archive.FullName)
+          try {
+            $entryNames = @($zipFile.Entries | ForEach-Object FullName)
+            if (($entryNames | Group-Object | Where-Object Count -gt 1)) { throw 'Archive contains duplicate paths' }
+            $allowedRootFiles = @('双击启动.vbs','LICENSE','THIRD_PARTY_NOTICES.md','README.md','BUILD_INFO.txt','SHA256SUMS.txt')
+            foreach ($entry in $entryNames) {
+              $normalized = $entry.Replace('\','/').TrimEnd('/')
+              if (-not $normalized) { continue }
+              if ($normalized -notlike 'ClipSave/*' -and $normalized -notlike 'THIRD_PARTY_LICENSES/*' -and $normalized -notin $allowedRootFiles) { throw "Unexpected archive path: $entry" }
+            }
+          } finally { $zipFile.Dispose() }
+          foreach ($name in @('双击启动.vbs','LICENSE','THIRD_PARTY_NOTICES.md','README.md','BUILD_INFO.txt','SHA256SUMS.txt')) {
+            $path = Join-Path $extract $name
+            if (-not (Test-Path -LiteralPath $path) -or (Get-Item -LiteralPath $path).Length -eq 0) { throw "Missing archived file $name" }
+          }
+          $archivedExe = Join-Path $extract 'ClipSave\ClipSave.exe'
+          if ((Get-FileHash $archivedExe -Algorithm SHA256).Hash -ne $exeHash) { throw 'Archived executable mismatch' }
+          $archivedVersion = (Get-Item $archivedExe).VersionInfo
+          if ($archivedVersion.ProductVersion -ne $expectedVersion -or $archivedVersion.ProductName -ne 'ClipSave') { throw 'Archived PE metadata mismatch' }
+          .\.venv\Scripts\python.exe -c "import pefile,sys; p=pefile.PE(sys.argv[1], fast_load=True); raise SystemExit(0 if p.FILE_HEADER.Machine == 0x8664 else 1)" $archivedExe
+          if ($LASTEXITCODE -ne 0) { throw 'Archived executable is not AMD64' }
+          $licenseRoot = Join-Path $extract 'THIRD_PARTY_LICENSES'
+          foreach ($name in @('CPython-PSF-2.0.txt','OpenSSL-Apache-2.0.txt','SQLite-Public-Domain.txt','Qt-LGPL-3.0-only.txt','Qt-GPL-3.0-only.txt','pywinrt-MIT.txt')) {
+            $path = Join-Path $licenseRoot "UPSTREAM_LICENSES\$name"
+            if (-not (Test-Path $path) -or (Get-Item $path).Length -eq 0) { throw "Missing archived license $name" }
+          }
+          if ((Get-ChildItem $licenseRoot -Recurse -File).Count -lt 10) { throw 'Archived license collection is unexpectedly empty' }
+          $looseBuildInfo = Get-Content .\build\release\BUILD_INFO.txt -Raw
+          $archivedBuildInfo = Get-Content (Join-Path $extract 'BUILD_INFO.txt') -Raw
+          if ($looseBuildInfo -ne $archivedBuildInfo) { throw 'Archived build information mismatch' }
+          if ($archivedBuildInfo -match '-dirty') { throw 'CI release unexpectedly came from a dirty worktree' }
+          if ($archivedBuildInfo -notmatch 'Build channel OFFICIAL') { throw 'CI release is not labeled official' }
+          if ($archivedBuildInfo -notmatch 'GitHub runner image OS \S+') { throw 'Runner image OS metadata is missing' }
+          if ($archivedBuildInfo -notmatch 'GitHub runner image version \S+') { throw 'Runner image version metadata is missing' }
+          if ($archivedBuildInfo -notmatch "Commit ${{ github.sha }}(\r?\n|$)") { throw 'Release commit provenance does not match github.sha' }
+          foreach ($line in Get-Content (Join-Path $extract 'SHA256SUMS.txt') -Encoding UTF8) {
+            if ($line -notmatch '^([A-Fa-f0-9]{64})  (.+)$') { throw "Malformed archived checksum line: $line" }
+            $path = Join-Path $extract ($Matches[2] -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $path) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $Matches[1]) { throw "Archived application checksum mismatch: $path" }
+          }
+          $manifestPaths = @(Get-Content (Join-Path $extract 'SHA256SUMS.txt') -Encoding UTF8 | ForEach-Object { if ($_ -match '^[A-Fa-f0-9]{64}  (.+)$') { $Matches[1] } }) | Sort-Object
+          $extractRoot = [IO.Path]::GetFullPath($extract).TrimEnd('\')
+          $actualPaths = @(Get-ChildItem $extract -Recurse -File | Where-Object Name -ne 'SHA256SUMS.txt' | ForEach-Object { [IO.Path]::GetFullPath($_.FullName).Substring($extractRoot.Length + 1).Replace('\','/') }) | Sort-Object
+          if (Compare-Object $manifestPaths $actualPaths) { throw 'Archive file set does not exactly match SHA256SUMS.txt' }
+          foreach ($dll in @('Qt6Core.dll','Qt6Gui.dll','Qt6Widgets.dll','Qt6Network.dll','Qt6Svg.dll')) {
+            $bundled = Join-Path $extract "ClipSave\_internal\PySide6\$dll"
+            $installed = Join-Path $PWD ".venv\Lib\site-packages\PySide6\$dll"
+            if (-not (Test-Path $bundled) -or (Get-FileHash $bundled -Algorithm SHA256).Hash -ne (Get-FileHash $installed -Algorithm SHA256).Hash) { throw "Bundled Qt DLL mismatch: $dll" }
+          }
+          .\.venv\Scripts\python.exe -c "from importlib.metadata import version; from pathlib import Path; text=Path('build/release/THIRD_PARTY_NOTICES.md').read_text(encoding='utf-8'); expected=version('PySide6-Essentials'); shiboken=version('shiboken6'); raise SystemExit(0 if f'| PySide6 Essentials | {expected} |' in text and f'| shiboken6 | {shiboken} |' in text else 1)"
+          if ($LASTEXITCODE -ne 0) { throw 'Qt notice versions do not match installed dependencies' }
+      - name: Frozen OCR import smoke test
+        shell: powershell
+        run: |
+          $process = Start-Process .\build\archive-check\ClipSave\ClipSave.exe -ArgumentList '--smoke-ocr-import' -PassThru
+          if (-not $process.WaitForExit(20000)) { $process | Stop-Process -Force; throw 'Frozen OCR import timed out' }
+          if ($process.ExitCode -ne 0) { throw "Frozen OCR import failed with exit code $($process.ExitCode)" }
+      - name: Frozen OCR runtime smoke test
+        shell: powershell
+        run: |
+          $process = Start-Process .\build\archive-check\ClipSave\ClipSave.exe -ArgumentList '--smoke-ocr-runtime' -PassThru
+          if (-not $process.WaitForExit(30000)) { $process | Stop-Process -Force; throw 'Frozen OCR runtime timed out' }
+          if ($process.ExitCode -ne 0) { throw "Frozen OCR runtime failed with exit code $($process.ExitCode)" }
+      - name: Frozen application smoke test
+        shell: powershell
+        run: |
+          $profile = Join-Path $PWD 'build\smoke-profile'
+          $ready = Join-Path $PWD 'build\smoke-ready.txt'
+          Remove-Item $profile,$ready -Recurse -Force -ErrorAction SilentlyContinue
+          $parent = Start-Process .\build\archive-check\ClipSave\ClipSave.exe -ArgumentList @('--smoke-profile', $profile, '--smoke-ready-file', $ready) -PassThru
+          $deadline = [DateTime]::UtcNow.AddSeconds(20)
+          while (-not (Test-Path $ready) -and -not $parent.HasExited -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
+          if (-not (Test-Path $ready) -or (Get-Content $ready -Raw).Trim() -ne 'ready') { if (-not $parent.HasExited) { $parent | Stop-Process -Force }; throw 'Frozen ClipSave did not report ready state' }
+          if (-not (Test-Path (Join-Path $profile 'Data\clipsave.db'))) { $parent | Stop-Process -Force; throw 'Frozen ClipSave did not initialize isolated storage' }
+          if (-not $parent.WaitForExit(20000)) { $parent | Stop-Process -Force; throw 'Frozen ClipSave did not shut down cleanly after readiness' }
+          if ($parent.ExitCode -ne 0) { throw "Frozen ClipSave exited with code $($parent.ExitCode)" }
+      - name: Frozen single-instance smoke test
+        shell: powershell
+        run: |
+          $profile = Join-Path $PWD 'build\dual-profile'
+          $firstReady = Join-Path $PWD 'build\dual-ready-1.txt'
+          $secondReady = Join-Path $PWD 'build\dual-ready-2.txt'
+          Remove-Item $profile,$firstReady,$secondReady -Recurse -Force -ErrorAction SilentlyContinue
+          $exe = '.\build\archive-check\ClipSave\ClipSave.exe'
+          $first = Start-Process $exe -ArgumentList @('--smoke-profile', $profile, '--smoke-ready-file', $firstReady, '--smoke-hold-ms', '10000') -PassThru
+          $deadline = [DateTime]::UtcNow.AddSeconds(20)
+          while (-not (Test-Path $firstReady) -and -not $first.HasExited -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+          if (-not (Test-Path $firstReady) -or (Get-Content $firstReady -Raw).Trim() -ne 'ready') { if (-not $first.HasExited) { $first | Stop-Process -Force }; throw 'First ClipSave instance did not report ready state before contention test' }
+          $second = Start-Process $exe -ArgumentList @('--smoke-profile', $profile, '--smoke-ready-file', $secondReady) -PassThru
+          if (-not $second.WaitForExit(10000)) { $second | Stop-Process -Force; $first | Stop-Process -Force; throw 'Second ClipSave instance did not exit' }
+          if (Test-Path $secondReady) { if (-not $first.HasExited) { $first | Stop-Process -Force }; throw 'Second ClipSave instance initialized the shared profile' }
+          if (-not $first.WaitForExit(20000)) { $first | Stop-Process -Force; throw 'First ClipSave instance did not shut down cleanly' }
+          if ($first.ExitCode -ne 0 -or $second.ExitCode -ne 0) { throw "Single-instance smoke exits were $($first.ExitCode) and $($second.ExitCode)" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ClipSave-windows-release
+          path: |
+            build/release/ClipSave-*-windows-x64.zip
+            build/release/ClipSave-*-windows-x64.zip.sha256
+          if-no-files-found: error

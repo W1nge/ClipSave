@@ -1,3 +1,5 @@
 """ClipSave desktop application."""
 
-__version__ = "0.2.0"
+from .constants import APP_VERSION
+
+__version__ = APP_VERSION

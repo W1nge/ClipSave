@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import secrets
 from collections import Counter
 from pathlib import Path
 
@@ -10,11 +11,14 @@ from send2trash import send2trash
 
 from .constants import LIBRARY_DIR, MAINTENANCE_DIR
 from .database import LibraryDatabase
-from .storage import is_under_local_store
+from .storage import delete_managed_file, is_under_local_store, iter_safe_files, recycle_managed_file
+from .storage import open_managed_binary
 
 
 CONFIRMATION_PHRASE = "DELETE_INDEXED_DUPLICATES"
 PERMANENT_CONFIRMATION_PHRASE = "PERMANENTLY_DELETE_INDEXED_DUPLICATES"
+MAX_MANIFEST_BYTES = 32 * 1024 * 1024
+MAX_MANIFEST_RECORDS = 200_000
 
 
 def _path_key(path: Path | str) -> str:
@@ -55,7 +59,7 @@ def scan_orphans(
 
     orphan_records = []
     errors = []
-    for path in library_dir.rglob("*"):
+    for path in iter_safe_files(library_dir):
         try:
             if path.is_symlink() or not path.is_file():
                 continue
@@ -93,9 +97,10 @@ def scan_orphans(
         "errors": errors,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = output_dir / f"orphan_manifest_{stamp}.json"
-    temporary = output_path.with_suffix(".json.tmp")
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    token = secrets.token_hex(6)
+    output_path = output_dir / f"orphan_manifest_{stamp}_{token}.json"
+    temporary = output_dir / f".orphan_manifest_{stamp}_{token}.tmp"
     temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, output_path)
     return output_path, report
@@ -110,9 +115,29 @@ def clean_indexed_duplicates(
     expected_confirmation = PERMANENT_CONFIRMATION_PHRASE if permanent else CONFIRMATION_PHRASE
     if confirmation != expected_confirmation:
         raise ValueError("Confirmation phrase does not match")
+    if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
+        raise ValueError("Maintenance manifest is too large")
     report = json.loads(manifest_path.read_text(encoding="utf-8"))
     if report.get("format_version") != 1:
         raise ValueError("Unsupported maintenance manifest")
+    records = report.get("orphans")
+    if not isinstance(records, list) or len(records) > MAX_MANIFEST_RECORDS:
+        raise ValueError("Maintenance manifest has an invalid orphan list")
+    if any(not isinstance(record, dict) for record in records):
+        raise ValueError("Maintenance manifest contains an invalid record")
+    for record in records:
+        if record.get("classification") != "indexed_duplicate":
+            continue
+        if (
+            not isinstance(record.get("path"), str)
+            or not record["path"]
+            or type(record.get("size")) is not int
+            or record["size"] < 0
+            or type(record.get("mtime_ns")) is not int
+            or not isinstance(record.get("sha256"), str)
+            or len(record["sha256"]) != 64
+        ):
+            raise ValueError("Maintenance manifest contains an invalid deletion record")
 
     result = {
         "mode": "permanent" if permanent else "recycle_bin",
@@ -121,11 +146,11 @@ def clean_indexed_duplicates(
         "skipped": 0,
         "errors": [],
     }
-    for record in report.get("orphans", []):
+    for record in records:
         if record.get("classification") != "indexed_duplicate":
             continue
-        path = Path(record.get("path", ""))
         try:
+            path = Path(record["path"])
             if not is_under_local_store(path) or not path.is_file() or path.is_symlink():
                 result["skipped"] += 1
                 continue
@@ -137,21 +162,58 @@ def clean_indexed_duplicates(
             if digest != record.get("sha256"):
                 result["skipped"] += 1
                 continue
-            indexed = database.indexed_file_for_hash(digest)
-            if indexed is None:
-                result["skipped"] += 1
-                continue
-            indexed_path = Path(indexed["path"])
-            if _path_key(indexed_path) == _path_key(path):
-                result["skipped"] += 1
-                continue
-            if not indexed_path.is_file() or LibraryDatabase.file_hash(indexed_path) != digest:
-                result["skipped"] += 1
-                continue
-            if permanent:
-                path.unlink()
-            else:
-                send2trash(str(path))
+            with database._lock:
+                indexed = database.indexed_file_for_hash(digest)
+                if indexed is None:
+                    result["skipped"] += 1
+                    continue
+                indexed_path = Path(indexed["path"])
+                if (
+                    not is_under_local_store(indexed_path)
+                    or _path_key(indexed_path) == _path_key(path)
+                ):
+                    result["skipped"] += 1
+                    continue
+                with open_managed_binary(
+                    indexed_path, "rb", LIBRARY_DIR, identity_locked=True
+                ) as keeper:
+                    keeper_stat = os.fstat(keeper.fileno())
+                    if LibraryDatabase._stream_hash(keeper) != digest:
+                        result["skipped"] += 1
+                        continue
+                    current_indexed = database.indexed_file_for_hash(digest)
+                    if (
+                        current_indexed is None
+                        or current_indexed["id"] != indexed["id"]
+                        or _path_key(current_indexed["path"]) != _path_key(indexed_path)
+                    ):
+                        result["skipped"] += 1
+                        continue
+                    final_stat = path.stat()
+                    if (
+                        keeper_stat.st_size != record["size"]
+                        or not is_under_local_store(path)
+                        or final_stat.st_size != stat.st_size
+                        or final_stat.st_mtime_ns != stat.st_mtime_ns
+                        or getattr(final_stat, "st_ino", None) != getattr(stat, "st_ino", None)
+                    ):
+                        result["skipped"] += 1
+                        continue
+                    if permanent:
+                        delete_managed_file(
+                            path,
+                            LIBRARY_DIR,
+                            expected_sha256=digest,
+                            expected_size=stat.st_size,
+                        )
+                    else:
+                        recycle_managed_file(
+                            path,
+                            LIBRARY_DIR,
+                            send2trash,
+                            expected_sha256=digest,
+                            expected_size=stat.st_size,
+                        )
             result["deleted"] += 1
             result["deleted_bytes"] += stat.st_size
         except Exception as exc:

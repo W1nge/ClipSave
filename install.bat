@@ -42,7 +42,7 @@ if errorlevel 1 (
   goto :unsupported_python
 )
 
-.venv\Scripts\python.exe -m pip install -r requirements.txt --progress-bar off
+.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-windows.lock --progress-bar off
 if errorlevel 1 goto :failed
 
 .venv\Scripts\python.exe -m pip uninstall --yes pyperclip

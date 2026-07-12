@@ -6,19 +6,22 @@ ClipSave uses and distributes third-party software. This document records the ve
 
 | Component | Version | License identified by the project/package | Upstream |
 | --- | --- | --- | --- |
+| CPython runtime | 3.13.5 | Python Software Foundation License Version 2 | [CPython](https://github.com/python/cpython) |
+| OpenSSL runtime libraries | 3.x | Apache-2.0 | [OpenSSL](https://www.openssl.org/) |
+| SQLite runtime library | 3.x | Public domain | [SQLite](https://www.sqlite.org/) |
 | PySide6 Essentials | 6.9.1 | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only; Qt also offers commercial terms separately | [Qt for Python](https://code.qt.io/cgit/pyside/pyside-setup.git/) |
 | shiboken6 | 6.9.1 | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only; Qt also offers commercial terms separately | [Qt for Python](https://code.qt.io/cgit/pyside/pyside-setup.git/) |
 | lucide Python package | 1.1.4 | MIT | [lucide-python](https://github.com/fmacedo/lucide-python) |
 | Pillow | 12.3.0 | HPND/Pillow license family; the 12.3.0 wheel's included license text describes it as MIT-CMU | [Pillow](https://github.com/python-pillow/Pillow) |
 | Send2Trash | 2.1.0 | BSD-3-Clause | [Send2Trash](https://github.com/arsenetar/send2trash) |
 | winrt-runtime and requested winrt-Windows projections | 3.2.1 | MIT | [pywinrt](https://github.com/pywinrt/pywinrt) |
-| typing_extensions | 4.16.0 in the verified build environment (transitive, not directly pinned) | PSF-2.0 | [typing_extensions](https://github.com/python/typing_extensions) |
+| typing_extensions | 4.16.0 | PSF-2.0 | [typing_extensions](https://github.com/python/typing_extensions) |
 
-The installed wheels contain the authoritative license text supplied with each package. Copyright notices and complete terms should be taken from those wheel files and the linked upstream release sources when preparing a public release archive.
+Release archives include `THIRD_PARTY_LICENSES/`, containing the license and metadata files supplied by installed wheels. The bundled CPython, OpenSSL and SQLite notices and fixed-version upstream texts needed by PySide6 and pywinrt are included under `THIRD_PARTY_LICENSES/UPSTREAM_LICENSES/`.
 
-## Qt and the single-file executable
+## Qt and the application directory
 
-ClipSave remains a PyInstaller `--onefile` application. The single EXE contains Qt dynamic libraries and plugins in its bundled archive; at runtime PyInstaller extracts those files to a temporary directory before loading them. The delivery format therefore remains one EXE, while the Qt libraries are still dynamically loaded files at runtime.
+Official ClipSave release archives use PyInstaller `--onedir`. Qt dynamic libraries and plugins remain separate files under `ClipSave/_internal`, so recipients can inspect and replace compatible Qt binaries without modifying `ClipSave.exe`. The repository includes the application source, build script, dependency versions, and installation information needed to rebuild the combined work.
 
 Source retrieval information for the pinned Qt/PySide line:
 
@@ -26,7 +29,7 @@ Source retrieval information for the pinned Qt/PySide line:
 - Qt for Python/PySide source archive: [PySide6 release sources](https://download.qt.io/official_releases/QtForPython/pyside6/)
 - Qt licensing texts and FAQ: [Qt licensing](https://www.qt.io/licensing/)
 
-Anyone redistributing `ClipSave.exe` should keep this notice available with the release and verify that the exact Qt binaries in the built artifact correspond to the documented source version.
+Anyone redistributing the `ClipSave` application directory should keep this notice available with the release and verify that the exact Qt binaries in the artifact correspond to the documented source version.
 
 ## Build tooling
 

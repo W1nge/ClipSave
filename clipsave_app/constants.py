@@ -1,12 +1,38 @@
 import sys
 import os
+import ctypes
 from pathlib import Path
 
 
+def _windows_local_appdata() -> Path:
+    buffer = ctypes.create_unicode_buffer(32768)
+    result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x001C, None, 0, buffer)
+    if result != 0 or not buffer.value:
+        raise OSError(f"SHGetFolderPathW(CSIDL_LOCAL_APPDATA) failed: {result}")
+    return Path(buffer.value)
+
+
+def _local_appdata() -> Path:
+    if os.name == "nt":
+        return _windows_local_appdata()
+    return Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share"))
+
+
+def _configured_local_root() -> Path:
+    try:
+        profile_index = sys.argv.index("--smoke-profile")
+        ready_index = sys.argv.index("--smoke-ready-file")
+        if ready_index + 1 >= len(sys.argv):
+            raise IndexError
+        return Path(sys.argv[profile_index + 1])
+    except (ValueError, IndexError):
+        return _local_appdata() / "ClipSave"
+
+
 APP_NAME = "ClipSave"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
-LOCAL_ROOT = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "ClipSave"
+LOCAL_ROOT = _configured_local_root()
 DATA_DIR = LOCAL_ROOT / "Data"
 LIBRARY_DIR = LOCAL_ROOT / "Library"
 PICTURE_DIR = LIBRARY_DIR / "Pictures"

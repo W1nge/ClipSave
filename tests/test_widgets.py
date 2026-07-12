@@ -1,21 +1,34 @@
 import os
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
-from collections import deque
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QThread, Qt
-from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtCore import QByteArray, QPropertyAnimation, QRect, QThread, Qt, QUrl
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QTextDocument
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QTableWidget, QTableWidgetItem, QWidget
+from PySide6.QtWidgets import QApplication, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QWidget
 
 import clipsave_app.widgets as widgets_module
-from clipsave_app.widgets import AssetGrid, AssetTable, DetailPanel, _THUMBNAIL_CACHE, thumbnail_pixmap
+from clipsave_app.app import create_app_icon
+from clipsave_app.widgets import (
+    AssetGrid,
+    AssetTable,
+    DetailPanel,
+    MarkdownDialog,
+    MAX_RICH_MARKDOWN_BYTES,
+    Sidebar,
+    SettingsDialog,
+    _SafeMarkdownBrowser,
+    _THUMBNAIL_CACHE,
+    _startfile_or_warn,
+    thumbnail_pixmap,
+)
 
 
 def asset_records(count: int, *, kind: str = "text", path: str | None = None) -> list[dict]:
@@ -102,26 +115,131 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertEqual(len(_THUMBNAIL_CACHE), 1)
         grid.close()
 
-    def test_grid_pauses_hidden_preview_queue_and_uses_deque(self):
+    def test_grid_delegate_accepts_sqlite_rows_from_production_queries(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """SELECT 1 AS id, 'image' AS kind, 'row image' AS title,
+                      'missing.png' AS path, '' AS content, 0 AS favorite,
+                      '2026-07-12T10:00:00' AS created_at, 64 AS width,
+                      40 AS height, 128 AS file_size, '' AS tag_names,
+                      'hash' AS content_hash"""
+        ).fetchone()
         grid = AssetGrid()
+        grid.resize(520, 400)
+        grid.show()
+        grid.set_items([row])
+        canvas = QImage(300, 280, QImage.Format.Format_ARGB32)
+        canvas.fill(Qt.GlobalColor.transparent)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 280, 270)
+        painter = QPainter(canvas)
+        with patch.object(grid, "thumbnail_for_index", return_value=None):
+            grid.delegate.paint(painter, option, grid.model().index(0, 0))
+        painter.end()
+        grid.close()
+        connection.close()
+
+    def test_null_thumbnail_decode_is_not_cached(self):
+        path = Path(self.temp.name) / "invalid.png"
+        path.write_bytes(b"not an image")
+        key = widgets_module._thumbnail_cache_key(path)
+
+        self.assertIsNotNone(key)
+        self.assertIsNone(widgets_module._cache_decoded_thumbnail(key, QImage()))
+        self.assertEqual(len(_THUMBNAIL_CACHE), 0)
+
+    def test_same_size_and_mtime_replacement_invalidates_thumbnail_cache(self):
+        path = Path(self.temp.name) / "replace.bmp"
+        red = QImage(32, 32, QImage.Format.Format_RGB32)
+        red.fill(QColor("#ff0000"))
+        blue = QImage(32, 32, QImage.Format.Format_RGB32)
+        blue.fill(QColor("#0000ff"))
+        self.assertTrue(red.save(str(path), "BMP"))
+        original_stat = path.stat()
+        original_key = widgets_module._thumbnail_cache_key(path, "original-hash")
+        self.assertIsNotNone(
+            widgets_module._cache_decoded_thumbnail(original_key, red)
+        )
+
+        QTest.qWait(10)
+        self.assertTrue(blue.save(str(path), "BMP"))
+        self.assertEqual(path.stat().st_size, original_stat.st_size)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+        replacement_key = widgets_module._thumbnail_cache_key(path, "replacement-hash")
+        self.assertNotEqual(replacement_key, original_key)
+        self.assertTrue(thumbnail_pixmap(path, "replacement-hash").isNull())
+
+    def test_new_thumbnail_generation_can_replace_blocked_stale_decodes(self):
+        decode_queue = widgets_module._ThumbnailDecodeQueue(max_workers=2, max_requests=8)
+        stale_started = threading.Event()
+        stale_release = threading.Event()
+        current_started = threading.Event()
+        started_count = 0
+        started_lock = threading.Lock()
+        stale_keys = [
+            widgets_module._ThumbnailCacheKey(f"stale-{index}", index, 1)
+            for index in range(2)
+        ]
+        current_key = widgets_module._ThumbnailCacheKey("current", 3, 1)
+
+        def blocking_decode(key):
+            nonlocal started_count
+            if key in stale_keys:
+                with started_lock:
+                    started_count += 1
+                    if started_count == len(stale_keys):
+                        stale_started.set()
+                stale_release.wait(2)
+            else:
+                current_started.set()
+            return QImage()
+
+        with patch("clipsave_app.widgets._decode_thumbnail_image", side_effect=blocking_decode):
+            for key in stale_keys:
+                self.assertTrue(decode_queue.request(key, 1))
+            self.assertTrue(stale_started.wait(1))
+            decode_queue.cancel_queued()
+            self.assertTrue(decode_queue.request(current_key, 2))
+            self.assertTrue(current_started.wait(1))
+            stale_release.set()
+            self.assertTrue(wait_for(lambda: decode_queue.pending_count == 0))
+
+        self.assertTrue(decode_queue.close())
+
+    def test_paused_thumbnail_queue_rejects_new_work_until_resumed(self):
+        decode_queue = widgets_module._ThumbnailDecodeQueue(max_workers=1, max_requests=4)
+        key = widgets_module._ThumbnailCacheKey("paused", 1, 1)
+
+        self.assertTrue(decode_queue.pause_and_wait())
+        self.assertFalse(decode_queue.request(key, 1))
+        decode_queue.resume()
+        self.assertTrue(decode_queue.request(key, 1))
+        self.assertTrue(wait_for(lambda: decode_queue.pending_count == 0))
+        self.assertTrue(decode_queue.close())
+
+    def test_rapid_viewport_changes_are_coalesced_into_one_generation(self):
+        grid = AssetGrid()
+        grid.resize(520, 400)
         grid.show()
         self.app.processEvents()
-        card = Mock()
-        grid.pending_previews.append(card)
-        self.assertIsInstance(grid.pending_previews, deque)
+        grid._thumbnail_refresh_timer.stop()
+        initial_generation = grid._thumbnail_generation
 
-        grid.set_preview_loading_enabled(False)
-        grid._load_next_preview()
-        card.load_preview.assert_not_called()
-        self.assertEqual(len(grid.pending_previews), 1)
+        with patch.object(
+            grid._thumbnail_loader,
+            "cancel_queued",
+            wraps=grid._thumbnail_loader.cancel_queued,
+        ) as cancel:
+            grid._thumbnail_viewport_changed(10)
+            grid._thumbnail_viewport_changed(20)
+            self.assertEqual(grid._thumbnail_generation, initial_generation)
+            self.assertTrue(
+                wait_for(lambda: grid._thumbnail_generation == initial_generation + 1)
+            )
 
-        grid.set_preview_loading_enabled(True)
-        grid._load_next_preview()
-        card.load_preview.assert_called_once()
-        grid.hide()
-        grid.set_items([])
-        self.assertTrue(grid.rebuild_pending)
-        self.assertFalse(grid.rebuild_timer.isActive())
+        cancel.assert_called_once_with()
         grid.close()
 
     def test_table_keeps_fixed_row_height_without_full_resize(self):
@@ -156,13 +274,44 @@ class ThumbnailPixmapTests(unittest.TestCase):
             self.assertEqual(table.model().rowCount(), count)
             self.assertEqual(grid.selected_id, count)
             self.assertEqual(table.selected_id, count)
-            self.assertEqual(len(grid.cards), 0)
             widget_counts.append((len(grid.findChildren(QWidget)), len(table.findChildren(QWidget))))
 
         self.assertLessEqual(widget_counts[1][0], widget_counts[0][0] + 2)
         self.assertLessEqual(widget_counts[1][1], widget_counts[0][1] + 2)
         self.assertTrue(hasattr(grid, "favorite_requested"))
         self.assertTrue(hasattr(table, "favorite_requested"))
+        grid.close()
+        table.close()
+
+    def test_views_resynchronize_visual_selection_from_selected_id_without_emitting(self):
+        records = asset_records(3)
+        grid = AssetGrid()
+        table = AssetTable()
+        grid.set_items(records, selected_id=1)
+        table.set_items(records, selected_id=1)
+        grid_selected = Mock()
+        table_selected = Mock()
+        grid.item_selected.connect(grid_selected)
+        table.item_selected.connect(table_selected)
+
+        grid.selected_id = 3
+        table.selected_id = 3
+        grid.sync_selection_from_selected_id()
+        table.sync_selection_from_selected_id()
+
+        self.assertEqual(grid.currentIndex().row(), 2)
+        self.assertEqual(table.currentIndex().row(), 2)
+        self.assertEqual([index.row() for index in grid.selectionModel().selectedIndexes()], [2])
+        self.assertEqual([index.row() for index in table.selectionModel().selectedRows()], [2])
+        grid_selected.assert_not_called()
+        table_selected.assert_not_called()
+
+        grid.selected_id = 99
+        table.selected_id = 99
+        grid.sync_selection_from_selected_id()
+        table.sync_selection_from_selected_id()
+        self.assertFalse(grid.currentIndex().isValid())
+        self.assertFalse(table.currentIndex().isValid())
         grid.close()
         table.close()
 
@@ -238,20 +387,36 @@ class ThumbnailPixmapTests(unittest.TestCase):
         selected = Mock()
         activated = Mock()
         favorite = Mock()
+        cleared = Mock()
         grid.item_selected.connect(selected)
         grid.item_activated.connect(activated)
         grid.favorite_requested.connect(favorite)
+        grid.selection_cleared.connect(cleared)
 
         favorite_point = grid.delegate.favorite_rect(grid.visualRect(index)).center()
         QTest.mouseClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=favorite_point)
         favorite.assert_called_once_with(1, True)
-        selected.assert_not_called()
+        selected.assert_called_once_with(1)
 
         card_center = grid.delegate.card_rect(grid.visualRect(index)).center()
         QTest.mouseClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=card_center)
         selected.assert_called_with(1)
         QTest.mouseDClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=card_center)
         activated.assert_called_with(1)
+        second_index = grid.model().index(1, 0)
+        grid.setCurrentIndex(second_index)
+        self.app.processEvents()
+        selected.assert_called_with(2)
+        second_center = grid.delegate.card_rect(grid.visualRect(second_index)).center()
+        QTest.mouseClick(
+            grid.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ControlModifier,
+            pos=second_center,
+        )
+        self.app.processEvents()
+        cleared.assert_called_once_with()
+        self.assertIsNone(grid.selected_id)
         grid.close()
 
     def test_detail_clears_preview_and_updates_image_only_buttons(self):
@@ -298,6 +463,35 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertIsNone(panel.current_item)
         self.assertTrue(all(not button.isEnabled() for button in panel.item_action_buttons))
         panel.close()
+
+    def test_detail_panel_scrolls_in_a_small_work_area(self):
+        panel = DetailPanel()
+        panel.resize(340, 300)
+        panel.show()
+        self.assertTrue(wait_for(lambda: panel.verticalScrollBar().maximum() > 0))
+        self.assertGreater(panel.content_widget.sizeHint().height(), panel.viewport().height())
+        panel.close()
+
+    def test_application_icon_contains_multiple_raster_sizes(self):
+        sizes = {(size.width(), size.height()) for size in create_app_icon().availableSizes()}
+        self.assertTrue({(32, 32), (64, 64), (128, 128), (256, 256)}.issubset(sizes))
+
+    def test_icon_controls_have_accessible_names(self):
+        button = widgets_module.IconButton("close", "Close details")
+        status = widgets_module.CaptureStatusButton()
+        self.assertEqual(button.accessibleName(), "Close details")
+        self.assertTrue(status.accessibleName())
+        button.close()
+        status.close()
+
+    def test_collapsed_navigation_keeps_accessible_names(self):
+        sidebar = widgets_module.Sidebar()
+        sidebar.set_primary({"all": 1})
+        sidebar.set_collapsed(True, animate=False)
+        self.assertTrue(sidebar.nav_buttons)
+        for button in sidebar.nav_buttons.values():
+            self.assertEqual(button.accessibleName(), button.label)
+        sidebar.close()
 
     def test_stale_grid_generation_does_not_cache_completed_decode(self):
         path = Path(self.temp.name) / "stale.png"
@@ -372,6 +566,8 @@ class ThumbnailPixmapTests(unittest.TestCase):
             return QImage()
 
         queue = widgets_module._ThumbnailDecodeQueue(max_workers=1, max_requests=3)
+        capacity_events = []
+        queue.capacity_available.connect(lambda: capacity_events.append(True))
         keys = [
             widgets_module._ThumbnailCacheKey(str(Path(self.temp.name) / f"{index}.png"), index, index)
             for index in range(5)
@@ -385,6 +581,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
                 self.assertLessEqual(queue.queued_count, 2)
                 release.set()
                 self.assertTrue(wait_for(lambda: queue.pending_count == 0))
+                self.assertTrue(capacity_events)
         finally:
             release.set()
             queue.close()
@@ -398,6 +595,134 @@ class ThumbnailPixmapTests(unittest.TestCase):
             self.assertEqual(len(_THUMBNAIL_CACHE), 3)
         finally:
             _THUMBNAIL_CACHE.limit = original_limit
+
+
+    def test_sidebar_reuses_one_animation_without_expand_width_jump(self):
+        sidebar = Sidebar()
+        sidebar.set_collapsed(True, animate=False)
+        sidebar.set_collapsed(False, animate=True)
+
+        self.assertEqual(sidebar.minimumWidth(), 72)
+        self.assertEqual(len(sidebar.findChildren(QPropertyAnimation)), 1)
+        self.assertTrue(wait_for(lambda: sidebar.minimumWidth() == 200))
+        sidebar.set_collapsed(True, animate=True)
+        self.assertEqual(len(sidebar.findChildren(QPropertyAnimation)), 1)
+        sidebar.close()
+
+    def test_large_markdown_uses_plain_text_instead_of_blocking_rich_parse(self):
+        content = "# heading\n" + ("x" * (MAX_RICH_MARKDOWN_BYTES + 1))
+        with patch.object(_SafeMarkdownBrowser, "setMarkdown") as set_markdown, patch.object(
+            _SafeMarkdownBrowser, "setPlainText"
+        ) as set_plain_text:
+            dialog = MarkdownDialog("Large", content)
+
+        set_plain_text.assert_called_once_with(content)
+        set_markdown.assert_not_called()
+        dialog.close()
+
+
+class WidgetSafetyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_sidebar_tag_color_icon_survives_active_state_refresh(self):
+        sidebar = Sidebar()
+        sidebar.set_tags([{"id": 7, "name": "Red", "amount": 1, "color": "#ff0000"}])
+        button = sidebar.tag_buttons[0]
+        color_icon_key = button.icon().cacheKey()
+
+        sidebar.set_active("tag:7")
+        self.assertEqual(button.icon().cacheKey(), color_icon_key)
+        sidebar.set_active("all")
+        self.assertEqual(button.icon().cacheKey(), color_icon_key)
+        sidebar.close()
+
+    def test_sidebar_tags_created_while_collapsed_stay_collapsed(self):
+        sidebar = Sidebar()
+        sidebar.set_collapsed(True, animate=False)
+        sidebar.set_tags([{"id": 7, "name": "Red", "amount": 1, "color": "#ff0000"}])
+
+        self.assertTrue(sidebar.tag_buttons[0].collapsed)
+        self.assertEqual(sidebar.tag_buttons[0].text(), "")
+        sidebar.close()
+
+    def test_table_clear_selection_also_clears_current_index(self):
+        table = AssetTable()
+        table.set_items(asset_records(2), selected_id=2)
+        self.assertTrue(table.currentIndex().isValid())
+
+        table.clear_selected_item()
+
+        self.assertFalse(table.currentIndex().isValid())
+        table.close()
+
+    def test_markdown_browsers_block_local_unc_and_network_resources(self):
+        browser = _SafeMarkdownBrowser()
+        blocked_urls = (
+            "relative.png",
+            "C:/Users/example/private.png",
+            "file:///C:/Users/example/private.png",
+            r"\\server\share\private.png",
+            "//server/share/private.png",
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+            "https://example.com/tracker.png",
+            "ftp://example.com/private.png",
+        )
+
+        for value in blocked_urls:
+            with self.subTest(value=value):
+                resource = browser.loadResource(QTextDocument.ResourceType.ImageResource, QUrl(value))
+                self.assertIsInstance(resource, QByteArray)
+                self.assertTrue(resource.isEmpty())
+
+        dialog = MarkdownDialog("Example", "![private](relative.png)", r"C:\notes\example.md")
+        panel = DetailPanel()
+        self.assertEqual(dialog.browser.searchPaths(), [])
+        self.assertIsInstance(panel.text_preview, _SafeMarkdownBrowser)
+        dialog.close()
+        panel.close()
+        browser.close()
+
+    def test_failed_settings_save_restores_previous_data(self):
+        settings = Mock()
+        settings.data = {
+            "close_to_tray": True,
+            "ai_base_url": "https://old.example/v1",
+            "custom": "preserve",
+        }
+        settings.get.side_effect = lambda key, default=None: settings.data.get(key, default)
+        settings.update.side_effect = OSError("disk full")
+        dialog = SettingsDialog(settings)
+        dialog.base_url.setText("https://new.example/v1")
+
+        with patch("clipsave_app.widgets.QMessageBox.warning") as warning:
+            dialog.accept()
+
+        self.assertEqual(
+            settings.data,
+            {
+                "close_to_tray": True,
+                "ai_base_url": "https://old.example/v1",
+                "custom": "preserve",
+            },
+        )
+        settings.update.assert_called_once()
+        warning.assert_called_once()
+        self.assertEqual(dialog.result(), 0)
+        dialog.close()
+
+    def test_startfile_failure_is_reported_to_the_user(self):
+        parent = QWidget()
+        with (
+            patch("clipsave_app.widgets.os.startfile", side_effect=OSError("no association")) as startfile,
+            patch("clipsave_app.widgets.QMessageBox.warning") as warning,
+        ):
+            _startfile_or_warn(parent, Path("missing.md"))
+
+        startfile.assert_called_once_with("missing.md")
+        warning.assert_called_once()
+        parent.close()
 
 
 if __name__ == "__main__":

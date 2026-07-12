@@ -7,6 +7,13 @@ from clipsave_app.ocr_service import WindowsOCRService
 from clipsave_app.services import OperationCancelled
 
 
+class Snapshot:
+    path = Path("image.png").resolve()
+
+    def require_current(self):
+        return None
+
+
 class Closable:
     def __init__(self):
         self.closed = False
@@ -61,7 +68,10 @@ def fake_winrt_types(*, engine_available=True):
 class WindowsOCRServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_recognize_async_closes_stream_and_bitmap(self):
         types, stream, bitmap = fake_winrt_types()
-        with patch.object(WindowsOCRService, "_winrt_types", return_value=types):
+        with (
+            patch("clipsave_app.ocr_service.preflight_image_file", return_value=Snapshot()),
+            patch.object(WindowsOCRService, "_winrt_types", return_value=types),
+        ):
             text = await WindowsOCRService.recognize_async(Path("image.png"))
 
         self.assertEqual(text, "recognized text")
@@ -70,7 +80,10 @@ class WindowsOCRServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recognize_async_closes_resources_when_engine_is_unavailable(self):
         types, stream, bitmap = fake_winrt_types(engine_available=False)
-        with patch.object(WindowsOCRService, "_winrt_types", return_value=types):
+        with (
+            patch("clipsave_app.ocr_service.preflight_image_file", return_value=Snapshot()),
+            patch.object(WindowsOCRService, "_winrt_types", return_value=types),
+        ):
             with self.assertRaisesRegex(RuntimeError, "OCR 语言包"):
                 await WindowsOCRService.recognize_async(Path("image.png"))
 
@@ -85,11 +98,23 @@ class WindowsOCRServiceTests(unittest.IsolatedAsyncioTestCase):
         types, stream, bitmap = fake_winrt_types()
         cancel_event = threading.Event()
         cancel_event.set()
-        with patch.object(WindowsOCRService, "_winrt_types", return_value=types):
+        with (
+            patch("clipsave_app.ocr_service.preflight_image_file", return_value=Snapshot()),
+            patch.object(WindowsOCRService, "_winrt_types", return_value=types),
+        ):
             with self.assertRaises(OperationCancelled):
                 await WindowsOCRService.recognize_async(Path("image.png"), cancel_event)
         self.assertFalse(stream.closed)
         self.assertFalse(bitmap.closed)
+
+    async def test_preflight_failure_happens_before_loading_winrt(self):
+        with (
+            patch("clipsave_app.ocr_service.preflight_image_file", side_effect=ValueError("too many pixels")),
+            patch.object(WindowsOCRService, "_winrt_types") as winrt_types,
+        ):
+            with self.assertRaisesRegex(ValueError, "too many pixels"):
+                await WindowsOCRService.recognize_async(Path("image.png"))
+        winrt_types.assert_not_called()
 
 
 if __name__ == "__main__":

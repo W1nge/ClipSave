@@ -20,6 +20,7 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QThreadPool,
     QTimer,
+    QUrl,
     Signal,
     Slot,
 )
@@ -100,9 +101,13 @@ class _ThumbnailCacheKey:
     path: str
     modified_ns: int
     size: int
+    changed_ns: int = 0
+    content_hash: str = ""
 
 
-def _thumbnail_cache_key(path: Path | str) -> _ThumbnailCacheKey | None:
+def _thumbnail_cache_key(
+    path: Path | str, content_hash: str | None = None
+) -> _ThumbnailCacheKey | None:
     normalized = normalized_thumbnail_path(path)
     if normalized is None:
         return None
@@ -110,7 +115,13 @@ def _thumbnail_cache_key(path: Path | str) -> _ThumbnailCacheKey | None:
         stat = os.stat(normalized)
     except OSError:
         return None
-    return _ThumbnailCacheKey(normalized, stat.st_mtime_ns, stat.st_size)
+    return _ThumbnailCacheKey(
+        normalized,
+        stat.st_mtime_ns,
+        stat.st_size,
+        getattr(stat, "st_ctime_ns", 0),
+        content_hash or "",
+    )
 
 
 class _ThumbnailPixmapCache(OrderedDict):
@@ -166,8 +177,10 @@ class _ThumbnailPixmapCache(OrderedDict):
 _THUMBNAIL_CACHE = _ThumbnailPixmapCache(_THUMBNAIL_CACHE_LIMIT)
 
 
-def _cached_thumbnail(path: Path | str) -> tuple[_ThumbnailCacheKey | None, QPixmap | None, bool]:
-    key = _thumbnail_cache_key(path)
+def _cached_thumbnail(
+    path: Path | str, content_hash: str | None = None
+) -> tuple[_ThumbnailCacheKey | None, QPixmap | None, bool]:
+    key = _thumbnail_cache_key(path, content_hash)
     if key is None:
         _THUMBNAIL_CACHE.invalidate_path(path)
         return None, None, False
@@ -175,8 +188,8 @@ def _cached_thumbnail(path: Path | str) -> tuple[_ThumbnailCacheKey | None, QPix
     return key, pixmap, pixmap is not None
 
 
-def thumbnail_pixmap(path: Path) -> QPixmap:
-    _key, pixmap, cached = _cached_thumbnail(path)
+def thumbnail_pixmap(path: Path, content_hash: str | None = None) -> QPixmap:
+    _key, pixmap, cached = _cached_thumbnail(path, content_hash)
     if cached:
         return pixmap
     return QPixmap()
@@ -199,10 +212,16 @@ def _decode_thumbnail_image(key: _ThumbnailCacheKey) -> QImage:
 
 
 def _cache_decoded_thumbnail(key: _ThumbnailCacheKey, image: QImage) -> QPixmap | None:
-    if _thumbnail_cache_key(key.path) != key:
+    if _thumbnail_cache_key(key.path, key.content_hash) != key:
         _THUMBNAIL_CACHE.discard_key(key)
         return None
-    pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
+    if image.isNull():
+        _THUMBNAIL_CACHE.discard_key(key)
+        return None
+    pixmap = QPixmap.fromImage(image)
+    if pixmap.isNull():
+        _THUMBNAIL_CACHE.discard_key(key)
+        return None
     _THUMBNAIL_CACHE[key] = pixmap
     return pixmap
 
@@ -218,9 +237,16 @@ class _ThumbnailDecodeTask(QRunnable):
         self.key = key
         self.generation = generation
         self.signals = _ThumbnailDecodeSignals()
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
 
     @Slot()
     def run(self) -> None:
+        if self.cancelled:
+            self.signals.finished.emit(self.request_id, self.key, self.generation, QImage())
+            return
         try:
             image = _decode_thumbnail_image(self.key)
         except Exception:
@@ -230,6 +256,7 @@ class _ThumbnailDecodeTask(QRunnable):
 
 class _ThumbnailDecodeQueue(QObject):
     decoded = Signal(object, object, int)
+    capacity_available = Signal()
 
     def __init__(
         self,
@@ -240,14 +267,16 @@ class _ThumbnailDecodeQueue(QObject):
     ):
         super().__init__(parent)
         self.max_workers = max(1, max_workers)
+        self.max_active = self.max_workers * 2
         self.max_requests = max(self.max_workers, max_requests)
         self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(self.max_workers)
+        self._pool.setMaxThreadCount(self.max_active)
         self._queued: deque[tuple[_ThumbnailCacheKey, int]] = deque()
         self._scheduled: set[tuple[int, _ThumbnailCacheKey]] = set()
         self._active: dict[int, tuple[_ThumbnailDecodeTask, tuple[int, _ThumbnailCacheKey]]] = {}
         self._next_request_id = 1
         self._closed = False
+        self._paused = False
 
     @property
     def pending_count(self) -> int:
@@ -258,7 +287,7 @@ class _ThumbnailDecodeQueue(QObject):
         return len(self._queued)
 
     def request(self, key: _ThumbnailCacheKey, generation: int) -> bool:
-        if self._closed:
+        if self._closed or self._paused:
             return False
         token = (generation, key)
         if token in self._scheduled:
@@ -274,14 +303,39 @@ class _ThumbnailDecodeQueue(QObject):
         while self._queued:
             key, generation = self._queued.popleft()
             self._scheduled.discard((generation, key))
+        for task, _token in self._active.values():
+            task.cancel()
 
-    def close(self) -> None:
+    def close(self, timeout_ms: int = 2000) -> bool:
         self._closed = True
+        self._paused = True
         self.cancel_queued()
         self._pool.clear()
+        return self._pool.waitForDone(timeout_ms)
+
+    def pause_and_wait(self, timeout_ms: int = 2000) -> bool:
+        self._paused = True
+        self.cancel_queued()
+        self._pool.clear()
+        return self._pool.waitForDone(timeout_ms)
+
+    def resume(self) -> None:
+        if self._closed:
+            return
+        self._paused = False
+        self._pump()
+        self.capacity_available.emit()
 
     def _pump(self) -> None:
-        while not self._closed and self._queued and len(self._active) < self.max_workers:
+        active_current = sum(
+            1 for task, _token in self._active.values() if not task.cancelled
+        )
+        while (
+            not self._closed
+            and self._queued
+            and active_current < self.max_workers
+            and len(self._active) < self.max_active
+        ):
             key, generation = self._queued.popleft()
             request_id = self._next_request_id
             self._next_request_id += 1
@@ -290,6 +344,7 @@ class _ThumbnailDecodeQueue(QObject):
             task.signals.finished.connect(self._job_finished, Qt.ConnectionType.QueuedConnection)
             self._active[request_id] = (task, token)
             self._pool.start(task)
+            active_current += 1
 
     @Slot(int, object, int, object)
     def _job_finished(self, request_id: int, key: _ThumbnailCacheKey, generation: int, image: QImage) -> None:
@@ -297,20 +352,25 @@ class _ThumbnailDecodeQueue(QObject):
         if active is None:
             return
         self._scheduled.discard(active[1])
-        if not self._closed:
+        if not self._closed and not active[0].cancelled:
             self.decoded.emit(key, image, generation)
         self._pump()
+        if not self._paused and not active[0].cancelled:
+            self.capacity_available.emit()
 
 
 def lucide_icon(name: str, color: str = "#354052", size: int = 20, fill: str = "none") -> QIcon:
-    svg = _render_icon(name, size, stroke=color, fill=fill, stroke_width="1.8")
-    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    renderer.render(painter)
-    painter.end()
-    return QIcon(pixmap)
+    icon = QIcon()
+    for pixel_size in sorted({size, size * 2, size * 3}):
+        svg = _render_icon(name, pixel_size, stroke=color, fill=fill, stroke_width="1.8")
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        pixmap = QPixmap(pixel_size, pixel_size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
 
 
 def human_size(value: int) -> str:
@@ -354,6 +414,7 @@ class IconButton(QPushButton):
         self.setIcon(lucide_icon(GLYPHS.get(glyph, glyph)))
         self.setIconSize(QSize(18, 18))
         self.setToolTip(tooltip)
+        self.setAccessibleName(tooltip)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
 
@@ -415,6 +476,7 @@ class CaptureStatusButton(QPushButton):
         self.setObjectName("CaptureStatus")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(28, 28)
+        self.setAccessibleName("本地自动捕获状态")
         self.active = True
         self.set_active(True)
 
@@ -493,7 +555,9 @@ class WindowTitleBar(QFrame):
 
     def update_maximize_state(self, maximized: bool) -> None:
         self.maximize_button.setIcon(lucide_icon("copy" if maximized else "square", size=14))
-        self.maximize_button.setToolTip("还原" if maximized else "最大化")
+        label = "还原" if maximized else "最大化"
+        self.maximize_button.setToolTip(label)
+        self.maximize_button.setAccessibleName(label)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -559,8 +623,10 @@ class NavButton(QPushButton):
         self.label = label
         self.count = count
         self.collapsed = False
+        self.custom_icon: QIcon | None = None
         self.setObjectName("NavButton")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAccessibleName(label)
         self.clicked.connect(lambda: self.triggered.emit(self.key))
         self.refresh_text()
 
@@ -575,8 +641,15 @@ class NavButton(QPushButton):
             self.setText(f"{gap}{self.label}{suffix}")
             self.setToolTip("")
             self.setStyleSheet("text-align:left;")
-        self.setIcon(lucide_icon(self.glyph, "#2f6fca" if self.property("active") else "#4d596b"))
+        self.setIcon(
+            self.custom_icon
+            or lucide_icon(self.glyph, "#2f6fca" if self.property("active") else "#4d596b")
+        )
         self.setIconSize(QSize(20, 20))
+
+    def set_custom_icon(self, icon: QIcon) -> None:
+        self.custom_icon = icon
+        self.refresh_text()
 
     def set_collapsed(self, value: bool) -> None:
         self.collapsed = value
@@ -607,6 +680,10 @@ class Sidebar(QWidget):
         self.collection_buttons: list[NavButton] = []
         self.tag_buttons: list[NavButton] = []
         self.footer_buttons: list[NavButton] = []
+        self.animation = QPropertyAnimation(self, b"maximumWidth", self)
+        self.animation.setDuration(190)
+        self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.animation.finished.connect(self._finish_width_animation)
         self.layout_root = QVBoxLayout(self)
         self.layout_root.setContentsMargins(10, 72, 10, 12)
         self.layout_root.setSpacing(4)
@@ -677,6 +754,7 @@ class Sidebar(QWidget):
             button.triggered.connect(lambda selected, k=key: self.navigation_requested.emit(k, None))
             self.primary_box.addWidget(button)
             self.nav_buttons[key] = button
+        self.set_active(getattr(self, "active_key", ""))
 
     @staticmethod
     def _clear_layout(layout) -> None:
@@ -694,20 +772,29 @@ class Sidebar(QWidget):
             button.triggered.connect(lambda _key, ident=row["id"]: self.navigation_requested.emit("collection", ident))
             self.collection_box.addWidget(button)
             self.collection_buttons.append(button)
+        self.set_active(getattr(self, "active_key", ""))
 
     def set_tags(self, tags) -> None:
         self._clear_layout(self.tag_box)
         self.tag_buttons = []
         for row in tags[:8]:
             button = NavButton(f"tag:{row['id']}", "tag", row["name"], row["amount"])
-            button.setIcon(QIcon(color_dot(row["color"])))
+            button.set_custom_icon(QIcon(color_dot(row["color"])))
+            button.set_collapsed(self.collapsed)
             button.triggered.connect(lambda _key, ident=row["id"]: self.navigation_requested.emit("tag", ident))
             self.tag_box.addWidget(button)
             self.tag_buttons.append(button)
+        self.set_active(getattr(self, "active_key", ""))
 
     def set_active(self, key: str) -> None:
-        for button_key, button in self.nav_buttons.items():
-            button.set_active(button_key == key)
+        self.active_key = key
+        for button in [
+            *self.nav_buttons.values(),
+            *self.collection_buttons,
+            *self.tag_buttons,
+            *self.footer_buttons,
+        ]:
+            button.set_active(button.key == key)
 
     def set_collapsed(self, value: bool, animate: bool = True) -> None:
         self.collapsed = value
@@ -720,118 +807,23 @@ class Sidebar(QWidget):
             button.set_collapsed(value)
         start = self.width()
         end = 72 if value else 242
-        self.setMinimumWidth(72 if value else 200)
+        self.animation.stop()
+        self.setMinimumWidth(72)
         if animate:
-            self.animation = QPropertyAnimation(self, b"maximumWidth", self)
-            self.animation.setDuration(190)
             self.animation.setStartValue(start)
             self.animation.setEndValue(end)
-            self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
             self.animation.start()
         else:
             self.setMaximumWidth(end)
+            self._finish_width_animation()
         self.collapsed_changed.emit(value)
+
+    def _finish_width_animation(self) -> None:
+        self.setMaximumWidth(72 if self.collapsed else 242)
+        self.setMinimumWidth(72 if self.collapsed else 200)
 
     def toggle_collapsed(self) -> None:
         self.set_collapsed(not self.collapsed)
-
-
-class AssetCard(QFrame):
-    selected = Signal(int)
-    activated = Signal(int)
-    favorite_requested = Signal(int, bool)
-
-    def __init__(self, item, width: int, parent=None):
-        super().__init__(parent)
-        self.item = item
-        self.setObjectName("Card")
-        self.setProperty("selected", False)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(252)
-        self.setMinimumWidth(190)
-        self.setMaximumWidth(max(210, width))
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(9, 9, 9, 9)
-        layout.setSpacing(7)
-
-        head = QHBoxLayout()
-        kind = QLabel(TYPE_LABELS.get(item["kind"], item["kind"]))
-        kind.setObjectName("Muted")
-        head.addWidget(kind)
-        head.addStretch()
-        time_text = item["created_at"][11:16] if len(item["created_at"]) >= 16 else ""
-        time = QLabel(time_text)
-        time.setObjectName("Muted")
-        head.addWidget(time)
-        favorite = IconButton("favorite", "取消收藏" if item["favorite"] else "收藏")
-        favorite.setIcon(lucide_icon("star", "#f4a100", 18, "#f4a100" if item["favorite"] else "none"))
-        favorite.clicked.connect(lambda: self.favorite_requested.emit(item["id"], not bool(item["favorite"])))
-        head.addWidget(favorite)
-        layout.addLayout(head)
-
-        preview = QLabel()
-        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview.setFixedHeight(150)
-        preview.setWordWrap(True)
-        preview.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.preview = preview
-        self.preview_width = width
-        if item["kind"] == "image" and item["path"] and Path(item["path"]).exists():
-            preview.setStyleSheet("background:rgba(237,241,247,150); border-radius:5px;")
-        else:
-            content = item["content"].strip() or item["title"]
-            preview.setText(content[:330])
-            preview.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-            preview.setStyleSheet("background:rgba(247,249,252,180); padding:10px; border-radius:5px;")
-        layout.addWidget(preview)
-
-        title = QLabel(item["title"])
-        title.setToolTip(item["title"])
-        title.setWordWrap(False)
-        title.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        font = title.font()
-        font.setWeight(QFont.Weight.Medium)
-        title.setFont(font)
-        layout.addWidget(title)
-        detail = QLabel(self._detail_text())
-        detail.setObjectName("Muted")
-        layout.addWidget(detail)
-
-    def load_preview(self) -> None:
-        if self.item["kind"] != "image" or not self.item["path"]:
-            return
-        path = Path(self.item["path"])
-        if not path.exists():
-            return
-        pixmap = thumbnail_pixmap(path)
-        if not pixmap.isNull():
-            self.preview.setPixmap(
-                pixmap.scaled(
-                    QSize(max(180, self.preview_width - 20), 150),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
-
-    def _detail_text(self) -> str:
-        if self.item["kind"] == "image" and self.item["width"]:
-            return f"{self.item['width']} × {self.item['height']}   {human_size(self.item['file_size'])}"
-        return f"{TYPE_LABELS.get(self.item['kind'], '')}   {human_size(self.item['file_size'])}"
-
-    def set_selected(self, value: bool) -> None:
-        self.setProperty("selected", value)
-        self.style().unpolish(self)
-        self.style().polish(self)
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.selected.emit(self.item["id"])
-        super().mousePressEvent(event)
-
-    def mouseDoubleClickEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.activated.emit(self.item["id"])
-        super().mouseDoubleClickEvent(event)
 
 
 class AssetGridDelegate(QStyledItemDelegate):
@@ -894,7 +886,11 @@ class AssetGridDelegate(QStyledItemDelegate):
         painter.drawRoundedRect(preview, 5, 5)
         path = record["path"] if record["kind"] == "image" else None
         if path and self.view.preview_loading_enabled and self.view.isVisible():
-            pixmap = self.view.thumbnail_for_index(index, path)
+            try:
+                content_hash = record["content_hash"]
+            except (KeyError, IndexError):
+                content_hash = None
+            pixmap = self.view.thumbnail_for_index(index, path, content_hash)
             if pixmap is not None and not pixmap.isNull():
                 scaled = pixmap.scaled(
                     preview.size() - QSize(12, 12),
@@ -931,6 +927,7 @@ class AssetGridDelegate(QStyledItemDelegate):
 
 class AssetGrid(QListView):
     item_selected = Signal(int)
+    selection_cleared = Signal()
     item_activated = Signal(int)
     favorite_requested = Signal(int, bool)
 
@@ -956,33 +953,31 @@ class AssetGrid(QListView):
         self.delegate = AssetGridDelegate(self)
         self.setItemDelegate(self.delegate)
         self.items = self._asset_model.items
-        self.cards: dict[int, AssetCard] = {}
         self.selected_id: int | None = None
         self.columns = 0
-        self.pending_previews: deque[AssetCard] = deque()
         self.preview_loading_enabled = True
         self.rebuild_pending = False
         self._thumbnail_generation = 0
         self._thumbnail_loader = _ThumbnailDecodeQueue(self)
         self._thumbnail_loader.decoded.connect(self._thumbnail_decoded)
-        self.preview_timer = QTimer(self)
-        self.preview_timer.setInterval(8)
-        self.preview_timer.timeout.connect(self._load_next_preview)
-        self.rebuild_timer = QTimer(self)
-        self.rebuild_timer.setSingleShot(True)
-        self.rebuild_timer.timeout.connect(self.rebuild)
+        self._thumbnail_loader.capacity_available.connect(self.viewport().update)
+        self._thumbnail_refresh_timer = QTimer(self)
+        self._thumbnail_refresh_timer.setSingleShot(True)
+        self._thumbnail_refresh_timer.setInterval(50)
+        self._thumbnail_refresh_timer.timeout.connect(self._refresh_thumbnail_generation)
         self._favorite_press_row = -1
-        self.clicked.connect(self._index_selected)
+        self._suppress_selection_signal = False
+        self.selectionModel().currentChanged.connect(self._index_selected)
+        self.selectionModel().selectionChanged.connect(self._selection_changed)
         self.doubleClicked.connect(self._index_activated)
         self.verticalScrollBar().valueChanged.connect(self._thumbnail_viewport_changed)
         self._update_grid_size()
 
     def set_items(self, items, selected_id: int | None = None) -> None:
+        self._thumbnail_refresh_timer.stop()
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
         self.selected_id = selected_id
-        self.cards.clear()
-        self.pending_previews.clear()
         self._asset_model.set_items(items)
         self.items = self._asset_model.items
         self.rebuild_pending = not self.isVisible()
@@ -990,9 +985,9 @@ class AssetGrid(QListView):
         self.viewport().update()
 
     def resizeEvent(self, event) -> None:
-        self._thumbnail_loader.cancel_queued()
         super().resizeEvent(event)
         self._update_grid_size()
+        self._thumbnail_refresh_timer.start()
 
     def _update_grid_size(self) -> None:
         available = max(210, self.viewport().width())
@@ -1002,50 +997,19 @@ class AssetGrid(QListView):
         self.columns = columns
         self.setGridSize(QSize(card_width + gap, AssetGridDelegate.card_height + gap))
 
-    def _schedule_rebuild(self, delay: int) -> None:
-        self.rebuild_pending = not self.isVisible()
-        if self.isVisible():
-            self.rebuild_timer.start(max(0, delay))
-
-    def _clear(self) -> None:
-        self.preview_timer.stop()
-        self.pending_previews.clear()
-        self.cards.clear()
-
-    def rebuild(self) -> None:
-        if not self.isVisible():
-            self.rebuild_pending = True
-            return
-        self.rebuild_pending = False
-        self._update_grid_size()
-        self.viewport().update()
-
-    def _load_next_preview(self) -> None:
-        if not self.preview_loading_enabled or not self.isVisible():
-            self.preview_timer.stop()
-            return
-        if not self.pending_previews:
-            self.preview_timer.stop()
-            self.viewport().update()
-            return
-        self.pending_previews.popleft().load_preview()
-
     def set_preview_loading_enabled(self, enabled: bool) -> None:
         if enabled == self.preview_loading_enabled:
             return
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
         self.preview_loading_enabled = enabled
-        if not enabled:
-            self.preview_timer.stop()
-        elif self.isVisible():
+        if enabled and self.isVisible():
             self.viewport().update()
 
     def hideEvent(self, event) -> None:
+        self._thumbnail_refresh_timer.stop()
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
-        self.preview_timer.stop()
-        self.rebuild_timer.stop()
         super().hideEvent(event)
 
     def showEvent(self, event) -> None:
@@ -1057,12 +1021,29 @@ class AssetGrid(QListView):
             self.viewport().update()
 
     def closeEvent(self, event) -> None:
+        self._thumbnail_refresh_timer.stop()
         self._thumbnail_generation += 1
         self._thumbnail_loader.close()
         super().closeEvent(event)
 
-    def thumbnail_for_index(self, index: QModelIndex, path: Path | str) -> QPixmap | None:
-        key, pixmap, cached = _cached_thumbnail(path)
+    def shutdown_thumbnail_loader(self, timeout_ms: int = 2000) -> bool:
+        self._thumbnail_generation += 1
+        return self._thumbnail_loader.close(timeout_ms)
+
+    def wait_for_thumbnail_idle(self) -> bool:
+        self._thumbnail_refresh_timer.stop()
+        self._thumbnail_generation += 1
+        return self._thumbnail_loader.pause_and_wait()
+
+    def resume_thumbnail_loader(self) -> None:
+        self._thumbnail_loader.resume()
+        if self.preview_loading_enabled and self.isVisible():
+            self.viewport().update()
+
+    def thumbnail_for_index(
+        self, index: QModelIndex, path: Path | str, content_hash: str | None = None
+    ) -> QPixmap | None:
+        key, pixmap, cached = _cached_thumbnail(path, content_hash)
         if cached:
             return pixmap
         if (
@@ -1088,7 +1069,12 @@ class AssetGrid(QListView):
         self._asset_model.notify_thumbnail_changed(key.path, model_generation)
 
     def _thumbnail_viewport_changed(self, _value: int) -> None:
+        self._thumbnail_refresh_timer.start()
+
+    def _refresh_thumbnail_generation(self) -> None:
+        self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
+        self.viewport().update()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -1108,27 +1094,43 @@ class AssetGrid(QListView):
 
     def select_item(self, item_id: int) -> None:
         self.selected_id = item_id
-        self._restore_selection()
+        self.sync_selection_from_selected_id()
         self.item_selected.emit(item_id)
 
-    def _restore_selection(self) -> None:
+    def sync_selection_from_selected_id(self) -> None:
         row = self._asset_model.row_for_id(self.selected_id)
-        if row < 0:
-            self.clearSelection()
-            return
-        index = self._asset_model.index(row, 0)
-        self.selectionModel().select(
-            index,
-            QItemSelectionModel.SelectionFlag.ClearAndSelect,
-        )
-        self.setCurrentIndex(index)
+        self._suppress_selection_signal = True
+        try:
+            if row < 0:
+                self.clearSelection()
+                self.setCurrentIndex(QModelIndex())
+                return
+            index = self._asset_model.index(row, 0)
+            self.selectionModel().select(
+                index,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect,
+            )
+            self.setCurrentIndex(index)
+        finally:
+            self._suppress_selection_signal = False
 
-    def _index_selected(self, index) -> None:
+    def _restore_selection(self) -> None:
+        self.sync_selection_from_selected_id()
+
+    def _index_selected(self, index, _previous=QModelIndex()) -> None:
+        if self._suppress_selection_signal:
+            return
         record = index.data(AssetItemModel.ItemRole)
         if record is None:
             return
         self.selected_id = int(record["id"])
         self.item_selected.emit(self.selected_id)
+
+    def _selection_changed(self, _selected=None, _deselected=None) -> None:
+        if self._suppress_selection_signal or self.selectionModel().selectedIndexes():
+            return
+        self.selected_id = None
+        self.selection_cleared.emit()
 
     def _index_activated(self, index) -> None:
         record = index.data(AssetItemModel.ItemRole)
@@ -1156,6 +1158,7 @@ class AssetGrid(QListView):
                 and self.delegate.favorite_rect(self.visualRect(index)).contains(event.position().toPoint())
             ):
                 record = index.data(AssetItemModel.ItemRole)
+                self.select_item(int(record["id"]))
                 self.favorite_requested.emit(int(record["id"]), not bool(record["favorite"]))
             event.accept()
             return
@@ -1171,6 +1174,7 @@ class AssetGrid(QListView):
 
 class AssetTable(QTableView):
     item_selected = Signal(int)
+    selection_cleared = Signal()
     item_activated = Signal(int)
     favorite_requested = Signal(int, bool)
 
@@ -1213,17 +1217,29 @@ class AssetTable(QTableView):
         self._suppress_selection_signal = True
         try:
             self._asset_model.set_items(items)
-            selected_row = self._asset_model.row_for_id(selected_id)
-            if selected_row >= 0:
-                self.selectRow(selected_row)
-            else:
-                self.clearSelection()
+            self._apply_selected_id_to_view()
         finally:
             self._suppress_selection_signal = False
+
+    def sync_selection_from_selected_id(self) -> None:
+        self._suppress_selection_signal = True
+        try:
+            self._apply_selected_id_to_view()
+        finally:
+            self._suppress_selection_signal = False
+
+    def _apply_selected_id_to_view(self) -> None:
+        selected_row = self._asset_model.row_for_id(self.selected_id)
+        if selected_row >= 0:
+            self.selectRow(selected_row)
+        else:
+            self.clearSelection()
+            self.setCurrentIndex(QModelIndex())
 
     def clear_selected_item(self) -> None:
         self.selected_id = None
         self.clearSelection()
+        self.setCurrentIndex(QModelIndex())
 
     def clear_selection(self) -> None:
         self.clear_selected_item()
@@ -1236,6 +1252,9 @@ class AssetTable(QTableView):
             record = self._asset_model.item(rows[0].row())
             self.selected_id = int(record["id"])
             self.item_selected.emit(self.selected_id)
+        else:
+            self.selected_id = None
+            self.selection_cleared.emit()
 
     def _index_activated(self, index) -> None:
         record = self._asset_model.item(index.row())
@@ -1243,7 +1262,33 @@ class AssetTable(QTableView):
             self.item_activated.emit(int(record["id"]))
 
 
-class DetailPanel(QWidget):
+class _SafeMarkdownBrowser(QTextBrowser):
+    _ALLOWED_RESOURCE_SCHEMES = {"qrc"}
+
+    def loadResource(self, resource_type: int, name: QUrl):
+        if name.isRelative() or name.isLocalFile() or name.scheme().lower() not in self._ALLOWED_RESOURCE_SCHEMES:
+            return QByteArray()
+        return super().loadResource(resource_type, name)
+
+
+MAX_RICH_MARKDOWN_BYTES = 2 * 1024 * 1024
+
+
+def _set_markdown_content(browser: QTextBrowser, content: str) -> None:
+    if len(content.encode("utf-8")) > MAX_RICH_MARKDOWN_BYTES:
+        browser.setPlainText(content)
+    else:
+        browser.setMarkdown(content)
+
+
+def _startfile_or_warn(parent: QWidget, path: Path | str) -> None:
+    try:
+        os.startfile(str(path))
+    except OSError as exc:
+        QMessageBox.warning(parent, "Open failed", f"Could not open the requested location.\n\n{exc}")
+
+
+class DetailPanel(QScrollArea):
     close_requested = Signal()
     copy_requested = Signal(int)
     open_requested = Signal(int)
@@ -1260,13 +1305,18 @@ class DetailPanel(QWidget):
         super().__init__(parent)
         self.setObjectName("DetailPanel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setMinimumWidth(300)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setMinimumWidth(280)
         self.setMaximumWidth(370)
         self.current_item = None
         self._thumbnail_generation = 0
         self._thumbnail_loader = _ThumbnailDecodeQueue(self)
         self._thumbnail_loader.decoded.connect(self._thumbnail_decoded)
-        layout = QVBoxLayout(self)
+        self.content_widget = QWidget()
+        self.content_widget.setObjectName("DetailPanelContent")
+        layout = QVBoxLayout(self.content_widget)
         layout.setContentsMargins(16, 14, 16, 16)
         layout.setSpacing(10)
         top = QHBoxLayout()
@@ -1287,7 +1337,7 @@ class DetailPanel(QWidget):
         self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_preview.setMinimumHeight(190)
         self.image_preview.setStyleSheet("background:rgba(235,239,245,160); border-radius:6px;")
-        self.text_preview = QTextBrowser()
+        self.text_preview = _SafeMarkdownBrowser()
         self.text_preview.setOpenExternalLinks(False)
         self.text_preview.setMinimumHeight(190)
         self.preview_stack.addWidget(self.image_preview)
@@ -1348,6 +1398,9 @@ class DetailPanel(QWidget):
         self.notes.setPlaceholderText("添加备注…")
         self.notes.setMaximumHeight(90)
         self.notes.installEventFilter(self)
+        self._loaded_notes = ""
+        self._note_drafts: dict[int, str] = {}
+        self._note_draft_bases: dict[int, str] = {}
         layout.addWidget(self.notes)
         actions = QHBoxLayout()
         self.item_action_buttons = []
@@ -1366,6 +1419,7 @@ class DetailPanel(QWidget):
             actions.addWidget(button)
         actions.addStretch()
         layout.addLayout(actions)
+        self.setWidget(self.content_widget)
         self.clear_item()
 
     def set_collections(self, collections) -> None:
@@ -1379,7 +1433,16 @@ class DetailPanel(QWidget):
         self.collection_combo.setCurrentIndex(max(0, index))
         self.collection_combo.blockSignals(False)
 
-    def set_item(self, item) -> None:
+    def set_item(self, item) -> bool:
+        previous_item_id = self.current_item["id"] if self.current_item else None
+        loaded_notes_before_flush = self._loaded_notes
+        self.flush_notes()
+        if previous_item_id is not None and (
+            self.current_item is None or self.current_item["id"] != previous_item_id
+        ):
+            return False
+        if self._loaded_notes != loaded_notes_before_flush:
+            return False
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
         self.current_item = item
@@ -1389,14 +1452,18 @@ class DetailPanel(QWidget):
         self.title.setText(item["title"])
         if item["kind"] == "image" and item["path"] and Path(item["path"]).exists():
             self.preview_stack.setCurrentWidget(self.image_preview)
-            key, pixmap, cached = _cached_thumbnail(item["path"])
+            try:
+                content_hash = item["content_hash"]
+            except (KeyError, IndexError):
+                content_hash = None
+            key, pixmap, cached = _cached_thumbnail(item["path"], content_hash)
             if cached:
                 self._set_image_preview(pixmap)
             elif key is not None:
                 self._thumbnail_loader.request(key, self._thumbnail_generation)
         else:
             if item["kind"] == "markdown":
-                self.text_preview.setMarkdown(item["content"])
+                _set_markdown_content(self.text_preview, item["content"])
             else:
                 self.text_preview.setPlainText(item["content"])
             self.preview_stack.setCurrentWidget(self.text_preview)
@@ -1418,10 +1485,14 @@ class DetailPanel(QWidget):
         for button in self.item_action_buttons:
             button.setEnabled(True)
         self.notes.blockSignals(True)
-        self.notes.setPlainText(item["notes"] or "")
+        loaded_notes = item["notes"] or ""
+        self.notes.setPlainText(self._note_drafts.get(item["id"], loaded_notes))
         self.notes.blockSignals(False)
+        self._loaded_notes = loaded_notes
+        return True
 
     def clear_item(self) -> None:
+        self.flush_notes()
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
         self.current_item = None
@@ -1444,6 +1515,7 @@ class DetailPanel(QWidget):
         self.notes.blockSignals(True)
         self.notes.clear()
         self.notes.blockSignals(False)
+        self._loaded_notes = ""
         for button in self.item_action_buttons:
             button.setEnabled(False)
 
@@ -1451,6 +1523,19 @@ class DetailPanel(QWidget):
         self._thumbnail_generation += 1
         self._thumbnail_loader.close()
         super().closeEvent(event)
+
+    def shutdown_thumbnail_loader(self, timeout_ms: int = 2000) -> bool:
+        self._thumbnail_generation += 1
+        return self._thumbnail_loader.close(timeout_ms)
+
+    def wait_for_thumbnail_idle(self) -> bool:
+        self._thumbnail_generation += 1
+        return self._thumbnail_loader.pause_and_wait()
+
+    def resume_thumbnail_loader(self) -> None:
+        self._thumbnail_loader.resume()
+        if self.current_item is not None:
+            self.set_item(self.current_item)
 
     @Slot(object, object, int)
     def _thumbnail_decoded(self, key: _ThumbnailCacheKey, image: QImage, generation: int) -> None:
@@ -1517,8 +1602,39 @@ class DetailPanel(QWidget):
 
     def eventFilter(self, watched, event) -> bool:
         if watched is self.notes and event.type() == QEvent.Type.FocusOut and self.current_item:
-            self.notes_changed.emit(self.current_item["id"], self.notes.toPlainText())
+            self.flush_notes()
         return super().eventFilter(watched, event)
+
+    def flush_notes(self) -> bool:
+        if not self.current_item:
+            return True
+        item_id = self.current_item["id"]
+        notes = self.notes.toPlainText()
+        if notes == self._loaded_notes:
+            self._note_drafts.pop(item_id, None)
+            self._note_draft_bases.pop(item_id, None)
+            return True
+        if notes != self._loaded_notes:
+            self._note_draft_bases.setdefault(item_id, self._loaded_notes)
+            self._note_drafts[item_id] = notes
+            self.notes_changed.emit(item_id, notes)
+        return self._note_drafts.get(item_id) != notes
+
+    def mark_notes_saved(self, item_id: int, notes: str) -> None:
+        if self.current_item and self.current_item["id"] == item_id and self.notes.toPlainText() == notes:
+            self._loaded_notes = notes
+        if self._note_drafts.get(item_id) == notes:
+            self._note_drafts.pop(item_id, None)
+            self._note_draft_bases.pop(item_id, None)
+
+    def pending_note_drafts(self) -> dict[int, str]:
+        return dict(self._note_drafts)
+
+    def pending_note_updates(self) -> dict[int, tuple[str, str]]:
+        return {
+            item_id: (self._note_draft_bases.get(item_id, ""), notes)
+            for item_id, notes in self._note_drafts.items()
+        }
 
 
 class MarkdownDialog(QDialog):
@@ -1534,17 +1650,16 @@ class MarkdownDialog(QDialog):
         top.addStretch()
         if path:
             locate = QPushButton("在资源管理器中显示")
-            locate.clicked.connect(lambda: os.startfile(str(Path(path).parent)))
+            locate.clicked.connect(lambda: _startfile_or_warn(self, Path(path).parent))
             top.addWidget(locate)
             external = QPushButton("外部打开")
-            external.clicked.connect(lambda: os.startfile(path))
+            external.clicked.connect(lambda: _startfile_or_warn(self, path))
             top.addWidget(external)
         layout.addLayout(top)
-        browser = QTextBrowser()
+        browser = _SafeMarkdownBrowser()
         browser.setOpenExternalLinks(False)
-        if path:
-            browser.setSearchPaths([str(Path(path).parent)])
-        browser.setMarkdown(content)
+        _set_markdown_content(browser, content)
+        self.browser = browser
         layout.addWidget(browser)
 
 
@@ -1603,7 +1718,7 @@ class SettingsDialog(QDialog):
         self.setObjectName("FluentDialog")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.resize(620, 650)
-        self.setMinimumSize(520, 520)
+        self.setMinimumSize(480, 400)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -1629,7 +1744,15 @@ class SettingsDialog(QDialog):
         self.close_to_tray.addItem("关闭窗口时退出", False)
         self.close_to_tray.setCurrentIndex(0 if settings.get("close_to_tray", True) else 1)
         layout.addWidget(self.close_to_tray)
-        layout.addWidget(QLabel("全局唤醒快捷键：Ctrl + Alt + V"))
+        hotkey_state = getattr(parent, "global_hotkey_registered", None)
+        if hotkey_state is False:
+            hotkey_text = "全局唤醒快捷键：Ctrl + Alt + V（注册失败，可能已被占用）"
+        elif hotkey_state is True:
+            hotkey_text = "全局唤醒快捷键：Ctrl + Alt + V（已启用）"
+        else:
+            hotkey_text = "全局唤醒快捷键：Ctrl + Alt + V"
+        self.hotkey_status = QLabel(hotkey_text)
+        layout.addWidget(self.hotkey_status)
         layout.addSpacing(14)
         from .constants import DATA_DIR, LIBRARY_DIR
 
@@ -1648,7 +1771,8 @@ class SettingsDialog(QDialog):
         open_storage = QPushButton("打开本地资料库")
         open_storage.setObjectName("SettingsAction")
         open_storage.setIcon(lucide_icon("folder"))
-        open_storage.clicked.connect(lambda: os.startfile(str(LIBRARY_DIR)))
+        open_storage.clicked.connect(lambda: _startfile_or_warn(self, LIBRARY_DIR))
+        self.open_storage_button = open_storage
         layout.addWidget(open_storage)
         layout.addSpacing(14)
         ai_heading = QLabel("OpenAI-compatible AI 服务（独立的主动功能）")
@@ -1690,16 +1814,16 @@ class SettingsDialog(QDialog):
         root.addWidget(footer)
 
     def accept(self) -> None:
-        self.settings.data.update({
+        values = {
             "close_to_tray": self.close_to_tray.currentData(),
             "ai_base_url": self.base_url.text().strip(),
             "ai_api_key": self.api_key.text().strip(),
             "ai_vision_model": self.vision_model.text().strip(),
             "ai_embedding_model": self.embedding_model.text().strip(),
-        })
+        }
         try:
-            self.settings.save()
-        except OSError as exc:
-            QMessageBox.warning(self, "设置保存失败", f"无法写入设置文件。\n\n{exc}")
+            self.settings.update(values)
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "设置保存失败", str(exc))
             return
         super().accept()

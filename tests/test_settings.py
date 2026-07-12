@@ -29,6 +29,7 @@ class SettingsTests(unittest.TestCase):
                     "sidebar_collapsed": 1,
                     "sort": "sideways",
                     "theme": "dark",
+                    "hotkey": "Ctrl+Shift+V",
                     "unknown": "value",
                 }
             ),
@@ -40,33 +41,34 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(settings.get("monitoring"))
         self.assertFalse(settings.get("sidebar_collapsed"))
         self.assertEqual(settings.get("sort"), "newest")
-        self.assertEqual(settings.get("theme"), "dark")
+        self.assertIsNone(settings.get("theme"))
+        self.assertIsNone(settings.get("hotkey"))
         self.assertIsNone(settings.get("unknown"))
 
     def test_corrupt_primary_uses_backup_but_disables_monitoring(self):
         backup = self.path.with_name(f"{self.path.name}.bak")
-        backup.write_text(json.dumps({"monitoring": True, "theme": "dark"}), encoding="utf-8")
+        backup.write_text(json.dumps({"monitoring": True, "sort": "oldest"}), encoding="utf-8")
         self.path.write_text("{broken", encoding="utf-8")
 
         settings = Settings(self.path)
 
-        self.assertEqual(settings.get("theme"), "dark")
+        self.assertEqual(settings.get("sort"), "oldest")
         self.assertFalse(settings.get("monitoring"))
         self.assertTrue(backup.exists())
 
     def test_save_atomically_keeps_previous_valid_backup(self):
-        self.path.write_text(json.dumps({"theme": "light", "monitoring": False}), encoding="utf-8")
+        self.path.write_text(json.dumps({"view_mode": "grid", "monitoring": False}), encoding="utf-8")
         settings = Settings(self.path)
 
-        settings.set("theme", "dark")
+        settings.set("view_mode", "list")
 
         current = json.loads(self.path.read_text(encoding="utf-8"))
         backup = json.loads(settings.backup_path.read_text(encoding="utf-8"))
-        self.assertEqual(current["theme"], "dark")
-        self.assertEqual(backup["theme"], "light")
+        self.assertEqual(current["view_mode"], "list")
+        self.assertEqual(backup["view_mode"], "grid")
 
     def test_failed_primary_replace_leaves_previous_file_and_memory_intact(self):
-        original = {"theme": "light", "monitoring": False}
+        original = {"view_mode": "grid", "monitoring": False}
         self.path.write_text(json.dumps(original), encoding="utf-8")
         settings = Settings(self.path)
         real_replace = os.replace
@@ -78,9 +80,9 @@ class SettingsTests(unittest.TestCase):
 
         with patch("clipsave_app.settings.os.replace", side_effect=fail_primary_replace):
             with self.assertRaises(OSError):
-                settings.set("theme", "dark")
+                settings.set("view_mode", "list")
 
-        self.assertEqual(settings.get("theme"), "light")
+        self.assertEqual(settings.get("view_mode"), "grid")
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), original)
         self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
 
@@ -105,6 +107,20 @@ class SettingsTests(unittest.TestCase):
         with patch.object(settings, "save") as save:
             settings.set("monitoring", False)
         save.assert_not_called()
+
+    def test_oversized_settings_file_is_rejected_without_loading_it(self):
+        self.path.write_bytes(b" " * (1024 * 1024 + 1))
+        settings = Settings(self.path)
+        self.assertFalse(settings.get("monitoring"))
+        self.assertEqual(settings.get("view_mode"), "grid")
+
+    def test_settings_reject_unbounded_strings(self):
+        settings = Settings(self.path)
+        settings.set("ai_api_key", "previous")
+        with self.assertRaises(TypeError):
+            settings.update({"ai_api_key": "x" * 20_000, "close_to_tray": False})
+        self.assertEqual(settings.get("ai_api_key"), "previous")
+        self.assertTrue(settings.get("close_to_tray"))
 
 
 if __name__ == "__main__":

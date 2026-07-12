@@ -14,18 +14,22 @@ DEFAULTS = {
     "monitoring": False,
     "view_mode": "grid",
     "sort": "newest",
-    "theme": "light",
     "close_to_tray": True,
-    "hotkey": "Ctrl+Alt+V",
     "ai_base_url": "",
     "ai_api_key": "",
     "ai_vision_model": "",
     "ai_embedding_model": "",
 }
+MAX_SETTINGS_BYTES = 1024 * 1024
+_STRING_LIMITS = {
+    "ai_base_url": 8192,
+    "ai_api_key": 16_384,
+    "ai_vision_model": 512,
+    "ai_embedding_model": 512,
+}
 
 _BOOLEAN_KEYS = {"sidebar_collapsed", "monitoring", "close_to_tray"}
 _STRING_KEYS = {
-    "hotkey",
     "ai_base_url",
     "ai_api_key",
     "ai_vision_model",
@@ -34,7 +38,6 @@ _STRING_KEYS = {
 _CHOICES = {
     "view_mode": {"grid", "list"},
     "sort": {"newest", "oldest", "name", "size", "type"},
-    "theme": {"light", "dark", "system"},
 }
 
 
@@ -42,7 +45,7 @@ def _valid_value(key: str, value: Any) -> bool:
     if key in _BOOLEAN_KEYS:
         return type(value) is bool
     if key in _STRING_KEYS:
-        return type(value) is str
+        return type(value) is str and len(value) <= _STRING_LIMITS[key]
     if key in _CHOICES:
         return type(value) is str and value in _CHOICES[key]
     return False
@@ -56,6 +59,8 @@ def _validated_settings(value: Any) -> dict[str, Any] | None:
 
 def _read_settings(path: Path) -> dict[str, Any] | None:
     try:
+        if path.stat().st_size > MAX_SETTINGS_BYTES:
+            return None
         return _validated_settings(json.loads(path.read_text(encoding="utf-8")))
     except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
@@ -117,6 +122,21 @@ class Settings:
             self.save()
         except Exception:
             self.data[key] = previous
+            raise
+
+    def update(self, values: dict[str, Any]) -> None:
+        for key, value in values.items():
+            if key not in DEFAULTS:
+                raise KeyError(key)
+            if not _valid_value(key, value):
+                raise TypeError(f"Invalid value for setting {key!r}")
+        previous = self.data.copy()
+        self.data.update(values)
+        try:
+            self.save()
+        except Exception:
+            self.data.clear()
+            self.data.update(previous)
             raise
 
     def save(self) -> None:

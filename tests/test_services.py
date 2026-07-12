@@ -1,5 +1,6 @@
 import json
 import os
+import ctypes
 import tempfile
 import threading
 import time
@@ -10,16 +11,28 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image as PILImage
+from PySide6.QtCore import QBuffer, QIODevice
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
 
 from clipsave_app.constants import (
     MAX_AI_RESPONSE_BYTES,
+    MAX_CLIPBOARD_IMAGE_BYTES,
     MAX_CLIPBOARD_TEXT_BYTES,
     MAX_EMBEDDING_DIMENSIONS,
 )
 from clipsave_app.database import LibraryDatabase
-from clipsave_app.services import AIService, ClipboardService, OperationCancelled
+from clipsave_app.services import (
+    AIService,
+    BoundedTaskExecutor,
+    ClipboardService,
+    OperationCancelled,
+    TaskCapacityExceeded,
+    WindowsClipboardNotifier,
+    ai_ocr_task_executor,
+    preflight_image_file,
+    shutdown_ai_ocr_task_executor,
+)
 
 
 class FakeMimeData:
@@ -112,11 +125,70 @@ class ClipboardServiceTests(unittest.TestCase):
         self.service.poll()
         self.assertTrue(self.service.wait_for_idle())
 
+    def test_resume_after_failed_shutdown_does_not_rebaseline_clipboard(self):
+        self.service.last_text = "before shutdown"
+        self.service.last_clipboard_sequence = 17
+        with patch.object(self.service, "_start_monitoring") as start_monitoring, patch.object(
+            self.service, "poll"
+        ) as poll, patch("clipsave_app.services.QTimer.singleShot", side_effect=lambda _delay, callback: callback()):
+            self.service.resume_after_failed_shutdown(True)
+
+        start_monitoring.assert_called_once_with()
+        poll.assert_called_once_with()
+        self.assertEqual(self.service.last_text, "before shutdown")
+        self.assertEqual(self.service.last_clipboard_sequence, 17)
+
+    def test_shutdown_fully_joins_worker_in_bounded_slices(self):
+        worker = self.service._worker
+        with patch.object(worker, "join", wraps=worker.join) as join:
+            self.assertTrue(self.service.shutdown(timeout=0.1))
+
+        self.assertGreaterEqual(join.call_count, 1)
+        for call in join.call_args_list:
+            self.assertGreater(call.args[0], 0)
+            self.assertLessEqual(call.args[0], self.service.WAIT_INTERVAL_SECONDS)
+        self.assertFalse(worker.is_alive())
+
+    def test_failed_shutdown_can_restart_worker_and_accept_tasks(self):
+        original_worker = self.service._worker
+
+        self.assertFalse(self.service.shutdown(timeout=0.0))
+        original_worker.join(1)
+        self.assertFalse(original_worker.is_alive())
+
+        saved = []
+        self.service.save_text = lambda text: saved.append(text) or True
+        self.service.resume_after_failed_shutdown(False)
+        self.service._enqueue_task("text", "after timeout", 18)
+
+        self.assertTrue(self.service.wait_for_idle(1))
+        self.assertEqual(saved, ["after timeout"])
+        self.assertIsNot(self.service._worker, original_worker)
+
+    def test_wait_for_idle_caps_each_wait_to_remaining_deadline(self):
+        idle = Mock()
+        idle.is_set.return_value = False
+        idle.wait.return_value = False
+        service = Mock(
+            _idle_event=idle,
+            WAIT_INTERVAL_SECONDS=0.01,
+            PROCESS_EVENTS_MAX_MS=2,
+        )
+
+        with patch("clipsave_app.services.QApplication.instance", return_value=None), patch(
+            "clipsave_app.services.time.monotonic",
+            side_effect=[100.0, 100.001, 100.001, 100.006, 100.006],
+        ):
+            self.assertFalse(ClipboardService.wait_for_idle(service, timeout=0.005))
+
+        self.assertAlmostEqual(idle.wait.call_args.args[0], 0.004)
+
     def test_blank_text_advances_sequence_without_saving(self):
         clipboard = FakeClipboard(texts=["  \n"])
         sequences = iter([10, 10])
         self.service.last_clipboard_sequence = 9
         self.service._clipboard = lambda: clipboard
+        self.service._snapshot_clipboard_text = lambda source: source.text()
         self.service.clipboard_sequence = lambda: next(sequences)
         self.service.save_text = lambda _text: self.fail("blank text should not be saved")
 
@@ -139,6 +211,42 @@ class ClipboardServiceTests(unittest.TestCase):
 
         self.assertEqual(self.service.last_clipboard_sequence, 42)
         self.service.image_key.assert_not_called()
+        clipboard.text.assert_not_called()
+        clipboard.image.assert_not_called()
+
+    def test_start_rejects_native_text_without_qt_reread(self):
+        clipboard = Mock()
+        clipboard.mimeData.return_value = FakeMimeData(has_text=True)
+        self.service.clipboard_sequence = lambda: None
+        with patch("clipsave_app.services.QApplication.clipboard", return_value=clipboard), patch.object(
+            self.service,
+            "_snapshot_clipboard_text",
+            side_effect=ValueError("剪贴板文字过大，已拒绝读取。"),
+        ):
+            self.service.start()
+            self.service.stop()
+
+        clipboard.text.assert_not_called()
+
+    def test_start_uses_event_notifications_with_slow_polling_fallback(self):
+        clipboard = Mock()
+        clipboard.text.return_value = "current"
+        self.service.clipboard_sequence = lambda: 42
+        self.service.notifier.start = Mock(return_value=True)
+
+        with patch("clipsave_app.services.QApplication.clipboard", return_value=clipboard):
+            self.service.start()
+
+        self.service.notifier.start.assert_called_once_with(self.service.parent())
+        self.assertEqual(self.service.timer.interval(), self.service.EVENT_FALLBACK_INTERVAL_MS)
+        self.assertTrue(self.service.timer.isActive())
+
+    def test_clipboard_notification_runs_stable_snapshot_path(self):
+        self.service.poll = Mock()
+
+        self.service.notifier.changed.emit()
+
+        self.service.poll.assert_called_once_with()
 
     def test_sequence_change_during_read_retries_latest_snapshot(self):
         clipboard = FakeClipboard(texts=["first", "  second\n"])
@@ -146,6 +254,7 @@ class ClipboardServiceTests(unittest.TestCase):
         saved = []
         self.service.last_clipboard_sequence = 9
         self.service._clipboard = lambda: clipboard
+        self.service._snapshot_clipboard_text = lambda source: source.text()
         self.service.clipboard_sequence = lambda: next(sequences)
         self.service.save_text = lambda text: saved.append(text) or True
 
@@ -156,6 +265,222 @@ class ClipboardServiceTests(unittest.TestCase):
         self.assertEqual(self.service.last_text, "  second\n")
         self.assertEqual(self.service.last_clipboard_sequence, 11)
 
+    def test_clipboard_sequence_wrap_advances_after_successful_image_save(self):
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(QColor("#21a8fb"))
+        self.service.last_clipboard_sequence = 0xFFFFFFFF
+        self.service._clipboard = lambda: FakeClipboard(image=image)
+        self.service.clipboard_sequence = lambda: 0
+        self.service.save_image = Mock(return_value=True)
+
+        with patch.object(self.service, "_snapshot_clipboard_image", return_value=image):
+            self.service.poll()
+            self.assertTrue(self.service.wait_for_idle())
+            self.service.poll()
+            self.assertTrue(self.service.wait_for_idle())
+
+        self.service.save_image.assert_called_once()
+        self.assertEqual(self.service.last_clipboard_sequence, 0)
+
+    def test_native_clipboard_size_is_rejected_before_materializing_payload(self):
+        user32 = Mock()
+        kernel32 = Mock()
+        user32.OpenClipboard.return_value = 1
+        user32.IsClipboardFormatAvailable.return_value = 1
+        user32.GetClipboardData.return_value = 123
+        kernel32.GlobalSize.return_value = MAX_CLIPBOARD_TEXT_BYTES + 2
+
+        with patch("clipsave_app.services.os.name", "nt"), patch.object(
+            ClipboardService, "_windows_clipboard_apis", return_value=(user32, kernel32)
+        ), patch("clipsave_app.services.ctypes.string_at") as string_at:
+            with self.assertRaisesRegex(ValueError, "过大"):
+                self.service._native_clipboard_text_snapshot()
+
+        kernel32.GlobalLock.assert_not_called()
+        string_at.assert_not_called()
+        user32.CloseClipboard.assert_called_once_with()
+
+    def test_native_unicode_text_is_copied_and_decoded_under_one_open(self):
+        payload = "fixed text\0changed later".encode("utf-16-le")
+        user32 = Mock()
+        kernel32 = Mock()
+        user32.OpenClipboard.return_value = 1
+        user32.IsClipboardFormatAvailable.return_value = 1
+        user32.GetClipboardData.return_value = 123
+        kernel32.GlobalSize.return_value = len(payload)
+        kernel32.GlobalLock.return_value = 456
+
+        with patch("clipsave_app.services.os.name", "nt"), patch.object(
+            ClipboardService, "_windows_clipboard_apis", return_value=(user32, kernel32)
+        ), patch("clipsave_app.services.ctypes.string_at", return_value=payload):
+            self.assertEqual(self.service._native_clipboard_text_snapshot(), "fixed text")
+
+        user32.OpenClipboard.assert_called_once_with(None)
+        user32.CloseClipboard.assert_called_once_with()
+        kernel32.GlobalLock.assert_called_once_with(123)
+        kernel32.GlobalUnlock.assert_called_once_with(123)
+
+    def test_stable_text_snapshot_does_not_reread_qt_clipboard_text(self):
+        clipboard = Mock()
+        clipboard.mimeData.return_value = FakeMimeData(has_text=True)
+        clipboard.text.side_effect = AssertionError("Qt clipboard text must not be reread")
+        self.service._clipboard = lambda: clipboard
+        self.service.clipboard_sequence = Mock(side_effect=[10, 10])
+
+        with patch.object(self.service, "_snapshot_clipboard_text", return_value="fixed text"):
+            self.assertEqual(self.service._read_stable_snapshot(), ("text", "fixed text", 10))
+
+        clipboard.text.assert_not_called()
+
+    def test_registered_png_dimensions_are_rejected_before_qt_decode(self):
+        clipboard = Mock()
+        clipboard.mimeData.return_value = FakeMimeData(has_image=True)
+        self.service._clipboard = lambda: clipboard
+        self.service.clipboard_sequence = lambda: 10
+        header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (100000).to_bytes(4, "big") * 2
+        with patch.object(self.service, "_native_clipboard_image_snapshot", return_value=("PNG", header)):
+            with self.assertRaisesRegex(ValueError, "dimensions"):
+                self.service._read_stable_snapshot()
+        clipboard.image.assert_not_called()
+
+    def test_registered_png_payload_is_rejected_before_qt_decode(self):
+        clipboard = Mock()
+        clipboard.mimeData.return_value = FakeMimeData(has_image=True)
+        self.service._clipboard = lambda: clipboard
+        self.service.clipboard_sequence = lambda: 10
+        header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (1).to_bytes(4, "big") * 2
+        with patch.object(
+            self.service,
+            "_native_clipboard_image_snapshot",
+            return_value=("PNG", header + b"x" * (MAX_CLIPBOARD_IMAGE_BYTES + 1 - len(header))),
+        ):
+            with self.assertRaisesRegex(ValueError, "payload"):
+                self.service._read_stable_snapshot()
+        clipboard.image.assert_not_called()
+
+    def test_registered_png_is_decoded_from_validated_native_copy(self):
+        image = QImage(2, 3, QImage.Format.Format_RGBA8888)
+        image.fill(QColor("#21a8fb"))
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        self.assertTrue(image.save(buffer, "PNG"))
+        payload = bytes(buffer.data())
+        clipboard = Mock()
+        clipboard.mimeData.return_value = FakeMimeData(has_image=True)
+        self.service._clipboard = lambda: clipboard
+        self.service.clipboard_sequence = lambda: 10
+        with patch.object(self.service, "_native_clipboard_image_snapshot", return_value=("PNG", payload)):
+            kind, decoded, sequence = self.service._read_stable_snapshot()
+
+        self.assertEqual((kind, decoded.width(), decoded.height(), sequence), ("image", 2, 3, 10))
+        clipboard.image.assert_not_called()
+
+    def test_unknown_native_image_source_is_rejected(self):
+        with patch("clipsave_app.services.os.name", "nt"), patch.object(
+            self.service, "_native_clipboard_image_snapshot", return_value=None
+        ):
+            with self.assertRaisesRegex(ValueError, "Unknown native"):
+                self.service._reject_oversized_native_clipboard("image")
+
+    def test_clipboard_sequence_calls_configured_win32_api(self):
+        user32 = Mock()
+        user32.GetClipboardSequenceNumber.return_value = 0xFFFFFFFF
+        with patch("clipsave_app.services.os.name", "nt"), patch.object(
+            ClipboardService, "_windows_clipboard_apis", return_value=(user32, Mock())
+        ):
+            self.assertEqual(self.service.clipboard_sequence(), 0xFFFFFFFF)
+        user32.GetClipboardSequenceNumber.assert_called_once_with()
+
+    def test_registered_payload_cap_is_checked_before_global_lock(self):
+        user32 = Mock()
+        kernel32 = Mock()
+        user32.OpenClipboard.return_value = 1
+        user32.EnumClipboardFormats.side_effect = [0xC001, 0]
+        user32.GetClipboardData.return_value = 123
+        kernel32.GlobalSize.return_value = MAX_CLIPBOARD_IMAGE_BYTES + 1
+        kernel32.GetLastError.return_value = 0
+
+        def set_png_name(_format_id, buffer, _length):
+            buffer.value = "PNG"
+            return 3
+
+        user32.GetClipboardFormatNameW.side_effect = set_png_name
+        with patch("clipsave_app.services.os.name", "nt"), patch.object(
+            ClipboardService, "_windows_clipboard_apis", return_value=(user32, kernel32)
+        ), patch("clipsave_app.services.ctypes.string_at") as string_at:
+            with self.assertRaisesRegex(ValueError, "payload"):
+                self.service._native_registered_image_payloads()
+
+        kernel32.GlobalLock.assert_not_called()
+        string_at.assert_not_called()
+        user32.CloseClipboard.assert_called_once_with()
+
+    def test_native_dib_snapshot_uses_one_open_clipboard_window(self):
+        source = QImage(2, 2, QImage.Format.Format_RGB32)
+        source.fill(QColor("#21a8fb"))
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        self.assertTrue(source.save(buffer, "BMP"))
+        dib = bytes(buffer.data())[14:]
+        user32 = Mock()
+        kernel32 = Mock()
+        user32.OpenClipboard.return_value = 1
+        user32.EnumClipboardFormats.return_value = 0
+        user32.IsClipboardFormatAvailable.side_effect = lambda format_id: format_id == ClipboardService.CF_DIB
+        user32.GetClipboardData.return_value = 123
+        kernel32.GetLastError.return_value = 0
+        kernel32.GlobalSize.return_value = len(dib)
+        kernel32.GlobalLock.return_value = 456
+
+        with patch("clipsave_app.services.os.name", "nt"), patch.object(
+            ClipboardService, "_windows_clipboard_apis", return_value=(user32, kernel32)
+        ), patch("clipsave_app.services.ctypes.string_at", return_value=dib):
+            self.assertEqual(self.service._native_clipboard_image_snapshot(), ("DIB", dib))
+
+        user32.OpenClipboard.assert_called_once_with(None)
+        user32.CloseClipboard.assert_called_once_with()
+        kernel32.GlobalLock.assert_called_once_with(123)
+
+    def test_dib_is_decoded_from_fixed_native_snapshot_not_qt_clipboard(self):
+        source = QImage(3, 2, QImage.Format.Format_RGB32)
+        source.fill(QColor("#21a8fb"))
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        self.assertTrue(source.save(buffer, "BMP"))
+        dib = bytes(buffer.data())[14:]
+        clipboard = Mock()
+        clipboard.mimeData.return_value = FakeMimeData(has_image=True)
+        self.service._clipboard = lambda: clipboard
+        self.service.clipboard_sequence = lambda: 10
+
+        with patch.object(self.service, "_native_clipboard_image_snapshot", return_value=("DIB", dib)):
+            kind, decoded, sequence = self.service._read_stable_snapshot()
+
+        self.assertEqual((kind, decoded.width(), decoded.height(), sequence), ("image", 3, 2, 10))
+        clipboard.image.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows ctypes signatures are Windows-only")
+    def test_windows_clipboard_apis_use_pointer_sized_handles(self):
+        from ctypes import wintypes
+
+        user32, kernel32 = self.service._windows_clipboard_apis()
+
+        self.assertIs(user32.GetClipboardData.restype, wintypes.HANDLE)
+        self.assertIs(user32.GetClipboardSequenceNumber.restype, wintypes.DWORD)
+        self.assertIs(kernel32.GlobalLock.restype, wintypes.LPVOID)
+        self.assertIs(kernel32.GlobalSize.restype, ctypes.c_size_t)
+        self.assertIs(user32.EnumClipboardFormats.restype, wintypes.UINT)
+        self.assertIs(kernel32.GetLastError.restype, wintypes.DWORD)
+
+    def test_prepare_for_shutdown_pauses_and_resume_reenables_tasks(self):
+        self.service.timer.start()
+        self.service.prepare_for_shutdown()
+
+        self.assertFalse(self.service.timer.isActive())
+        self.assertFalse(self.service._accepting_tasks)
+        self.service.resume_after_failed_shutdown(False)
+        self.assertTrue(self.service._accepting_tasks)
+
     def test_failed_save_does_not_advance_clipboard_state(self):
         clipboard = FakeClipboard(texts=["new text"])
         sequences = iter([10, 10])
@@ -163,6 +488,7 @@ class ClipboardServiceTests(unittest.TestCase):
         self.service.last_text = "old text"
         self.service.last_clipboard_sequence = 9
         self.service._clipboard = lambda: clipboard
+        self.service._snapshot_clipboard_text = lambda source: source.text()
         self.service.clipboard_sequence = lambda: next(sequences)
         self.service.save_text = Mock(side_effect=RuntimeError("database unavailable"))
         self.service.failed.connect(failures.append)
@@ -187,6 +513,7 @@ class ClipboardServiceTests(unittest.TestCase):
 
         self.service.last_clipboard_sequence = 9
         self.service._clipboard = lambda: clipboard
+        self.service._snapshot_clipboard_text = lambda source: source.text()
         self.service.clipboard_sequence = lambda: next(sequences)
         self.service.save_text = slow_save
 
@@ -201,6 +528,24 @@ class ClipboardServiceTests(unittest.TestCase):
         self.assertTrue(self.service.wait_for_idle())
         self.assertEqual(self.service.last_text, "background save")
         self.assertEqual(self.service.last_clipboard_sequence, 10)
+
+    def test_idle_event_stays_clear_until_every_accepted_task_finishes(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_save(_text):
+            started.set()
+            release.wait(2)
+            return True
+
+        with patch.object(self.service, "save_text", side_effect=blocked_save):
+            self.service._enqueue_task("text", "accepted", 91)
+            self.assertTrue(started.wait(1))
+            self.assertFalse(self.service._idle_event.is_set())
+            release.set()
+            self.assertTrue(self.service.wait_for_idle(1))
+
+        self.assertTrue(self.service._idle_event.is_set())
 
     def test_persistence_queue_enforces_total_memory_budget(self):
         failures = []
@@ -235,13 +580,26 @@ class ClipboardServiceTests(unittest.TestCase):
 
         with (
             patch("clipsave_app.services.MARKDOWN_DIR", markdown_dir),
-            patch.object(Path, "write_text", side_effect=OSError("disk full")),
+            patch("clipsave_app.services.open_managed_binary", side_effect=OSError("disk full")),
         ):
             self.assertTrue(self.service.save_text("persist me"))
 
         self.assertEqual(len(captured), 1)
         self.assertEqual(len(self.database.query_items()), 1)
         self.assertIn("disk full", failures[0])
+
+    def test_daily_markdown_uses_exclusive_create_then_handle_append(self):
+        markdown_dir = Path(self.temp.name) / "Markdown"
+        markdown_dir.mkdir()
+        with patch("clipsave_app.services.MARKDOWN_DIR", markdown_dir):
+            self.assertTrue(self.service.save_text("first entry"))
+            self.assertTrue(self.service.save_text("second entry"))
+
+        daily = next(markdown_dir.glob("clipboard_*.md"))
+        content = daily.read_text(encoding="utf-8")
+        self.assertEqual(content.count("# ClipSave"), 1)
+        self.assertIn("first entry", content)
+        self.assertIn("second entry", content)
 
     def test_duplicate_image_and_database_failure_remove_new_png(self):
         picture_dir = Path(self.temp.name) / "Pictures"
@@ -269,8 +627,87 @@ class ClipboardServiceTests(unittest.TestCase):
                     self.service.save_image(image_c)
             self.assertEqual(len(list(picture_dir.rglob("*.png"))), 2)
 
+    def test_scanner_owned_capture_path_is_not_deleted_as_duplicate(self):
+        picture_dir = Path(self.temp.name) / "Pictures"
+        image = QImage(16, 16, QImage.Format.Format_RGBA8888)
+        image.fill(QColor("#00aa55"))
+        real_add_image = self.database.add_image
+
+        def scanner_wins(path, created_at=None):
+            self.assertTrue(self.database.import_file(path, "image"))
+            return real_add_image(path, created_at)
+
+        captured = []
+        self.service.captured.connect(captured.append)
+        with patch("clipsave_app.services.PICTURE_DIR", picture_dir), patch.object(
+            self.database, "add_image", side_effect=scanner_wins
+        ):
+            self.assertTrue(self.service.save_image(image))
+
+        rows = self.database.query_items(kind="image")
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(Path(rows[0]["path"]).exists())
+        self.assertEqual(len(list(picture_dir.rglob("*.png"))), 1)
+        self.assertEqual(captured, [rows[0]["id"]])
+
+    def test_capture_identity_lock_blocks_replacement_during_scanner_race(self):
+        picture_dir = Path(self.temp.name) / "Pictures"
+        original = QImage(16, 16, QImage.Format.Format_RGBA8888)
+        original.fill(QColor("#00aa55"))
+        replacement = QImage(16, 16, QImage.Format.Format_RGBA8888)
+        replacement.fill(QColor("#aa0055"))
+        real_add_image = self.database.add_image
+        replacement_attempts = []
+
+        def scanner_wins(path, created_at=None):
+            replacement_attempts.append(replacement.save(str(path)))
+            self.assertTrue(self.database.import_file(path, "image"))
+            return real_add_image(path, created_at)
+
+        with patch("clipsave_app.services.PICTURE_DIR", picture_dir), patch.object(
+            self.database, "add_image", side_effect=scanner_wins
+        ):
+            self.assertTrue(self.service.save_image(original))
+
+        row = self.database.query_items(kind="image")[0]
+        self.assertEqual(replacement_attempts, [False])
+        self.assertTrue(Path(row["path"]).exists())
+        self.assertEqual(row["content_hash"], self.database.file_hash(Path(row["path"])))
+
+    def test_capture_identity_lock_blocks_replacement_before_database_insert(self):
+        picture_dir = Path(self.temp.name) / "Pictures"
+        original = QImage(16, 16, QImage.Format.Format_RGBA8888)
+        original.fill(QColor("#009944"))
+        replacement = QImage(16, 16, QImage.Format.Format_RGBA8888)
+        replacement.fill(QColor("#990044"))
+        real_add_image = self.database.add_image
+        replacement_attempts = []
+
+        def attempt_replacement(path, created_at=None):
+            replacement_attempts.append(replacement.save(str(path)))
+            return real_add_image(path, created_at)
+
+        with patch("clipsave_app.services.PICTURE_DIR", picture_dir), patch.object(
+            self.database, "add_image", side_effect=attempt_replacement
+        ):
+            self.assertTrue(self.service.save_image(original))
+
+        row = self.database.query_items(kind="image")[0]
+        self.assertEqual(replacement_attempts, [False])
+        self.assertEqual(row["content_hash"], self.database.file_hash(Path(row["path"])))
+
 
 class AIServiceTests(unittest.TestCase):
+    def test_preflight_rejects_truncated_image_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "truncated.jpg"
+            PILImage.new("RGB", (64, 64), "red").save(path, "JPEG")
+            payload = path.read_bytes()
+            path.write_bytes(payload[: max(100, len(payload) // 2)])
+
+            with self.assertRaises(ValueError):
+                preflight_image_file(path)
+
     def test_local_http_service_can_be_configured_without_api_key(self):
         service = AIService("http://127.0.0.1:11434/v1", "", "vision", "embedding")
         response = FakeResponse(json.dumps({"ok": True}).encode("utf-8"))
@@ -321,6 +758,141 @@ class AIServiceTests(unittest.TestCase):
             with self.assertRaises(OperationCancelled):
                 service._post("/test", {}, cancel_event)
         urlopen.assert_not_called()
+
+    def test_describe_image_preflights_pixels_before_posting(self):
+        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        with patch("clipsave_app.services.preflight_image_file", side_effect=ValueError("图片尺寸过大")) as preflight:
+            with self.assertRaisesRegex(ValueError, "尺寸过大"):
+                service.describe_image(Path("image.png"))
+        preflight.assert_called_once_with(Path("image.png"))
+
+
+class WindowsClipboardNotifierTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_registers_and_unregisters_window_listener(self):
+        notifier = WindowsClipboardNotifier()
+        user32 = Mock()
+        user32.AddClipboardFormatListener.return_value = 1
+        app = Mock()
+        window = Mock()
+        window.winId.return_value = 123
+
+        with (
+            patch("clipsave_app.services.os.name", "nt"),
+            patch.object(notifier, "_user32", return_value=user32),
+            patch("clipsave_app.services.QCoreApplication.instance", return_value=app),
+        ):
+            self.assertTrue(notifier.start(window))
+            notifier.stop()
+
+        user32.AddClipboardFormatListener.assert_called_once_with(123)
+        user32.RemoveClipboardFormatListener.assert_called_once_with(123)
+        app.installNativeEventFilter.assert_called_once_with(notifier)
+        app.removeNativeEventFilter.assert_called_once_with(notifier)
+
+    def test_wm_clipboardupdate_emits_changed_for_registered_window(self):
+        from ctypes import wintypes
+
+        notifier = WindowsClipboardNotifier()
+        notifier._hwnd = 123
+        notifier._installed = True
+        changed = []
+        notifier.changed.connect(lambda: changed.append(True))
+        message = wintypes.MSG()
+        message.hWnd = 123
+        message.message = notifier.WM_CLIPBOARDUPDATE
+
+        handled, result = notifier.nativeEventFilter(b"windows_generic_MSG", ctypes.addressof(message))
+
+        self.assertEqual((handled, result), (False, 0))
+        self.assertEqual(changed, [True])
+
+
+class PreflightTests(unittest.TestCase):
+    def test_image_snapshot_tracks_pixels_and_detects_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "image.png"
+            PILImage.new("RGB", (12, 8), "white").save(path)
+            snapshot = preflight_image_file(path)
+
+            self.assertEqual(snapshot.pixels, 96)
+            self.assertEqual(snapshot.decoded_bytes, 384)
+            PILImage.new("RGB", (4, 4), "black").save(path)
+            with self.assertRaisesRegex(RuntimeError, "修改"):
+                snapshot.require_current()
+
+    def test_image_preflight_rejects_pixel_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "image.png"
+            PILImage.new("RGB", (11, 11), "white").save(path)
+            with self.assertRaisesRegex(ValueError, "尺寸过大"):
+                preflight_image_file(path, max_pixels=100)
+
+
+class BoundedTaskExecutorTests(unittest.TestCase):
+    def test_global_executor_can_shutdown_and_be_recreated(self):
+        self.assertTrue(shutdown_ai_ocr_task_executor())
+        first = ai_ocr_task_executor()
+        self.assertTrue(shutdown_ai_ocr_task_executor())
+        second = ai_ocr_task_executor()
+        try:
+            self.assertIsNot(first, second)
+        finally:
+            self.assertTrue(shutdown_ai_ocr_task_executor())
+
+    def test_shutdown_can_retry_after_timeout_before_sentinels_are_queued(self):
+        executor = BoundedTaskExecutor(max_active=1, max_queued=1, memory_budget_bytes=100)
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking(_cancel_event):
+            started.set()
+            release.wait(2)
+
+        executor.submit(blocking)
+        executor.submit(lambda _cancel_event: None)
+        self.assertTrue(started.wait(1))
+        self.assertFalse(executor.shutdown(timeout=0.0))
+        release.set()
+        self.assertTrue(executor.shutdown(timeout=2.0))
+        self.assertTrue(all(not worker.is_alive() for worker in executor._workers))
+
+    def test_active_queue_limit_and_queued_cancellation(self):
+        executor = BoundedTaskExecutor(max_active=1, max_queued=1, memory_budget_bytes=100)
+        started = threading.Event()
+        release = threading.Event()
+        queued_ran = threading.Event()
+
+        def blocking(_cancel_event):
+            started.set()
+            release.wait(2)
+
+        first = executor.submit(blocking, estimated_bytes=40)
+        self.assertTrue(started.wait(1))
+        second = executor.submit(lambda _cancel_event: queued_ran.set(), estimated_bytes=40)
+        with self.assertRaises(TaskCapacityExceeded):
+            executor.submit(lambda _cancel_event: None)
+
+        second.cancel()
+        release.set()
+        self.assertTrue(first.wait(1))
+        self.assertTrue(second.wait(1))
+        self.assertFalse(queued_ran.is_set())
+        self.assertEqual(executor.reserved_bytes, 0)
+        self.assertTrue(executor.shutdown())
+
+    def test_memory_budget_is_global_across_active_and_queued_tasks(self):
+        executor = BoundedTaskExecutor(max_active=1, max_queued=2, memory_budget_bytes=50)
+        release = threading.Event()
+        handle = executor.submit(lambda _cancel_event: release.wait(2), estimated_bytes=40)
+        with self.assertRaisesRegex(TaskCapacityExceeded, "内存"):
+            executor.submit(lambda _cancel_event: None, estimated_bytes=11)
+        release.set()
+        self.assertTrue(handle.wait(1))
+        self.assertTrue(executor.shutdown())
 
 
 if __name__ == "__main__":

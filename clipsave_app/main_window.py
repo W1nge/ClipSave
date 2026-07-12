@@ -9,7 +9,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QCloseEvent, QIcon, QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -29,12 +29,21 @@ from PySide6.QtWidgets import (
 )
 from send2trash import send2trash
 
-from .constants import APP_NAME
-from .database import LibraryDatabase
-from .services import AIService, ClipboardService, OperationCancelled, apply_windows_acrylic
+from .constants import APP_NAME, LIBRARY_DIR, MAX_IMPORT_BYTES, MAX_MARKDOWN_BYTES
+from .database import ImportFileResult, LibraryDatabase
+from .services import (
+    AIService,
+    ClipboardService,
+    OperationCancelled,
+    TaskCapacityExceeded,
+    ai_ocr_task_executor,
+    apply_windows_acrylic,
+    preflight_image_file,
+    shutdown_ai_ocr_task_executor,
+)
 from .ocr_service import WindowsOCRService
 from .settings import Settings
-from .storage import is_under_local_store
+from .storage import is_under_local_store, recycle_managed_file
 from .styles import LIGHT_STYLESHEET
 from .widgets import (
     AssetGrid,
@@ -52,6 +61,15 @@ from .widgets import (
     WindowTitleBar,
     lucide_icon,
 )
+
+
+SORT_BUTTON_LABELS = {
+    "newest": "排序：最新",
+    "oldest": "排序：最早",
+    "name": "排序：名称",
+    "size": "排序：大小",
+    "type": "排序：类型",
+}
 
 
 class AsyncSignals(QObject):
@@ -90,17 +108,24 @@ class MainWindow(QMainWindow):
         self._ai_requests: dict[int, tuple[object, AsyncSignals]] = {}
         self._ocr_requests: dict[int, tuple[object, AsyncSignals]] = {}
         self._semantic_request: tuple[object, AsyncSignals] | None = None
+        self._semantic_results_active = False
+        self._semantic_ordered_ids: list[int] = []
+        self._session_hidden_item_ids: set[int] = set()
         self._startup_scan_request: tuple[object, AsyncSignals] | None = None
         self._import_request: tuple[object, AsyncSignals] | None = None
+        self._copy_request: tuple[object, AsyncSignals, int] | None = None
+        self._backup_request: tuple[object, AsyncSignals] | None = None
         self._async_tasks: dict[object, tuple[threading.Event, threading.Thread]] = {}
+        self._bounded_tasks: dict[object, object] = {}
         self._async_tasks_lock = threading.Lock()
         self._closing = False
         self._quit_in_progress = False
+        self.global_hotkey_registered: bool | None = None
 
-        self.setWindowTitle("")
+        self.setWindowTitle(APP_NAME)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.resize(1440, 880)
-        self.setMinimumSize(980, 640)
+        self.setMinimumSize(800, 440)
         self.setStyleSheet(LIGHT_STYLESHEET)
         self.build_ui()
         self.build_tray()
@@ -118,6 +143,11 @@ class MainWindow(QMainWindow):
         self.refresh_library()
         if scan_on_start or reconcile_on_start:
             self._start_startup_scan(scan_on_start, reconcile_on_start)
+        self.backup_timer = QTimer(self)
+        self.backup_timer.setInterval(5 * 60 * 1000)
+        self.backup_timer.timeout.connect(self._start_periodic_backup)
+        self.backup_timer.start()
+        QTimer.singleShot(0, self._show_database_recovery_state)
         QTimer.singleShot(100, lambda: apply_windows_acrylic(self))
 
     def build_ui(self) -> None:
@@ -172,7 +202,7 @@ class MainWindow(QMainWindow):
         self.search.setPlaceholderText("搜索剪贴板内容、文件名、标签、OCR 或 AI 描述  (Ctrl+K)")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(560)
-        self.search.setMinimumWidth(320)
+        self.search.setMinimumWidth(160)
         self.search.textChanged.connect(lambda _text: self.search_timer.start())
         top_layout.addWidget(self.search, 3)
         self.semantic_button = QPushButton("语义搜索")
@@ -181,7 +211,9 @@ class MainWindow(QMainWindow):
         self.semantic_button.clicked.connect(self.semantic_search)
         top_layout.addWidget(self.semantic_button)
         top_layout.addStretch(1)
-        self.sort_button = QPushButton("按时间排序  ▾")
+        self.sort_button = QPushButton(
+            SORT_BUTTON_LABELS.get(self.current_sort, SORT_BUTTON_LABELS["newest"]) + "  ▾"
+        )
         self.sort_button.clicked.connect(self.open_sort_menu)
         top_layout.addWidget(self.sort_button)
         self.grid_button = IconButton("grid", "网格视图")
@@ -220,10 +252,12 @@ class MainWindow(QMainWindow):
         self.view_stack.setObjectName("ViewStack")
         self.grid = AssetGrid()
         self.grid.item_selected.connect(self.select_item)
+        self.grid.selection_cleared.connect(self.clear_item_selection)
         self.grid.item_activated.connect(self.activate_item)
         self.grid.favorite_requested.connect(self.set_favorite)
         self.table = AssetTable()
         self.table.item_selected.connect(self.select_item)
+        self.table.selection_cleared.connect(self.clear_item_selection)
         self.table.item_activated.connect(self.activate_item)
         self.table_page = QWidget()
         table_page_layout = QVBoxLayout(self.table_page)
@@ -359,34 +393,56 @@ class MainWindow(QMainWindow):
         self.tray = QSystemTrayIcon(self.app_icon, self)
         self.tray.setToolTip("ClipSave - 正在监听剪贴板")
         menu = QMenu()
-        show_action = menu.addAction("显示 ClipSave")
-        show_action.triggered.connect(self.bring_to_front)
+        self.tray_show_action = menu.addAction("显示 ClipSave")
+        self.tray_show_action.triggered.connect(self.bring_to_front)
         self.tray_monitor_action = menu.addAction("暂停监听")
         self.tray_monitor_action.triggered.connect(self.toggle_monitor)
         menu.addSeparator()
-        quit_action = menu.addAction("退出")
-        quit_action.triggered.connect(self.quit_application)
+        self.tray_quit_action = menu.addAction("退出")
+        self.tray_quit_action.triggered.connect(self.quit_application)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda reason: self.bring_to_front() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
         self.tray.show()
 
     def build_shortcuts(self) -> None:
-        QShortcut(QKeySequence("Ctrl+K"), self, activated=self.focus_search)
-        QShortcut(QKeySequence("Ctrl+F"), self, activated=self.focus_search)
-        QShortcut(QKeySequence("Ctrl+B"), self, activated=self.sidebar.toggle_collapsed)
-        QShortcut(QKeySequence("Ctrl+I"), self, activated=self.toggle_detail)
-        QShortcut(QKeySequence("Delete"), self, activated=lambda: self.current_item_id and self.delete_item(self.current_item_id))
-        QShortcut(QKeySequence("Ctrl+C"), self, activated=lambda: self.current_item_id and self.copy_item(self.current_item_id))
+        self.shortcuts = [
+            QShortcut(QKeySequence("Ctrl+K"), self, activated=self.focus_search),
+            QShortcut(QKeySequence("Ctrl+F"), self, activated=self.focus_search),
+            QShortcut(QKeySequence("Ctrl+B"), self, activated=self.sidebar.toggle_collapsed),
+            QShortcut(QKeySequence("Ctrl+I"), self, activated=self.toggle_detail),
+            QShortcut(QKeySequence("Delete"), self, activated=lambda: self.current_item_id and self.delete_item(self.current_item_id)),
+            QShortcut(QKeySequence("Ctrl+C"), self, activated=lambda: self.current_item_id and self.copy_item(self.current_item_id)),
+        ]
+
+    def _set_interactions_enabled(self, enabled: bool) -> None:
+        self.centralWidget().setEnabled(enabled)
+        for shortcut in getattr(self, "shortcuts", []):
+            shortcut.setEnabled(enabled)
+        for action_name in ("tray_show_action", "tray_monitor_action", "tray_quit_action"):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(enabled)
+
+    @staticmethod
+    def _exec_transient_dialog(dialog) -> int:
+        try:
+            return dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def refresh_library(self) -> None:
+        self._refresh_navigation_metadata()
+        self.refresh_items()
+
+    def _refresh_navigation_metadata(self) -> None:
         counts = self.database.counts()
         self.sidebar.set_primary(counts)
         self.sidebar.set_collections(self.database.collections())
         self.sidebar.set_tags(self.database.tags())
         self.detail.set_collections(self.database.collections())
-        self.refresh_items()
 
     def refresh_items(self) -> None:
+        self._semantic_results_active = False
         self._cancel_semantic_request()
         items = self.database.query_items(
             query=self.search.text().strip(),
@@ -397,6 +453,7 @@ class MainWindow(QMainWindow):
             collection_id=self.current_collection,
             tag_id=self.current_tag,
             sort=self.current_sort,
+            summary_only=True,
         )
         self._apply_items(items)
         self.result_count.setText(f"{len(self.current_items):,} 项")
@@ -408,7 +465,9 @@ class MainWindow(QMainWindow):
         self.filter_hint.setText("  ·  ".join(filters))
 
     def _apply_items(self, items) -> None:
-        self.current_items = list(items)
+        self.current_items = [
+            item for item in items if item["id"] not in self._session_hidden_item_ids
+        ]
         visible_ids = {item["id"] for item in self.current_items}
         if self.current_item_id is not None and self.current_item_id not in visible_ids:
             self.current_item_id = None
@@ -432,7 +491,7 @@ class MainWindow(QMainWindow):
         if key == "date":
             dialog = DateDialog(self.database.days(), self)
             dialog.day_selected.connect(self.open_day)
-            dialog.exec()
+            self._exec_transient_dialog(dialog)
             return
         self.current_kind = None
         self.current_favorite = False
@@ -456,7 +515,8 @@ class MainWindow(QMainWindow):
             row = next((row for row in self.database.tags() if row["id"] == value), None)
             titles[key] = f"标签：{row['name']}" if row else "标签"
         self.page_title.setText(titles.get(key, "全部内容"))
-        self.sidebar.set_active(key if key in self.sidebar.nav_buttons else "")
+        active_key = f"{key}:{value}" if key in ("collection", "tag") else key
+        self.sidebar.set_active(active_key)
         self.refresh_items()
 
     def open_day(self, day: str) -> None:
@@ -479,10 +539,21 @@ class MainWindow(QMainWindow):
         if self.detail.isVisible():
             self.update_detail(item_id)
 
+    def clear_item_selection(self) -> None:
+        self.current_item_id = None
+        self.grid.selected_id = None
+        self.table.selected_id = None
+        self.detail.clear_item()
+
     def update_detail(self, item_id: int) -> None:
         item = self.database.get_item(item_id)
-        if item:
-            self.detail.set_item(item)
+        if item and self.current_item_id == item_id:
+            if not self.detail.set_item(item):
+                if self.current_item_id == item_id:
+                    refreshed_item = self.database.get_item(item_id)
+                    if refreshed_item is not None:
+                        self.detail.set_item(refreshed_item)
+                return
             if item_id in self._ai_requests:
                 self.detail.set_ai_busy(True)
             if item_id in self._ocr_requests:
@@ -506,6 +577,9 @@ class MainWindow(QMainWindow):
         self.view_stack.setCurrentWidget(self.grid if mode == "grid" else self.table_page)
         self.grid.set_preview_loading_enabled(mode == "grid" and self.isVisible())
         self._refresh_visible_view()
+        active_view = self.grid if mode == "grid" else self.table
+        active_view.selected_id = self.current_item_id
+        active_view.sync_selection_from_selected_id()
         self._save_setting("view_mode", mode)
         self.grid_button.setStyleSheet("background:rgba(47,125,246,28); color:#1769d2;" if mode == "grid" else "")
         self.list_button.setStyleSheet("background:rgba(47,125,246,28); color:#1769d2;" if mode == "list" else "")
@@ -535,7 +609,7 @@ class MainWindow(QMainWindow):
     def set_sort(self, key: str, label: str) -> None:
         self.current_sort = key
         self._save_setting("sort", key)
-        self.sort_button.setText(label + "  ▾")
+        self.sort_button.setText(SORT_BUTTON_LABELS.get(key, label) + "  ▾")
         self.refresh_items()
 
     def toggle_monitor(self) -> None:
@@ -556,14 +630,19 @@ class MainWindow(QMainWindow):
 
     def on_captured(self, _item_id: int) -> None:
         self.show_status("已保存一条新的剪贴板内容")
-        self.refresh_library()
+        if self._semantic_request is not None or self._semantic_results_active:
+            self._refresh_navigation_metadata()
+        else:
+            self.refresh_library()
 
     def activate_item(self, item_id: int) -> None:
         item = self.database.get_item(item_id)
         if not item:
             return
         if item["kind"] == "markdown":
-            MarkdownDialog(item["title"], item["content"], item["path"], self).exec()
+            self._exec_transient_dialog(
+                MarkdownDialog(item["title"], item["content"], item["path"], self)
+            )
         elif item["kind"] == "image" and item["path"]:
             path = Path(item["path"])
             if not path.exists():
@@ -582,6 +661,10 @@ class MainWindow(QMainWindow):
         item = self.database.get_item(item_id)
         if not item:
             return
+        if self._copy_request is not None:
+            self._cancel_async_token(self._copy_request[0])
+            self._async_signals.discard(self._copy_request[1])
+            self._copy_request = None
         clipboard = QApplication.clipboard()
         if item["kind"] == "image" and item["path"]:
             path = Path(item["path"])
@@ -589,19 +672,71 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "复制失败", "图片文件不存在或已被移动。")
                 self.show_status("复制失败：图片文件不存在")
                 return
-            pixmap = QPixmap(str(path))
-            if pixmap.isNull():
-                QMessageBox.warning(self, "复制失败", "图片文件无法读取，可能已损坏或无权访问。")
+            try:
+                snapshot = preflight_image_file(path)
+            except Exception as exc:
+                QMessageBox.warning(self, "复制失败", str(exc))
                 self.show_status("复制失败：图片文件无法读取")
                 return
-            image = pixmap.toImage()
-            self.clipboard_service.suppress_image(image)
-            clipboard.setImage(image)
+            token = object()
+            signals = AsyncSignals()
+            self._async_signals.add(signals)
+            self._copy_request = (token, signals, item_id)
+            signals.succeeded.connect(
+                lambda result_item_id, _text, image, request_token=token, request_signals=signals: self._copy_image_succeeded(
+                    request_token, request_signals, result_item_id, image
+                )
+            )
+            signals.failed.connect(
+                lambda message, request_token=token, request_signals=signals: self._copy_image_failed(
+                    request_token, request_signals, message
+                )
+            )
+
+            def work(cancel_event: threading.Event) -> None:
+                try:
+                    snapshot.require_current()
+                    image = QImage(str(snapshot.path))
+                    snapshot.require_current()
+                    if image.isNull():
+                        raise ValueError("图片文件无法读取，可能已损坏或无权访问。")
+                    if not cancel_event.is_set():
+                        signals.succeeded.emit(item_id, "", image)
+                except Exception as exc:
+                    if not cancel_event.is_set():
+                        signals.failed.emit(str(exc))
+
+            try:
+                self._start_bounded_task(token, work, estimated_bytes=snapshot.decoded_bytes)
+            except TaskCapacityExceeded as exc:
+                self._copy_request = None
+                self._async_signals.discard(signals)
+                QMessageBox.warning(self, "复制任务繁忙", str(exc))
+            return
         else:
             text = item["content"]
             self.clipboard_service.suppress_text(text)
             clipboard.setText(text)
         self.show_status("已复制到剪贴板")
+
+    def _copy_image_succeeded(self, token: object, signals: AsyncSignals, item_id: int, image: QImage) -> None:
+        self._async_signals.discard(signals)
+        self._finish_async_token(token)
+        if self._closing or self._copy_request != (token, signals, item_id):
+            return
+        self._copy_request = None
+        self.clipboard_service.suppress_image(image)
+        QApplication.clipboard().setImage(image)
+        self.show_status("已复制到剪贴板")
+
+    def _copy_image_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
+        self._async_signals.discard(signals)
+        self._finish_async_token(token)
+        if self._closing or self._copy_request is None or self._copy_request[:2] != (token, signals):
+            return
+        self._copy_request = None
+        QMessageBox.warning(self, "复制失败", message)
+        self.show_status("复制失败：图片文件无法读取")
 
     def delete_item(self, item_id: int) -> None:
         item = self.database.get_item(item_id)
@@ -622,10 +757,19 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        managed_file = bool(item["path"] and is_under_local_store(Path(item["path"])))
         file_exists = bool(item["path"] and Path(item["path"]).exists())
         if managed_file and file_exists:
             try:
-                send2trash(item["path"])
+                if not is_under_local_store(Path(item["path"])):
+                    raise RuntimeError("文件路径在确认期间发生变化，已取消删除。")
+                recycle_managed_file(
+                    Path(item["path"]),
+                    LIBRARY_DIR,
+                    send2trash,
+                    expected_sha256=item["content_hash"],
+                    expected_size=item["file_size"],
+                )
             except Exception as exc:
                 QMessageBox.warning(self, "删除失败", f"文件无法移入回收站，内容未删除。\n\n{exc}")
                 self.show_status("删除失败：文件未能移入回收站")
@@ -634,19 +778,26 @@ class MainWindow(QMainWindow):
             self.database.remove_item(item_id)
         except Exception as exc:
             if managed_file and file_exists:
-                message = f"文件已移入回收站，但 ClipSave 索引删除失败。请稍后重试。\n\n{exc}"
-                status = "删除未完成：文件已移入回收站，索引仍保留"
+                try:
+                    self.database.mark_item_missing(item_id)
+                except Exception:
+                    self._session_hidden_item_ids.add(item_id)
+                self._cancel_item_requests(item_id)
+                self._refresh_after_mutation()
+                message = f"文件已移入回收站，但 ClipSave 索引删除失败。该条目已在当前会话隐藏，并会在下次启动时重新核对。\n\n{exc}"
+                status = "文件已移入回收站，失效条目已隐藏"
             else:
                 message = f"ClipSave 索引删除失败，内容未删除。\n\n{exc}"
                 status = "删除失败：内容索引未能移除"
             QMessageBox.warning(self, "删除失败", message)
             self.show_status(status)
             return
+        self._cancel_item_requests(item_id)
         if self.current_item_id == item_id:
             self.current_item_id = None
             self.detail.clear_item()
             self.hide_detail()
-        self.refresh_library()
+        self._refresh_after_mutation()
         if managed_file and file_exists:
             status = "内容及文件已移入回收站"
         elif managed_file:
@@ -658,20 +809,33 @@ class MainWindow(QMainWindow):
         self.show_status(status)
 
     def set_favorite(self, item_id: int, value: bool) -> None:
-        self.database.set_favorite(item_id, value)
-        self.refresh_library()
-        if self.detail.isVisible():
+        if not self._run_database_action(
+            lambda: self.database.set_favorite(item_id, value), "收藏更新失败", "收藏状态未保存"
+        ):
+            return
+        self._refresh_after_mutation()
+        if self.detail.isVisible() and self.current_item_id == item_id:
             self.update_detail(item_id)
 
-    def save_notes(self, item_id: int, notes: str) -> None:
-        self.database.set_notes(item_id, notes)
+    def save_notes(self, item_id: int, notes: str) -> bool:
+        if not self._run_database_action(
+            lambda: self.database.set_notes(item_id, notes), "备注保存失败", "备注未保存"
+        ):
+            return False
+        self.detail.mark_notes_saved(item_id, notes)
+        if self.search.text().strip() and not self._semantic_results_active:
+            self.refresh_items()
         self.show_status("备注已保存")
+        return True
 
     def add_collection(self) -> None:
         name, ok = QInputDialog.getText(self, "新建集合", "集合名称")
         if ok and name.strip():
-            self.database.create_collection(name.strip())
-            self.refresh_library()
+            if not self._run_database_action(
+                lambda: self.database.create_collection(name.strip()), "集合创建失败", "集合未创建"
+            ):
+                return
+            self._refresh_after_mutation()
 
     def add_global_tag(self) -> None:
         if not self.current_item_id:
@@ -682,19 +846,59 @@ class MainWindow(QMainWindow):
     def add_tag_to_item(self, item_id: int) -> None:
         name, ok = QInputDialog.getText(self, "添加标签", "标签名称")
         if ok and name.strip():
-            self.database.add_tag(item_id, name.strip())
-            self.refresh_library()
+            if not self._run_database_action(
+                lambda: self.database.add_tag(item_id, name.strip()), "标签添加失败", "标签未添加"
+            ):
+                return
+            self._refresh_after_mutation()
             self.update_detail(item_id)
 
     def remove_tag_from_item(self, item_id: int, name: str) -> None:
-        self.database.remove_tag(item_id, name)
-        self.refresh_library()
-        self.update_detail(item_id)
+        if not self._run_database_action(
+            lambda: self.database.remove_tag(item_id, name), "标签移除失败", "标签未移除"
+        ):
+            return
+        self._refresh_after_mutation()
+        if self.current_item_id == item_id:
+            self.update_detail(item_id)
 
     def set_item_collection(self, item_id: int, collection_id) -> None:
-        self.database.set_collection(item_id, collection_id)
-        self.refresh_items()
+        if not self._run_database_action(
+            lambda: self.database.set_collection(item_id, collection_id), "集合更新失败", "集合未更新"
+        ):
+            if self.current_item_id == item_id:
+                self.update_detail(item_id)
+            return
+        self._refresh_after_mutation()
         self.show_status("集合已更新")
+
+    def _refresh_after_mutation(self) -> None:
+        if not self._semantic_results_active:
+            self.refresh_library()
+            return
+        self._refresh_navigation_metadata()
+        base_items = self.database.query_items(
+            kind=self.current_kind,
+            favorite=self.current_favorite,
+            day=self.current_day,
+            recent_days=7 if self.current_recent else None,
+            collection_id=self.current_collection,
+            tag_id=self.current_tag,
+            sort=self.current_sort,
+            summary_only=True,
+        )
+        records = {row["id"]: row for row in base_items}
+        self._apply_items([records[item_id] for item_id in self._semantic_ordered_ids if item_id in records])
+        self.result_count.setText(f"{len(self.current_items):,} 项 · 按语义相关度")
+
+    def _run_database_action(self, action, title: str, status: str) -> bool:
+        try:
+            action()
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, title, str(exc))
+            self.show_status(status)
+            return False
 
     def import_files(self, parent=None) -> None:
         if self._import_request is not None:
@@ -721,32 +925,75 @@ class MainWindow(QMainWindow):
 
         def work(cancel_event: threading.Event) -> None:
             added = 0
+            localized = 0
+            duplicates = 0
+            processed = 0
             failed = []
             for filename in paths:
                 if cancel_event.is_set():
                     break
                 try:
-                    added += int(self.database.import_file(Path(filename), copy_to_library=True))
+                    candidate = Path(filename)
+                    if candidate.suffix.lower() == ".md":
+                        if candidate.stat().st_size > MAX_MARKDOWN_BYTES:
+                            raise ValueError("Markdown 文件过大，已拒绝导入。")
+                        candidate.read_text(encoding="utf-8", errors="replace")
+                    else:
+                        preflight_image_file(candidate, max_file_bytes=MAX_IMPORT_BYTES)
+                    import_result = self.database.import_file(
+                        candidate, copy_to_library=True, strict=True
+                    )
+                    if import_result is ImportFileResult.LOCALIZED:
+                        localized += 1
+                    elif import_result:
+                        added += int(import_result)
+                    else:
+                        duplicates += 1
                 except Exception as exc:
                     failed.append((Path(filename).name, str(exc)))
+                finally:
+                    processed += 1
             signals.succeeded.emit(
                 -1,
                 "",
-                {"total": len(paths), "added": added, "failed": failed, "cancelled": cancel_event.is_set()},
+                {
+                    "total": len(paths),
+                    "added": added,
+                    "localized": localized,
+                    "duplicates": duplicates,
+                    "processed": processed,
+                    "failed": failed,
+                    "cancelled": cancel_event.is_set(),
+                },
             )
 
         self._start_async_task(token, work)
 
     def _import_finished(self, token: object, signals: AsyncSignals, result: dict) -> None:
         self._async_signals.discard(signals)
-        if self._closing or self._import_request != (token, signals):
+        if self._closing or self._quit_in_progress or self._import_request != (token, signals):
             return
         self._import_request = None
         self.refresh_library()
         failed = result["failed"]
-        skipped = result["total"] - result["added"] - len(failed)
+        localized = result.get("localized", 0)
+        skipped = result.get(
+            "duplicates",
+            result["total"] - result["added"] - localized - len(failed),
+        )
+        unprocessed = max(0, result["total"] - result.get("processed", result["total"]))
         prefix = "导入已取消；" if result.get("cancelled") else ""
-        self.show_status(f"{prefix}已导入 {result['added']} 项，跳过 {skipped} 项重复内容，失败 {len(failed)} 项")
+        unprocessed_text = f"，未处理 {unprocessed} 项" if unprocessed else ""
+        if localized:
+            self.show_status(
+                f"{prefix}已导入 {result['added']} 项，本地化 {localized} 项，"
+                f"跳过 {skipped} 项重复内容，失败 {len(failed)} 项{unprocessed_text}"
+            )
+        else:
+            self.show_status(
+                f"{prefix}已导入 {result['added']} 项，跳过 {skipped} 项重复内容，"
+                f"失败 {len(failed)} 项{unprocessed_text}"
+            )
         if failed:
             details = "\n".join(f"{name}：{message}" for name, message in failed[:5])
             if len(failed) > 5:
@@ -755,7 +1002,7 @@ class MainWindow(QMainWindow):
 
     def _import_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
         self._async_signals.discard(signals)
-        if self._closing or self._import_request != (token, signals):
+        if self._closing or self._quit_in_progress or self._import_request != (token, signals):
             return
         self._import_request = None
         QMessageBox.warning(self, "文件导入失败", message)
@@ -763,7 +1010,7 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
         dialog.import_requested.connect(lambda: self.import_files(dialog))
-        dialog.exec()
+        self._exec_transient_dialog(dialog)
 
     def _start_async_task(self, token: object, target) -> threading.Event:
         cancel_event = threading.Event()
@@ -782,6 +1029,16 @@ class MainWindow(QMainWindow):
             self._async_tasks[token] = (cancel_event, thread)
         thread.start()
         return cancel_event
+
+    def _start_bounded_task(self, token: object, target, *, estimated_bytes: int = 0):
+        with self._async_tasks_lock:
+            self._bounded_tasks = {
+                key: handle for key, handle in self._bounded_tasks.items() if not handle.done_event.is_set()
+            }
+        handle = ai_ocr_task_executor().submit(target, estimated_bytes=estimated_bytes)
+        with self._async_tasks_lock:
+            self._bounded_tasks[token] = handle
+        return handle
 
     def _start_startup_scan(self, full_scan: bool, reconcile_images: bool) -> None:
         token = object()
@@ -806,13 +1063,70 @@ class MainWindow(QMainWindow):
                 if not cancel_event.is_set() and full_scan:
                     imported = self.database.scan_legacy_files(cancel_event)
                 elif not cancel_event.is_set() and reconcile_images:
-                    imported = self.database.scan_unindexed_images(cancel_event)
+                    imported = self.database.scan_unindexed_files(cancel_event)
                 signals.succeeded.emit(-1, "", imported)
             except Exception as exc:
                 if not cancel_event.is_set():
                     signals.failed.emit(str(exc))
 
         self._start_async_task(token, work)
+
+    def _start_periodic_backup(self) -> None:
+        if self._closing or self._quit_in_progress or self._backup_request is not None:
+            return
+        if not self.database.backup_state()["dirty"]:
+            return
+        token = object()
+        signals = AsyncSignals()
+        self._async_signals.add(signals)
+        self._backup_request = (token, signals)
+        signals.succeeded.connect(
+            lambda _item_id, _text, path, request_token=token, request_signals=signals: self._periodic_backup_finished(
+                request_token, request_signals, path
+            )
+        )
+        signals.failed.connect(
+            lambda message, request_token=token, request_signals=signals: self._periodic_backup_failed(
+                request_token, request_signals, message
+            )
+        )
+
+        def work(_cancel_event: threading.Event) -> None:
+            try:
+                path = self.database.create_backup_if_changed()
+                signals.succeeded.emit(-1, "", str(path) if path else "")
+            except Exception as exc:
+                signals.failed.emit(str(exc))
+
+        self._start_async_task(token, work)
+
+    def _periodic_backup_finished(self, token: object, signals: AsyncSignals, _path: str) -> None:
+        self._async_signals.discard(signals)
+        if self._backup_request == (token, signals):
+            self._backup_request = None
+
+    def _periodic_backup_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
+        self._async_signals.discard(signals)
+        if self._closing or self._backup_request != (token, signals):
+            return
+        self._backup_request = None
+        self.show_error_status(f"数据库备份失败：{message}")
+
+    def _show_database_recovery_state(self) -> None:
+        state = self.database.recovery_state()
+        backup = self.database.backup_state()
+        if state["action"] == "none" and not backup["last_error"]:
+            return
+        details = []
+        if state["action"] == "restored":
+            details.append(f"数据库已从备份恢复：{state['backup_path']}")
+        elif state["action"] == "rebuilt":
+            details.append("数据库无法恢复，已重建索引。原数据库文件已保留。")
+        if state["preserved_paths"]:
+            details.append("保留文件：\n" + "\n".join(state["preserved_paths"]))
+        if backup["last_error"]:
+            details.append(f"最近一次备份失败：{backup['last_error']}")
+        QMessageBox.warning(self, "ClipSave 数据库恢复", "\n\n".join(details))
 
     def _startup_scan_finished(self, token: object, signals: AsyncSignals, imported: int) -> None:
         self._async_signals.discard(signals)
@@ -833,8 +1147,75 @@ class MainWindow(QMainWindow):
     def _cancel_async_token(self, token: object) -> None:
         with self._async_tasks_lock:
             task = self._async_tasks.get(token)
+            bounded = self._bounded_tasks.get(token)
         if task is not None:
             task[0].set()
+        if bounded is not None:
+            bounded.cancel()
+
+    def _finish_async_token(self, token: object) -> None:
+        with self._async_tasks_lock:
+            self._bounded_tasks.pop(token, None)
+
+    def _schedule_cancelled_request_cleanup(self, cancelled_tokens: set[object]) -> None:
+        if not cancelled_tokens:
+            return
+
+        def token_done(token: object) -> bool:
+            with self._async_tasks_lock:
+                regular = self._async_tasks.get(token)
+                bounded = self._bounded_tasks.get(token)
+            return (
+                (regular is None or not regular[1].is_alive())
+                and (bounded is None or bounded.done_event.is_set())
+            )
+
+        def poll() -> None:
+            if self._closing:
+                return
+            pending = False
+            for requests, kind in (
+                (self._ai_requests, "ai"),
+                (self._ocr_requests, "ocr"),
+            ):
+                for item_id, request in list(requests.items()):
+                    token, signals = request
+                    if token not in cancelled_tokens:
+                        continue
+                    if not token_done(token):
+                        pending = True
+                        continue
+                    requests.pop(item_id, None)
+                    self._async_signals.discard(signals)
+                    self._finish_async_token(token)
+                    if self.current_item_id == item_id:
+                        if kind == "ai":
+                            self.detail.set_ai_busy(False)
+                        else:
+                            self.detail.set_ocr_busy(False)
+            if self._semantic_request is not None:
+                token, signals = self._semantic_request
+                if token in cancelled_tokens:
+                    if token_done(token):
+                        self._semantic_request = None
+                        self._async_signals.discard(signals)
+                        self._finish_async_token(token)
+                        self.semantic_button.setEnabled(True)
+                        self.semantic_button.setText("语义搜索")
+                    else:
+                        pending = True
+            if self._copy_request is not None:
+                token, signals, _item_id = self._copy_request
+                if token in cancelled_tokens:
+                    if token_done(token):
+                        self._copy_request = None
+                        self._async_signals.discard(signals)
+                    else:
+                        pending = True
+            if pending:
+                QTimer.singleShot(100, poll)
+
+        QTimer.singleShot(0, poll)
 
     def _cancel_request(self, request: tuple[object, AsyncSignals] | None) -> None:
         if request is None:
@@ -843,7 +1224,17 @@ class MainWindow(QMainWindow):
         self._cancel_async_token(token)
         self._async_signals.discard(signals)
 
-    def _cancel_and_wait_request(self, request: tuple[object, AsyncSignals] | None, timeout: float) -> bool:
+    def _cancel_item_requests(self, item_id: int) -> None:
+        self._cancel_request(self._ai_requests.pop(item_id, None))
+        self._cancel_request(self._ocr_requests.pop(item_id, None))
+
+    def _cancel_and_wait_request(
+        self,
+        request: tuple[object, AsyncSignals] | None,
+        timeout: float,
+        *,
+        process_events: bool = True,
+    ) -> bool:
         if request is None:
             return True
         token, _signals = request
@@ -852,21 +1243,58 @@ class MainWindow(QMainWindow):
             task = self._async_tasks.get(token)
         if task is None:
             return True
-        task[1].join(max(timeout, 0.0))
+        deadline = time.monotonic() + max(timeout, 0.0)
+        app = QApplication.instance()
+        while task[1].is_alive() and time.monotonic() < deadline:
+            if process_events and app is not None:
+                app.processEvents()
+            wait_time = min(0.01, max(0.0, deadline - time.monotonic()))
+            if wait_time <= 0:
+                break
+            task[1].join(wait_time)
         return not task[1].is_alive()
 
-    def _cancel_and_wait_for_async_tasks(self, timeout: float = 1.5) -> bool:
+    def _cancel_and_wait_for_async_tasks(
+        self,
+        timeout: float = 1.5,
+        *,
+        require_bounded: bool = True,
+        process_events: bool = True,
+    ) -> bool:
+        deadline = time.monotonic() + max(timeout, 0.0)
+        app = QApplication.instance()
+        while time.monotonic() < deadline:
+            with self._async_tasks_lock:
+                tasks = list(self._async_tasks.values())
+                bounded_tasks = list(self._bounded_tasks.values())
+            for cancel_event, _thread in tasks:
+                cancel_event.set()
+            for handle in bounded_tasks:
+                handle.cancel()
+            regular_done = all(not thread.is_alive() for _cancel_event, thread in tasks)
+            bounded_done = all(handle.done_event.is_set() for handle in bounded_tasks)
+            if regular_done and (bounded_done or not require_bounded):
+                return True
+            if process_events and app is not None:
+                app.processEvents()
+            for _cancel_event, thread in tasks:
+                if thread.is_alive():
+                    wait_time = min(0.005, max(0.0, deadline - time.monotonic()))
+                    if wait_time <= 0:
+                        break
+                    thread.join(wait_time)
+            for handle in bounded_tasks:
+                if not handle.done_event.is_set():
+                    wait_time = min(0.005, max(0.0, deadline - time.monotonic()))
+                    if wait_time <= 0:
+                        break
+                    handle.wait(wait_time)
         with self._async_tasks_lock:
             tasks = list(self._async_tasks.values())
-        for cancel_event, _thread in tasks:
-            cancel_event.set()
-        deadline = time.monotonic() + max(timeout, 0.0)
-        for _cancel_event, thread in tasks:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            thread.join(remaining)
-        return all(not thread.is_alive() for _cancel_event, thread in tasks)
+            bounded_tasks = list(self._bounded_tasks.values())
+        regular_done = all(not thread.is_alive() for _cancel_event, thread in tasks)
+        bounded_done = all(handle.done_event.is_set() for handle in bounded_tasks)
+        return regular_done and (bounded_done or not require_bounded)
 
     def generate_ai_description(self, item_id: int) -> None:
         item = self.database.get_item(item_id)
@@ -882,6 +1310,11 @@ class MainWindow(QMainWindow):
         if not service.configured:
             QMessageBox.information(self, "AI 服务未配置", "请先在设置中填写 OpenAI-compatible 服务地址、API Key 和视觉模型。")
             self.open_settings()
+            return
+        try:
+            image_snapshot = preflight_image_file(Path(item["path"]))
+        except Exception as exc:
+            QMessageBox.warning(self, "AI 描述失败", str(exc))
             return
         self.detail.ai_button.setEnabled(False)
         self.detail.ai_button.setText("生成中…")
@@ -913,12 +1346,24 @@ class MainWindow(QMainWindow):
                 if not cancel_event.is_set():
                     signals.failed.emit(str(exc))
 
-        self._start_async_task(token, work)
+        try:
+            self._start_bounded_task(token, work, estimated_bytes=image_snapshot.decoded_bytes)
+        except TaskCapacityExceeded as exc:
+            self._ai_requests.pop(item_id, None)
+            self._async_signals.discard(signals)
+            if self.current_item_id == item_id:
+                self.detail.set_ai_busy(False, failed=True)
+            QMessageBox.warning(self, "AI 任务繁忙", str(exc))
 
     def generate_ocr(self, item_id: int) -> None:
         item = self.database.get_item(item_id)
         if not item or item["kind"] != "image" or not item["path"]:
             QMessageBox.information(self, "OCR", "当前只支持识别图片中的文字。")
+            return
+        try:
+            image_snapshot = preflight_image_file(Path(item["path"]))
+        except Exception as exc:
+            QMessageBox.warning(self, "OCR 识别失败", str(exc))
             return
         self.detail.ocr_button.setEnabled(False)
         self.detail.ocr_button.setText("识别中…")
@@ -949,23 +1394,40 @@ class MainWindow(QMainWindow):
                 if not cancel_event.is_set():
                     signals.failed.emit(str(exc))
 
-        self._start_async_task(token, work)
+        try:
+            self._start_bounded_task(token, work, estimated_bytes=image_snapshot.decoded_bytes)
+        except TaskCapacityExceeded as exc:
+            self._ocr_requests.pop(item_id, None)
+            self._async_signals.discard(signals)
+            if self.current_item_id == item_id:
+                self.detail.set_ocr_busy(False, failed=True)
+            QMessageBox.warning(self, "OCR 任务繁忙", str(exc))
 
     def _ocr_succeeded(self, token: object, signals: AsyncSignals, item_id: int, text: str, _unused) -> None:
         self._async_signals.discard(signals)
-        if self._closing:
+        self._finish_async_token(token)
+        if self._closing or self._quit_in_progress:
             return
         if self._ocr_requests.get(item_id) != (token, signals):
             return
+        if self.database.get_item(item_id) is None:
+            self._ocr_requests.pop(item_id, None)
+            return
+        try:
+            self.database.update_ocr(item_id, text)
+        except Exception as exc:
+            self._ocr_failed(token, signals, item_id, f"OCR 结果无法保存：{exc}")
+            return
         self._ocr_requests.pop(item_id, None)
-        self.database.update_ocr(item_id, text)
+        self._refresh_after_mutation()
         if self.current_item_id == item_id:
             self.update_detail(item_id)
         self.show_status("OCR 识别完成" if text else "图片中未识别到文字")
 
     def _ocr_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
         self._async_signals.discard(signals)
-        if self._closing:
+        self._finish_async_token(token)
+        if self._closing or self._quit_in_progress:
             return
         if self._ocr_requests.get(item_id) != (token, signals):
             return
@@ -1030,10 +1492,18 @@ class MainWindow(QMainWindow):
                 if not cancel_event.is_set():
                     signals.failed.emit(str(exc))
 
-        self._start_async_task(token, work)
+        try:
+            self._start_bounded_task(token, work, estimated_bytes=min(len(embedded) * 4096, 64 * 1024 * 1024))
+        except TaskCapacityExceeded as exc:
+            self._semantic_request = None
+            self._async_signals.discard(signals)
+            self.semantic_button.setEnabled(True)
+            self.semantic_button.setText("语义搜索")
+            QMessageBox.warning(self, "语义搜索繁忙", str(exc))
 
     def _semantic_succeeded(self, token: object, signals: AsyncSignals, query: str, _item_id: int, _text: str, ordered_ids) -> None:
         self._async_signals.discard(signals)
+        self._finish_async_token(token)
         if self._closing:
             return
         if self._semantic_request != (token, signals):
@@ -1051,13 +1521,17 @@ class MainWindow(QMainWindow):
             collection_id=self.current_collection,
             tag_id=self.current_tag,
             sort=self.current_sort,
+            summary_only=True,
         )
         records = {row["id"]: row for row in base_items}
         self._apply_items([records[item_id] for item_id in ordered_ids if item_id in records])
+        self._semantic_ordered_ids = list(ordered_ids)
+        self._semantic_results_active = True
         self.result_count.setText(f"{len(self.current_items):,} 项 · 按语义相关度")
 
     def _semantic_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
         self._async_signals.discard(signals)
+        self._finish_async_token(token)
         if self._closing:
             return
         if self._semantic_request != (token, signals):
@@ -1078,20 +1552,29 @@ class MainWindow(QMainWindow):
 
     def _ai_succeeded(self, token: object, signals: AsyncSignals, item_id: int, description: str, embedding) -> None:
         self._async_signals.discard(signals)
-        if self._closing:
+        self._finish_async_token(token)
+        if self._closing or self._quit_in_progress:
             return
         if self._ai_requests.get(item_id) != (token, signals):
             return
+        if self.database.get_item(item_id) is None:
+            self._ai_requests.pop(item_id, None)
+            return
+        try:
+            self.database.update_ai(item_id, description, embedding)
+        except Exception as exc:
+            self._ai_failed(token, signals, item_id, f"AI 结果无法保存：{exc}")
+            return
         self._ai_requests.pop(item_id, None)
-        self.database.update_ai(item_id, description, embedding)
+        self._refresh_after_mutation()
         if self.current_item_id == item_id:
             self.update_detail(item_id)
-        self.refresh_items()
         self.show_status("AI 描述已生成")
 
     def _ai_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
         self._async_signals.discard(signals)
-        if self._closing:
+        self._finish_async_token(token)
+        if self._closing or self._quit_in_progress:
             return
         if self._ai_requests.get(item_id) != (token, signals):
             return
@@ -1120,25 +1603,176 @@ class MainWindow(QMainWindow):
         super().hideEvent(event)
 
     def show_status(self, text: str) -> None:
+        self._status_generation = getattr(self, "_status_generation", 0) + 1
+        generation = self._status_generation
         self.capture_status.setToolTip(text)
         QTimer.singleShot(
             2800,
-            lambda: self.capture_status.setToolTip(
-                "本地自动捕获已开启" if self.clipboard_service.timer.isActive() else "本地自动捕获已暂停"
-            ),
+            lambda: self._restore_capture_tooltip(generation),
         )
 
     def show_error_status(self, text: str) -> None:
-        self.capture_status.setToolTip(f"剪贴板读取失败：{text[:80]}")
+        self._status_generation = getattr(self, "_status_generation", 0) + 1
+        message = f"ClipSave 操作失败：{text[:160]}"
+        self.capture_status.setToolTip(message)
+        if hasattr(self, "tray") and self.tray.isVisible():
+            self.tray.showMessage("ClipSave", message, QSystemTrayIcon.MessageIcon.Warning, 5000)
+
+    def _restore_capture_tooltip(self, generation: int) -> None:
+        if generation != getattr(self, "_status_generation", 0):
+            return
+        self.capture_status.setToolTip(
+            "本地自动捕获已开启" if self.clipboard_service.timer.isActive() else "本地自动捕获已暂停"
+        )
+
+    def quit_application_for_session_end(self, timeout: float) -> bool:
+        if self._closing:
+            return True
+        if self._quit_in_progress or timeout <= 0:
+            return False
+        deadline = time.monotonic() + timeout
+        cancelled_request_tokens: set[object] = set()
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        def abort(monitoring_was_active: bool) -> bool:
+            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
+            self.backup_timer.start()
+            self._quit_in_progress = False
+            self.force_quit = False
+            self._set_interactions_enabled(True)
+            current_id = self.current_item_id
+            self.detail.set_ai_busy(bool(current_id and current_id in self._ai_requests))
+            self.detail.set_ocr_busy(bool(current_id and current_id in self._ocr_requests))
+            if self._semantic_request is None:
+                self.semantic_button.setEnabled(True)
+                self.semantic_button.setText("语义搜索")
+            self._schedule_cancelled_request_cleanup(cancelled_request_tokens)
+            return False
+
+        self._quit_in_progress = True
+        self.force_quit = True
+        self._set_interactions_enabled(False)
+        self.search_timer.stop()
+        monitoring_was_active = self.clipboard_service.timer.isActive()
+        self.clipboard_service.prepare_for_shutdown()
+
+        note_updates = self.detail.pending_note_updates()
+        if self.detail.current_item is not None:
+            item_id = self.detail.current_item["id"]
+            notes = self.detail.notes.toPlainText()
+            if notes != self.detail._loaded_notes:
+                note_updates[item_id] = (self.detail._loaded_notes, notes)
+        if note_updates:
+            note_result: list[Exception | None] = []
+            note_saved_ids: list[int] = []
+            note_done = threading.Event()
+
+            def persist_notes() -> None:
+                error = None
+                try:
+                    for item_id, (expected_notes, notes) in note_updates.items():
+                        if not self.database.set_notes_if_unchanged(
+                            item_id, expected_notes, notes
+                        ):
+                            raise RuntimeError("notes changed during session shutdown")
+                        note_saved_ids.append(item_id)
+                except Exception as exc:
+                    error = exc
+                finally:
+                    note_result.append(error)
+                    note_done.set()
+
+            threading.Thread(
+                target=persist_notes,
+                name="ClipSaveSessionNotes",
+                daemon=True,
+            ).start()
+            notes_finished = note_done.wait(remaining())
+            for item_id in list(note_saved_ids):
+                _expected_notes, notes = note_updates[item_id]
+                self.detail.mark_notes_saved(item_id, notes)
+            if not notes_finished or note_result != [None]:
+                return abort(monitoring_was_active)
+
+        for attribute in ("_startup_scan_request", "_import_request", "_backup_request"):
+            request = getattr(self, attribute)
+            self._cancel_request(request)
+            if not self._cancel_and_wait_request(
+                request, remaining(), process_events=False
+            ):
+                return abort(monitoring_was_active)
+            setattr(self, attribute, None)
+        self.backup_timer.stop()
+        semantic_request = self._semantic_request
+        self._cancel_request(semantic_request)
+        if semantic_request is not None:
+            cancelled_request_tokens.add(semantic_request[0])
+        for request in list(self._ai_requests.values()):
+            self._cancel_request(request)
+            cancelled_request_tokens.add(request[0])
+        for request in list(self._ocr_requests.values()):
+            self._cancel_request(request)
+            cancelled_request_tokens.add(request[0])
+        if self._copy_request is not None:
+            self._cancel_async_token(self._copy_request[0])
+            self._async_signals.discard(self._copy_request[1])
+            cancelled_request_tokens.add(self._copy_request[0])
+        if not self._cancel_and_wait_for_async_tasks(
+            remaining(), require_bounded=True, process_events=False
+        ):
+            return abort(monitoring_was_active)
+        self._semantic_request = None
+        self.semantic_button.setEnabled(True)
+        self.semantic_button.setText("语义搜索")
+        self._ai_requests.clear()
+        self._ocr_requests.clear()
+        self._copy_request = None
+
+        if not self.clipboard_service.shutdown(timeout=remaining()):
+            return abort(monitoring_was_active)
+
+        self._closing = True
+        self._async_signals.clear()
+        shutdown_ai_ocr_task_executor(timeout=min(remaining(), 0.1))
+        self.grid.shutdown_thumbnail_loader(timeout_ms=0)
+        self.detail.shutdown_thumbnail_loader(timeout_ms=0)
+        self.tray.hide()
+        application = QApplication.instance()
+        if application is not None:
+            application.exit(0)
+        return True
 
     def quit_application(self) -> bool:
         if self._closing or self._quit_in_progress:
             return False
         self._quit_in_progress = True
         self.force_quit = True
+        self._set_interactions_enabled(False)
+        self.search_timer.stop()
+        if not self.detail.flush_notes():
+            self._set_interactions_enabled(True)
+            self._quit_in_progress = False
+            self.force_quit = False
+            QMessageBox.warning(self, "备注保存失败", "当前备注尚未保存，ClipSave 已取消退出。")
+            return False
+        for item_id, notes in self.detail.pending_note_drafts().items():
+            if self.save_notes(item_id, notes):
+                continue
+            self._set_interactions_enabled(True)
+            self._quit_in_progress = False
+            self.force_quit = False
+            QMessageBox.warning(
+                self,
+                "备注保存失败",
+                "仍有备注尚未保存，ClipSave 已取消退出。",
+            )
+            return False
         if not self._cancel_and_wait_request(self._startup_scan_request, 10.0):
             self._quit_in_progress = False
             self.force_quit = False
+            self._set_interactions_enabled(True)
             QMessageBox.warning(
                 self,
                 "ClipSave 正在整理本地库",
@@ -1150,6 +1784,7 @@ class MainWindow(QMainWindow):
         if not self._cancel_and_wait_request(self._import_request, 10.0):
             self._quit_in_progress = False
             self.force_quit = False
+            self._set_interactions_enabled(True)
             QMessageBox.warning(
                 self,
                 "ClipSave 正在导入",
@@ -1158,12 +1793,118 @@ class MainWindow(QMainWindow):
             return False
         self._cancel_request(self._import_request)
         self._import_request = None
-        monitoring_was_active = self.clipboard_service.timer.isActive()
-        persistence_stopped = self.clipboard_service.shutdown()
-        if not persistence_stopped:
-            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
+        self.backup_timer.stop()
+        if not self._cancel_and_wait_request(self._backup_request, 10.0):
             self._quit_in_progress = False
             self.force_quit = False
+            self._set_interactions_enabled(True)
+            self.backup_timer.start()
+            QMessageBox.warning(
+                self,
+                "ClipSave 正在备份",
+                "数据库备份仍在完成。为避免备份损坏，ClipSave 暂时不会退出。请稍后再次退出。",
+            )
+            return False
+        self._cancel_request(self._backup_request)
+        self._backup_request = None
+        cancelled_request_tokens: set[object] = set()
+        semantic_request = self._semantic_request
+        self._cancel_request(semantic_request)
+        if semantic_request is not None:
+            cancelled_request_tokens.add(semantic_request[0])
+        for request in list(self._ai_requests.values()):
+            self._cancel_request(request)
+            cancelled_request_tokens.add(request[0])
+        for request in list(self._ocr_requests.values()):
+            self._cancel_request(request)
+            cancelled_request_tokens.add(request[0])
+        if self._copy_request is not None:
+            self._cancel_async_token(self._copy_request[0])
+            self._async_signals.discard(self._copy_request[1])
+            cancelled_request_tokens.add(self._copy_request[0])
+        if not self._cancel_and_wait_for_async_tasks(6.0):
+            self._quit_in_progress = False
+            self.force_quit = False
+            self._set_interactions_enabled(True)
+            self.backup_timer.start()
+            self._schedule_cancelled_request_cleanup(cancelled_request_tokens)
+            if self.current_item_id:
+                self.update_detail(self.current_item_id)
+            QMessageBox.warning(
+                self,
+                "ClipSave 正在结束后台任务",
+                "AI、OCR 或图片处理任务仍在结束。ClipSave 暂时不会退出，请稍后再次退出。",
+            )
+            return False
+        self._semantic_request = None
+        self.semantic_button.setEnabled(True)
+        self.semantic_button.setText("语义搜索")
+        self._ai_requests.clear()
+        self._ocr_requests.clear()
+        self._copy_request = None
+        if not (self.grid.wait_for_thumbnail_idle() and self.detail.wait_for_thumbnail_idle()):
+            self.grid.resume_thumbnail_loader()
+            self.detail.resume_thumbnail_loader()
+            self._quit_in_progress = False
+            self.force_quit = False
+            self._set_interactions_enabled(True)
+            self.backup_timer.start()
+            if self.current_item_id:
+                self.update_detail(self.current_item_id)
+            QMessageBox.warning(
+                self,
+                "ClipSave 正在结束缩略图任务",
+                "图片预览任务尚未结束，ClipSave 已取消退出。请稍后再次退出。",
+            )
+            return False
+        monitoring_was_active = self.clipboard_service.timer.isActive()
+        self.clipboard_service.stop()
+        if not self.clipboard_service.wait_for_idle(10.0):
+            self.grid.resume_thumbnail_loader()
+            self.detail.resume_thumbnail_loader()
+            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
+            self.backup_timer.start()
+            self._quit_in_progress = False
+            self.force_quit = False
+            self._set_interactions_enabled(True)
+            if self.current_item_id:
+                self.update_detail(self.current_item_id)
+            QMessageBox.warning(
+                self,
+                "ClipSave 正在保存",
+                "仍有剪贴板内容正在写入本地磁盘。为避免数据丢失，ClipSave 暂时不会退出。请稍后再次退出。",
+            )
+            return False
+        try:
+            self.database.create_backup()
+        except Exception as exc:
+            self.grid.resume_thumbnail_loader()
+            self.detail.resume_thumbnail_loader()
+            self.database.recovery_report["backup_error"] = str(exc)
+            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
+            self.backup_timer.start()
+            self._quit_in_progress = False
+            self.force_quit = False
+            self._set_interactions_enabled(True)
+            if self.current_item_id:
+                self.update_detail(self.current_item_id)
+            QMessageBox.warning(
+                self,
+                "数据库备份失败",
+                f"退出前无法创建最新数据库备份，ClipSave 已取消退出。\n\n{exc}",
+            )
+            return False
+        persistence_stopped = self.clipboard_service.shutdown()
+        if not persistence_stopped:
+            self.grid.resume_thumbnail_loader()
+            self.detail.resume_thumbnail_loader()
+            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
+            self.backup_timer.start()
+            self._quit_in_progress = False
+            self.force_quit = False
+            self._set_interactions_enabled(True)
+            if self.current_item_id:
+                self.update_detail(self.current_item_id)
             QMessageBox.warning(
                 self,
                 "ClipSave 正在保存",
@@ -1171,28 +1912,21 @@ class MainWindow(QMainWindow):
             )
             return False
         self._closing = True
-        self._cancel_semantic_request()
-        for request in list(self._ai_requests.values()):
-            self._cancel_request(request)
-        for request in list(self._ocr_requests.values()):
-            self._cancel_request(request)
-        self._ai_requests.clear()
-        self._ocr_requests.clear()
-        self._cancel_and_wait_for_async_tasks()
         self._async_signals.clear()
+        shutdown_ai_ocr_task_executor(timeout=2.0)
+        self.grid.shutdown_thumbnail_loader()
+        self.detail.shutdown_thumbnail_loader()
         if persistence_stopped:
-            try:
-                self.database.create_backup()
-            except Exception as exc:
-                self.database.recovery_report["backup_error"] = str(exc)
-            finally:
-                self.database.close()
+            self.database.close()
         self.tray.hide()
-        QApplication.quit()
+        application = QApplication.instance()
+        if application is not None:
+            application.exit(0)
         return True
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self.force_quit or not self.settings.get("close_to_tray", True):
+        tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        if self.force_quit or not self.settings.get("close_to_tray", True) or not tray_available:
             if self.quit_application():
                 event.accept()
             else:

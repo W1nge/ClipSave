@@ -4,7 +4,7 @@ import asyncio
 import threading
 from pathlib import Path
 
-from .services import OperationCancelled
+from .services import OperationCancelled, preflight_image_file
 
 
 class WindowsOCRService:
@@ -29,13 +29,17 @@ class WindowsOCRService:
 
     @classmethod
     async def recognize_async(cls, path: Path, cancel_event: threading.Event | None = None) -> str:
+        if cancel_event is not None and cancel_event.is_set():
+            raise OperationCancelled("Operation cancelled")
+        snapshot = preflight_image_file(path)
         BitmapDecoder, OcrEngine, FileAccessMode, StorageFile = cls._winrt_types()
         stream = None
         bitmap = None
         try:
             if cancel_event is not None and cancel_event.is_set():
                 raise OperationCancelled("Operation cancelled")
-            file = await StorageFile.get_file_from_path_async(str(path.resolve()))
+            snapshot.require_current()
+            file = await StorageFile.get_file_from_path_async(str(snapshot.path))
             if cancel_event is not None and cancel_event.is_set():
                 raise OperationCancelled("Operation cancelled")
             stream = await file.open_async(FileAccessMode.READ)
