@@ -45,6 +45,7 @@ QPushButton {
 }
 QPushButton:hover { background: rgba(39,75,125,18); }
 QPushButton:pressed { background: rgba(39,75,125,30); }
+QPushButton:disabled { color: rgba(53,64,82,105); background: transparent; }
 QPushButton#Primary { background: #2f7df6; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #246be0; }
 QPushButton#SettingsAction { text-align: left; background: rgba(255,255,255,150); border: 1px solid rgba(99,115,139,38); padding: 9px 12px; }

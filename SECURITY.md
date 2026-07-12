@@ -7,6 +7,7 @@
 - The executable and source directory do not contain user clipboard files.
 - Imported images and Markdown are copied into the managed local library. The original remains unchanged.
 - ClipSave can send files to the Recycle Bin only when their resolved path is inside the managed library.
+- Storage roots that are symbolic links or Windows Junctions are rejected before data directories are created.
 - Embedded Markdown links are not opened automatically.
 
 ## Network behavior
@@ -19,6 +20,7 @@
 
 - Library files and the SQLite database are not encrypted by ClipSave. They inherit the current Windows user's filesystem permissions.
 - Clipboard monitoring can capture sensitive content. Pause monitoring before copying secrets that should not be retained.
+- New installations and corrupt-settings recovery start with clipboard monitoring paused.
 - Anyone with access to the same Windows account may be able to read the local library.
 
 ## Reporting a vulnerability

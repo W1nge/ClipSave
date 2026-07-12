@@ -1,20 +1,63 @@
 from __future__ import annotations
 
 import ctypes
+import getpass
+import hashlib
+import hmac
 import os
+import sqlite3
 import sys
 from ctypes import wintypes
+from pathlib import Path
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QByteArray
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPixmap
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication
+from PySide6.QtNetwork import QAbstractSocket, QLocalServer, QLocalSocket
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .constants import APP_NAME, INSTANCE_SERVER
 from .database import LibraryDatabase
 from .main_window import MainWindow
 from .settings import Settings
-from .storage import migrate_legacy_layout
+from .storage import ensure_storage_directories, migrate_legacy_layout
+
+
+SHOW_MESSAGE = b"show\n"
+
+
+def _current_user_identity() -> str:
+    if hasattr(os, "getuid"):
+        return str(os.getuid())
+    return "|".join(
+        (
+            os.environ.get("USERDOMAIN", ""),
+            getpass.getuser(),
+            os.path.normcase(str(Path.home())),
+        )
+    )
+
+
+def _instance_server_name() -> str:
+    user_hash = hashlib.sha256(_current_user_identity().encode("utf-8", errors="surrogatepass")).hexdigest()[:24]
+    return f"{INSTANCE_SERVER}.{user_hash}"
+
+
+def _is_show_message(message: bytes) -> bool:
+    return hmac.compare_digest(message, SHOW_MESSAGE)
+
+
+def _migration_moved_files(result: dict[str, int]) -> bool:
+    return any(type(count) is int and count > 0 for count in result.values())
+
+
+def _should_scan_library(migration_result: dict[str, int], database) -> bool:
+    if getattr(database, "needs_library_rescan", False) or _migration_moved_files(migration_result):
+        return True
+    try:
+        row = database.connection.execute("SELECT 1 FROM items WHERE missing = 0 LIMIT 1").fetchone()
+    except (AttributeError, sqlite3.Error):
+        return False
+    return row is None
 
 
 def create_app_icon() -> QIcon:
@@ -52,33 +95,83 @@ class GlobalHotkeyFilter(QAbstractNativeEventFilter):
 
 
 class SingleInstance:
-    def __init__(self):
+    def __init__(self, server_name: str | None = None):
+        self.server_name = server_name or _instance_server_name()
         self.server = None
 
     def notify_existing(self) -> bool:
         socket = QLocalSocket()
-        socket.connectToServer(INSTANCE_SERVER)
-        if socket.waitForConnected(300):
-            socket.write(b"show")
-            socket.flush()
-            socket.waitForBytesWritten(300)
-            socket.disconnectFromServer()
-            return True
-        QLocalServer.removeServer(INSTANCE_SERVER)
-        return False
+        socket.connectToServer(self.server_name)
+        if not socket.waitForConnected(300):
+            return False
+        written = socket.write(SHOW_MESSAGE)
+        socket.flush()
+        delivered = written == len(SHOW_MESSAGE) and socket.waitForBytesWritten(300)
+        socket.disconnectFromServer()
+        return delivered
 
-    def listen(self, callback) -> None:
-        self.server = QLocalServer()
-        self.server.listen(INSTANCE_SERVER)
+    @staticmethod
+    def _configure_server(server: QLocalServer) -> None:
+        socket_options = getattr(QLocalServer, "SocketOption", QLocalServer)
+        user_access = getattr(socket_options, "UserAccessOption", None)
+        if user_access is not None:
+            server.setSocketOptions(user_access)
+
+    def _endpoint_is_active(self) -> bool:
+        socket = QLocalSocket()
+        socket.connectToServer(self.server_name)
+        connected = socket.waitForConnected(200)
+        if connected:
+            socket.disconnectFromServer()
+        return connected
+
+    @staticmethod
+    def _address_in_use(server: QLocalServer) -> bool:
+        errors = getattr(QAbstractSocket, "SocketError", QAbstractSocket)
+        address_in_use = getattr(errors, "AddressInUseError", None)
+        return address_in_use is not None and server.serverError() == address_in_use
+
+    @staticmethod
+    def _read_message(connection) -> bytes:
+        message = bytearray()
+        while len(message) <= len(SHOW_MESSAGE):
+            if connection.bytesAvailable() == 0 and not connection.waitForReadyRead(100):
+                break
+            chunk = bytes(connection.readAll())
+            if not chunk:
+                break
+            message.extend(chunk)
+            if len(message) >= len(SHOW_MESSAGE):
+                if connection.waitForReadyRead(10):
+                    continue
+                break
+        return bytes(message)
+
+    def listen(self, callback) -> bool:
+        server = QLocalServer()
+        self._configure_server(server)
+        if not server.listen(self.server_name):
+            if not self._address_in_use(server) or self._endpoint_is_active():
+                return False
+            if not QLocalServer.removeServer(self.server_name):
+                return False
+            server = QLocalServer()
+            self._configure_server(server)
+            if not server.listen(self.server_name):
+                return False
+        self.server = server
 
         def incoming() -> None:
-            connection = self.server.nextPendingConnection()
-            connection.waitForReadyRead(100)
-            connection.readAll()
-            callback()
-            connection.disconnectFromServer()
+            while self.server.hasPendingConnections():
+                connection = self.server.nextPendingConnection()
+                if connection is None:
+                    break
+                if _is_show_message(self._read_message(connection)):
+                    callback()
+                connection.disconnectFromServer()
 
         self.server.newConnection.connect(incoming)
+        return True
 
 
 def main() -> int:
@@ -97,12 +190,38 @@ def main() -> int:
     single = SingleInstance()
     if single.notify_existing():
         return 0
+    window_holder: list[MainWindow] = []
 
-    migrate_legacy_layout()
-    database = LibraryDatabase()
+    def show_window() -> None:
+        if window_holder:
+            window_holder[0].bring_to_front()
+
+    if not single.listen(show_window):
+        if single.notify_existing():
+            return 0
+        return 1
+
+    try:
+        ensure_storage_directories()
+        migration_result = migrate_legacy_layout()
+        ensure_storage_directories()
+    except (OSError, RuntimeError) as exc:
+        QMessageBox.critical(None, "ClipSave 无法启动", str(exc))
+        return 1
+    try:
+        database = LibraryDatabase()
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        QMessageBox.critical(None, "ClipSave 无法启动", str(exc))
+        return 1
     settings = Settings()
-    window = MainWindow(database, settings, icon)
-    single.listen(window.bring_to_front)
+    window = MainWindow(
+        database,
+        settings,
+        icon,
+        scan_on_start=_should_scan_library(migration_result, database),
+        reconcile_on_start=True,
+    )
+    window_holder.append(window)
 
     hotkey_filter = GlobalHotkeyFilter(window.focus_search)
     app.installNativeEventFilter(hotkey_filter)

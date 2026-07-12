@@ -31,7 +31,7 @@ from send2trash import send2trash
 
 from .constants import APP_NAME
 from .database import LibraryDatabase
-from .services import AIService, ClipboardService, apply_windows_acrylic
+from .services import AIService, ClipboardService, OperationCancelled, apply_windows_acrylic
 from .ocr_service import WindowsOCRService
 from .settings import Settings
 from .storage import is_under_local_store
@@ -60,7 +60,14 @@ class AsyncSignals(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, database: LibraryDatabase, settings: Settings, app_icon: QIcon, scan_on_start: bool = True):
+    def __init__(
+        self,
+        database: LibraryDatabase,
+        settings: Settings,
+        app_icon: QIcon,
+        scan_on_start: bool = True,
+        reconcile_on_start: bool = False,
+    ):
         super().__init__()
         self.database = database
         self.settings = settings
@@ -77,6 +84,18 @@ class MainWindow(QMainWindow):
         self.sort_menu = None
         self.sort_menu_closed_at = 0.0
         self.force_quit = False
+        self._grid_dirty = True
+        self._table_dirty = True
+        self._async_signals: set[AsyncSignals] = set()
+        self._ai_requests: dict[int, tuple[object, AsyncSignals]] = {}
+        self._ocr_requests: dict[int, tuple[object, AsyncSignals]] = {}
+        self._semantic_request: tuple[object, AsyncSignals] | None = None
+        self._startup_scan_request: tuple[object, AsyncSignals] | None = None
+        self._import_request: tuple[object, AsyncSignals] | None = None
+        self._async_tasks: dict[object, tuple[threading.Event, threading.Thread]] = {}
+        self._async_tasks_lock = threading.Lock()
+        self._closing = False
+        self._quit_in_progress = False
 
         self.setWindowTitle("")
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -91,14 +110,14 @@ class MainWindow(QMainWindow):
         self.clipboard_service.captured.connect(self.on_captured)
         self.clipboard_service.failed.connect(self.show_error_status)
         self.clipboard_service.state_changed.connect(self.update_monitor_button)
-        if settings.get("monitoring", True):
+        if settings.get("monitoring", False):
             self.clipboard_service.start()
+        else:
+            self.update_monitor_button(False)
 
-        self.database.mark_missing_files()
-        imported = self.database.scan_legacy_files() if scan_on_start else 0
         self.refresh_library()
-        if imported:
-            self.show_status(f"已导入 {imported} 个现有文件")
+        if scan_on_start or reconcile_on_start:
+            self._start_startup_scan(scan_on_start, reconcile_on_start)
         QTimer.singleShot(100, lambda: apply_windows_acrylic(self))
 
     def build_ui(self) -> None:
@@ -131,7 +150,7 @@ class MainWindow(QMainWindow):
         self.sidebar.add_collection_requested.connect(self.add_collection)
         self.sidebar.add_tag_requested.connect(self.add_global_tag)
         self.sidebar.settings_requested.connect(self.open_settings)
-        self.sidebar.collapsed_changed.connect(lambda value: self.settings.set("sidebar_collapsed", value))
+        self.sidebar.collapsed_changed.connect(lambda value: self._save_setting("sidebar_collapsed", value))
         body_layout.addWidget(self.sidebar)
 
         middle = QWidget()
@@ -368,7 +387,8 @@ class MainWindow(QMainWindow):
         self.refresh_items()
 
     def refresh_items(self) -> None:
-        self.current_items = self.database.query_items(
+        self._cancel_semantic_request()
+        items = self.database.query_items(
             query=self.search.text().strip(),
             kind=self.current_kind,
             favorite=self.current_favorite,
@@ -378,8 +398,7 @@ class MainWindow(QMainWindow):
             tag_id=self.current_tag,
             sort=self.current_sort,
         )
-        self.grid.set_items(self.current_items)
-        self.table.set_items(self.current_items)
+        self._apply_items(items)
         self.result_count.setText(f"{len(self.current_items):,} 项")
         filters = []
         if self.current_day:
@@ -387,6 +406,27 @@ class MainWindow(QMainWindow):
         if self.search.text().strip():
             filters.append(f"搜索：{self.search.text().strip()}")
         self.filter_hint.setText("  ·  ".join(filters))
+
+    def _apply_items(self, items) -> None:
+        self.current_items = list(items)
+        visible_ids = {item["id"] for item in self.current_items}
+        if self.current_item_id is not None and self.current_item_id not in visible_ids:
+            self.current_item_id = None
+            self.grid.clear_selection()
+            self.table.clear_selected_item()
+            self.detail.clear_item()
+        self._grid_dirty = True
+        self._table_dirty = True
+        self._refresh_visible_view()
+
+    def _refresh_visible_view(self) -> None:
+        if self.view_stack.currentWidget() is self.grid:
+            if self._grid_dirty:
+                self.grid.set_items(self.current_items, self.current_item_id)
+                self._grid_dirty = False
+        elif self._table_dirty:
+            self.table.set_items(self.current_items, self.current_item_id)
+            self._table_dirty = False
 
     def navigate(self, key: str, value) -> None:
         if key == "date":
@@ -431,7 +471,11 @@ class MainWindow(QMainWindow):
         self.refresh_items()
 
     def select_item(self, item_id: int) -> None:
+        if item_id not in {item["id"] for item in self.current_items}:
+            return
         self.current_item_id = item_id
+        self.grid.selected_id = item_id
+        self.table.selected_id = item_id
         if self.detail.isVisible():
             self.update_detail(item_id)
 
@@ -439,6 +483,10 @@ class MainWindow(QMainWindow):
         item = self.database.get_item(item_id)
         if item:
             self.detail.set_item(item)
+            if item_id in self._ai_requests:
+                self.detail.set_ai_busy(True)
+            if item_id in self._ocr_requests:
+                self.detail.set_ocr_busy(True)
 
     def toggle_detail(self) -> None:
         if self.detail.isVisible():
@@ -454,8 +502,11 @@ class MainWindow(QMainWindow):
         self.detail_button.setToolTip("显示详情")
 
     def set_view_mode(self, mode: str) -> None:
+        mode = "list" if mode == "list" else "grid"
         self.view_stack.setCurrentWidget(self.grid if mode == "grid" else self.table_page)
-        self.settings.set("view_mode", mode)
+        self.grid.set_preview_loading_enabled(mode == "grid" and self.isVisible())
+        self._refresh_visible_view()
+        self._save_setting("view_mode", mode)
         self.grid_button.setStyleSheet("background:rgba(47,125,246,28); color:#1769d2;" if mode == "grid" else "")
         self.list_button.setStyleSheet("background:rgba(47,125,246,28); color:#1769d2;" if mode == "list" else "")
 
@@ -483,13 +534,19 @@ class MainWindow(QMainWindow):
 
     def set_sort(self, key: str, label: str) -> None:
         self.current_sort = key
-        self.settings.set("sort", key)
+        self._save_setting("sort", key)
         self.sort_button.setText(label + "  ▾")
         self.refresh_items()
 
     def toggle_monitor(self) -> None:
         self.clipboard_service.toggle()
-        self.settings.set("monitoring", self.clipboard_service.timer.isActive())
+        self._save_setting("monitoring", self.clipboard_service.timer.isActive())
+
+    def _save_setting(self, key: str, value) -> None:
+        try:
+            self.settings.set(key, value)
+        except OSError as exc:
+            self.show_error_status(f"设置无法保存：{exc}")
 
     def update_monitor_button(self, active: bool) -> None:
         self.capture_status.set_active(active)
@@ -508,7 +565,16 @@ class MainWindow(QMainWindow):
         if item["kind"] == "markdown":
             MarkdownDialog(item["title"], item["content"], item["path"], self).exec()
         elif item["kind"] == "image" and item["path"]:
-            os.startfile(item["path"])
+            path = Path(item["path"])
+            if not path.exists():
+                QMessageBox.warning(self, "打开失败", "图片文件不存在或已被移动。")
+                self.show_status("打开失败：图片文件不存在")
+                return
+            try:
+                os.startfile(path)
+            except OSError as exc:
+                QMessageBox.warning(self, "打开失败", f"无法打开图片文件。\n\n{exc}")
+                self.show_status("打开失败：图片文件无法访问")
         else:
             self.copy_item(item_id)
 
@@ -518,7 +584,17 @@ class MainWindow(QMainWindow):
             return
         clipboard = QApplication.clipboard()
         if item["kind"] == "image" and item["path"]:
-            image = QPixmap(item["path"]).toImage()
+            path = Path(item["path"])
+            if not path.exists():
+                QMessageBox.warning(self, "复制失败", "图片文件不存在或已被移动。")
+                self.show_status("复制失败：图片文件不存在")
+                return
+            pixmap = QPixmap(str(path))
+            if pixmap.isNull():
+                QMessageBox.warning(self, "复制失败", "图片文件无法读取，可能已损坏或无权访问。")
+                self.show_status("复制失败：图片文件无法读取")
+                return
+            image = pixmap.toImage()
             self.clipboard_service.suppress_image(image)
             clipboard.setImage(image)
         else:
@@ -537,15 +613,49 @@ class MainWindow(QMainWindow):
             message += "\n\n对应文件将移入 Windows 回收站。"
         elif item["path"]:
             message += "\n\n该文件不在 ClipSave 本地资料库中，只会移除索引，原文件不会被删除。"
-        if QMessageBox.question(self, "删除内容", message) != QMessageBox.StandardButton.Yes:
+        answer = QMessageBox.question(
+            self,
+            "删除内容",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
             return
-        if managed_file and Path(item["path"]).exists():
-            send2trash(item["path"])
-        self.database.remove_item(item_id)
-        self.current_item_id = None
-        self.hide_detail()
+        file_exists = bool(item["path"] and Path(item["path"]).exists())
+        if managed_file and file_exists:
+            try:
+                send2trash(item["path"])
+            except Exception as exc:
+                QMessageBox.warning(self, "删除失败", f"文件无法移入回收站，内容未删除。\n\n{exc}")
+                self.show_status("删除失败：文件未能移入回收站")
+                return
+        try:
+            self.database.remove_item(item_id)
+        except Exception as exc:
+            if managed_file and file_exists:
+                message = f"文件已移入回收站，但 ClipSave 索引删除失败。请稍后重试。\n\n{exc}"
+                status = "删除未完成：文件已移入回收站，索引仍保留"
+            else:
+                message = f"ClipSave 索引删除失败，内容未删除。\n\n{exc}"
+                status = "删除失败：内容索引未能移除"
+            QMessageBox.warning(self, "删除失败", message)
+            self.show_status(status)
+            return
+        if self.current_item_id == item_id:
+            self.current_item_id = None
+            self.detail.clear_item()
+            self.hide_detail()
         self.refresh_library()
-        self.show_status("内容已移入回收站")
+        if managed_file and file_exists:
+            status = "内容及文件已移入回收站"
+        elif managed_file:
+            status = "内容索引已移除，文件已不存在"
+        elif item["path"]:
+            status = "内容索引已移除，原文件未删除"
+        else:
+            status = "内容已删除"
+        self.show_status(status)
 
     def set_favorite(self, item_id: int, value: bool) -> None:
         self.database.set_favorite(item_id, value)
@@ -587,18 +697,176 @@ class MainWindow(QMainWindow):
         self.show_status("集合已更新")
 
     def import_files(self, parent=None) -> None:
+        if self._import_request is not None:
+            QMessageBox.information(self, "正在导入", "上一批文件仍在导入，请稍候。")
+            return
         paths, _ = QFileDialog.getOpenFileNames(parent or self, "导入内容", "", "支持的文件 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.md)")
-        added = 0
-        for filename in paths:
-            added += int(self.database.import_file(Path(filename), copy_to_library=True))
-        if paths:
-            self.refresh_library()
-            self.show_status(f"已导入 {added} 项，跳过 {len(paths) - added} 项重复内容")
+        if not paths:
+            return
+        token = object()
+        signals = AsyncSignals()
+        self._async_signals.add(signals)
+        self._import_request = (token, signals)
+        signals.succeeded.connect(
+            lambda _item_id, _text, result, request_token=token, request_signals=signals: self._import_finished(
+                request_token, request_signals, result
+            )
+        )
+        signals.failed.connect(
+            lambda message, request_token=token, request_signals=signals: self._import_failed(
+                request_token, request_signals, message
+            )
+        )
+        self.show_status(f"正在导入 {len(paths)} 个文件")
+
+        def work(cancel_event: threading.Event) -> None:
+            added = 0
+            failed = []
+            for filename in paths:
+                if cancel_event.is_set():
+                    break
+                try:
+                    added += int(self.database.import_file(Path(filename), copy_to_library=True))
+                except Exception as exc:
+                    failed.append((Path(filename).name, str(exc)))
+            signals.succeeded.emit(
+                -1,
+                "",
+                {"total": len(paths), "added": added, "failed": failed, "cancelled": cancel_event.is_set()},
+            )
+
+        self._start_async_task(token, work)
+
+    def _import_finished(self, token: object, signals: AsyncSignals, result: dict) -> None:
+        self._async_signals.discard(signals)
+        if self._closing or self._import_request != (token, signals):
+            return
+        self._import_request = None
+        self.refresh_library()
+        failed = result["failed"]
+        skipped = result["total"] - result["added"] - len(failed)
+        prefix = "导入已取消；" if result.get("cancelled") else ""
+        self.show_status(f"{prefix}已导入 {result['added']} 项，跳过 {skipped} 项重复内容，失败 {len(failed)} 项")
+        if failed:
+            details = "\n".join(f"{name}：{message}" for name, message in failed[:5])
+            if len(failed) > 5:
+                details += f"\n另有 {len(failed) - 5} 项失败。"
+            QMessageBox.warning(self, "部分文件导入失败", f"以下文件无法导入，其他文件已继续处理：\n\n{details}")
+
+    def _import_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
+        self._async_signals.discard(signals)
+        if self._closing or self._import_request != (token, signals):
+            return
+        self._import_request = None
+        QMessageBox.warning(self, "文件导入失败", message)
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
         dialog.import_requested.connect(lambda: self.import_files(dialog))
         dialog.exec()
+
+    def _start_async_task(self, token: object, target) -> threading.Event:
+        cancel_event = threading.Event()
+
+        def run() -> None:
+            try:
+                target(cancel_event)
+            finally:
+                with self._async_tasks_lock:
+                    current = self._async_tasks.get(token)
+                    if current is not None and current[1] is threading.current_thread():
+                        self._async_tasks.pop(token, None)
+
+        thread = threading.Thread(target=run, name="ClipSaveAsync", daemon=True)
+        with self._async_tasks_lock:
+            self._async_tasks[token] = (cancel_event, thread)
+        thread.start()
+        return cancel_event
+
+    def _start_startup_scan(self, full_scan: bool, reconcile_images: bool) -> None:
+        token = object()
+        signals = AsyncSignals()
+        self._async_signals.add(signals)
+        self._startup_scan_request = (token, signals)
+        signals.succeeded.connect(
+            lambda _item_id, _text, imported, request_token=token, request_signals=signals: self._startup_scan_finished(
+                request_token, request_signals, int(imported)
+            )
+        )
+        signals.failed.connect(
+            lambda message, request_token=token, request_signals=signals: self._startup_scan_failed(
+                request_token, request_signals, message
+            )
+        )
+
+        def work(cancel_event: threading.Event) -> None:
+            try:
+                self.database.mark_missing_files(cancel_event)
+                imported = 0
+                if not cancel_event.is_set() and full_scan:
+                    imported = self.database.scan_legacy_files(cancel_event)
+                elif not cancel_event.is_set() and reconcile_images:
+                    imported = self.database.scan_unindexed_images(cancel_event)
+                signals.succeeded.emit(-1, "", imported)
+            except Exception as exc:
+                if not cancel_event.is_set():
+                    signals.failed.emit(str(exc))
+
+        self._start_async_task(token, work)
+
+    def _startup_scan_finished(self, token: object, signals: AsyncSignals, imported: int) -> None:
+        self._async_signals.discard(signals)
+        if self._closing or self._startup_scan_request != (token, signals):
+            return
+        self._startup_scan_request = None
+        self.refresh_library()
+        if imported:
+            self.show_status(f"已导入 {imported} 个现有文件")
+
+    def _startup_scan_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
+        self._async_signals.discard(signals)
+        if self._closing or self._startup_scan_request != (token, signals):
+            return
+        self._startup_scan_request = None
+        self.show_error_status(f"启动扫描失败：{message}")
+
+    def _cancel_async_token(self, token: object) -> None:
+        with self._async_tasks_lock:
+            task = self._async_tasks.get(token)
+        if task is not None:
+            task[0].set()
+
+    def _cancel_request(self, request: tuple[object, AsyncSignals] | None) -> None:
+        if request is None:
+            return
+        token, signals = request
+        self._cancel_async_token(token)
+        self._async_signals.discard(signals)
+
+    def _cancel_and_wait_request(self, request: tuple[object, AsyncSignals] | None, timeout: float) -> bool:
+        if request is None:
+            return True
+        token, _signals = request
+        self._cancel_async_token(token)
+        with self._async_tasks_lock:
+            task = self._async_tasks.get(token)
+        if task is None:
+            return True
+        task[1].join(max(timeout, 0.0))
+        return not task[1].is_alive()
+
+    def _cancel_and_wait_for_async_tasks(self, timeout: float = 1.5) -> bool:
+        with self._async_tasks_lock:
+            tasks = list(self._async_tasks.values())
+        for cancel_event, _thread in tasks:
+            cancel_event.set()
+        deadline = time.monotonic() + max(timeout, 0.0)
+        for _cancel_event, thread in tasks:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+        return all(not thread.is_alive() for _cancel_event, thread in tasks)
 
     def generate_ai_description(self, item_id: int) -> None:
         item = self.database.get_item(item_id)
@@ -617,19 +885,35 @@ class MainWindow(QMainWindow):
             return
         self.detail.ai_button.setEnabled(False)
         self.detail.ai_button.setText("生成中…")
-        self.ai_signals = AsyncSignals()
-        self.ai_signals.succeeded.connect(self._ai_succeeded)
-        self.ai_signals.failed.connect(self._ai_failed)
+        token = object()
+        signals = AsyncSignals()
+        self._cancel_request(self._ai_requests.get(item_id))
+        self._async_signals.add(signals)
+        self._ai_requests[item_id] = (token, signals)
+        signals.succeeded.connect(
+            lambda result_item_id, description, embedding, request_token=token, request_signals=signals: self._ai_succeeded(
+                request_token, request_signals, result_item_id, description, embedding
+            )
+        )
+        signals.failed.connect(
+            lambda message, request_token=token, request_signals=signals, request_item_id=item_id: self._ai_failed(
+                request_token, request_signals, request_item_id, message
+            )
+        )
 
-        def work() -> None:
+        def work(cancel_event: threading.Event) -> None:
             try:
-                description = service.describe_image(Path(item["path"]))
-                embedding = service.embed(description)
-                self.ai_signals.succeeded.emit(item_id, description, embedding)
+                description = service.describe_image(Path(item["path"]), cancel_event)
+                embedding = service.embed(description, cancel_event)
+                if not cancel_event.is_set():
+                    signals.succeeded.emit(item_id, description, embedding)
+            except OperationCancelled:
+                return
             except Exception as exc:
-                self.ai_signals.failed.emit(str(exc))
+                if not cancel_event.is_set():
+                    signals.failed.emit(str(exc))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_async_task(token, work)
 
     def generate_ocr(self, item_id: int) -> None:
         item = self.database.get_item(item_id)
@@ -638,29 +922,56 @@ class MainWindow(QMainWindow):
             return
         self.detail.ocr_button.setEnabled(False)
         self.detail.ocr_button.setText("识别中…")
-        self.ocr_signals = AsyncSignals()
-        self.ocr_signals.succeeded.connect(self._ocr_succeeded)
-        self.ocr_signals.failed.connect(self._ocr_failed)
+        token = object()
+        signals = AsyncSignals()
+        self._cancel_request(self._ocr_requests.get(item_id))
+        self._async_signals.add(signals)
+        self._ocr_requests[item_id] = (token, signals)
+        signals.succeeded.connect(
+            lambda result_item_id, text, unused, request_token=token, request_signals=signals: self._ocr_succeeded(
+                request_token, request_signals, result_item_id, text, unused
+            )
+        )
+        signals.failed.connect(
+            lambda message, request_token=token, request_signals=signals, request_item_id=item_id: self._ocr_failed(
+                request_token, request_signals, request_item_id, message
+            )
+        )
 
-        def work() -> None:
+        def work(cancel_event: threading.Event) -> None:
             try:
-                text = WindowsOCRService.recognize(Path(item["path"]))
-                self.ocr_signals.succeeded.emit(item_id, text, None)
+                text = WindowsOCRService.recognize(Path(item["path"]), cancel_event)
+                if not cancel_event.is_set():
+                    signals.succeeded.emit(item_id, text, None)
+            except OperationCancelled:
+                return
             except Exception as exc:
-                self.ocr_signals.failed.emit(str(exc))
+                if not cancel_event.is_set():
+                    signals.failed.emit(str(exc))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_async_task(token, work)
 
-    def _ocr_succeeded(self, item_id: int, text: str, _unused) -> None:
+    def _ocr_succeeded(self, token: object, signals: AsyncSignals, item_id: int, text: str, _unused) -> None:
+        self._async_signals.discard(signals)
+        if self._closing:
+            return
+        if self._ocr_requests.get(item_id) != (token, signals):
+            return
+        self._ocr_requests.pop(item_id, None)
         self.database.update_ocr(item_id, text)
-        self.detail.ocr_button.setEnabled(True)
-        self.detail.ocr_button.setText("重新识别")
-        self.update_detail(item_id)
+        if self.current_item_id == item_id:
+            self.update_detail(item_id)
         self.show_status("OCR 识别完成" if text else "图片中未识别到文字")
 
-    def _ocr_failed(self, message: str) -> None:
-        self.detail.ocr_button.setEnabled(True)
-        self.detail.ocr_button.setText("重试")
+    def _ocr_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
+        self._async_signals.discard(signals)
+        if self._closing:
+            return
+        if self._ocr_requests.get(item_id) != (token, signals):
+            return
+        self._ocr_requests.pop(item_id, None)
+        if self.current_item_id == item_id:
+            self.detail.set_ocr_busy(False, failed=True)
         QMessageBox.warning(self, "OCR 识别失败", message)
 
     def semantic_search(self) -> None:
@@ -682,27 +993,56 @@ class MainWindow(QMainWindow):
         if not embedded:
             QMessageBox.information(self, "没有语义索引", "请先在图片详情中生成 AI 描述和向量。")
             return
+        self.search_timer.stop()
+        self._cancel_semantic_request()
         self.semantic_button.setEnabled(False)
         self.semantic_button.setText("搜索中…")
-        self.semantic_signals = AsyncSignals()
-        self.semantic_signals.succeeded.connect(self._semantic_succeeded)
-        self.semantic_signals.failed.connect(self._semantic_failed)
+        token = object()
+        signals = AsyncSignals()
+        self._async_signals.add(signals)
+        self._semantic_request = (token, signals)
+        signals.succeeded.connect(
+            lambda item_id, text, ordered_ids, request_token=token, request_signals=signals, request_query=query: self._semantic_succeeded(
+                request_token, request_signals, request_query, item_id, text, ordered_ids
+            )
+        )
+        signals.failed.connect(
+            lambda message, request_token=token, request_signals=signals: self._semantic_failed(
+                request_token, request_signals, message
+            )
+        )
 
-        def work() -> None:
+        def work(cancel_event: threading.Event) -> None:
             try:
-                query_vector = service.embed(query)
+                query_vector = service.embed(query, cancel_event)
                 scored = []
                 for row in embedded:
+                    if cancel_event.is_set():
+                        raise OperationCancelled("Operation cancelled")
                     vector = json.loads(row["embedding"])
                     scored.append((service.similarity(query_vector, vector), row["id"]))
                 scored.sort(reverse=True)
-                self.semantic_signals.succeeded.emit(-1, "", [item_id for score, item_id in scored if score > 0])
+                if not cancel_event.is_set():
+                    signals.succeeded.emit(-1, "", [item_id for score, item_id in scored if score > 0])
+            except OperationCancelled:
+                return
             except Exception as exc:
-                self.semantic_signals.failed.emit(str(exc))
+                if not cancel_event.is_set():
+                    signals.failed.emit(str(exc))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._start_async_task(token, work)
 
-    def _semantic_succeeded(self, _item_id: int, _text: str, ordered_ids) -> None:
+    def _semantic_succeeded(self, token: object, signals: AsyncSignals, query: str, _item_id: int, _text: str, ordered_ids) -> None:
+        self._async_signals.discard(signals)
+        if self._closing:
+            return
+        if self._semantic_request != (token, signals):
+            return
+        self._semantic_request = None
+        self.semantic_button.setEnabled(True)
+        self.semantic_button.setText("语义搜索")
+        if self.search.text().strip() != query:
+            return
         base_items = self.database.query_items(
             kind=self.current_kind,
             favorite=self.current_favorite,
@@ -713,29 +1053,51 @@ class MainWindow(QMainWindow):
             sort=self.current_sort,
         )
         records = {row["id"]: row for row in base_items}
-        self.current_items = [records[item_id] for item_id in ordered_ids if item_id in records]
-        self.grid.set_items(self.current_items)
-        self.table.set_items(self.current_items)
+        self._apply_items([records[item_id] for item_id in ordered_ids if item_id in records])
         self.result_count.setText(f"{len(self.current_items):,} 项 · 按语义相关度")
-        self.semantic_button.setEnabled(True)
-        self.semantic_button.setText("语义搜索")
 
-    def _semantic_failed(self, message: str) -> None:
+    def _semantic_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
+        self._async_signals.discard(signals)
+        if self._closing:
+            return
+        if self._semantic_request != (token, signals):
+            return
+        self._semantic_request = None
         self.semantic_button.setEnabled(True)
         self.semantic_button.setText("语义搜索")
         QMessageBox.warning(self, "语义搜索失败", message)
 
-    def _ai_succeeded(self, item_id: int, description: str, embedding) -> None:
+    def _cancel_semantic_request(self) -> None:
+        if self._semantic_request is None:
+            return
+        self._cancel_request(self._semantic_request)
+        self._semantic_request = None
+        if hasattr(self, "semantic_button"):
+            self.semantic_button.setEnabled(True)
+            self.semantic_button.setText("语义搜索")
+
+    def _ai_succeeded(self, token: object, signals: AsyncSignals, item_id: int, description: str, embedding) -> None:
+        self._async_signals.discard(signals)
+        if self._closing:
+            return
+        if self._ai_requests.get(item_id) != (token, signals):
+            return
+        self._ai_requests.pop(item_id, None)
         self.database.update_ai(item_id, description, embedding)
-        self.detail.ai_button.setEnabled(True)
-        self.detail.ai_button.setText("重新生成")
-        self.update_detail(item_id)
+        if self.current_item_id == item_id:
+            self.update_detail(item_id)
         self.refresh_items()
         self.show_status("AI 描述已生成")
 
-    def _ai_failed(self, message: str) -> None:
-        self.detail.ai_button.setEnabled(True)
-        self.detail.ai_button.setText("重试")
+    def _ai_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
+        self._async_signals.discard(signals)
+        if self._closing:
+            return
+        if self._ai_requests.get(item_id) != (token, signals):
+            return
+        self._ai_requests.pop(item_id, None)
+        if self.current_item_id == item_id:
+            self.detail.set_ai_busy(False, failed=True)
         QMessageBox.warning(self, "AI 服务失败", message)
 
     def focus_search(self) -> None:
@@ -749,26 +1111,94 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.grid.set_preview_loading_enabled(self.view_stack.currentWidget() is self.grid)
+
+    def hideEvent(self, event) -> None:
+        self.grid.set_preview_loading_enabled(False)
+        super().hideEvent(event)
+
     def show_status(self, text: str) -> None:
-        active = self.clipboard_service.timer.isActive() if hasattr(self, "clipboard_service") else True
         self.capture_status.setToolTip(text)
-        QTimer.singleShot(2800, lambda: self.capture_status.setToolTip("本地自动捕获已开启" if active else "本地自动捕获已暂停"))
+        QTimer.singleShot(
+            2800,
+            lambda: self.capture_status.setToolTip(
+                "本地自动捕获已开启" if self.clipboard_service.timer.isActive() else "本地自动捕获已暂停"
+            ),
+        )
 
     def show_error_status(self, text: str) -> None:
         self.capture_status.setToolTip(f"剪贴板读取失败：{text[:80]}")
 
-    def quit_application(self) -> None:
+    def quit_application(self) -> bool:
+        if self._closing or self._quit_in_progress:
+            return False
+        self._quit_in_progress = True
         self.force_quit = True
-        self.clipboard_service.stop()
-        self.database.close()
+        if not self._cancel_and_wait_request(self._startup_scan_request, 10.0):
+            self._quit_in_progress = False
+            self.force_quit = False
+            QMessageBox.warning(
+                self,
+                "ClipSave 正在整理本地库",
+                "本地文件扫描仍在结束。为避免数据库操作中断，ClipSave 暂时不会退出。请稍后再次退出。",
+            )
+            return False
+        self._cancel_request(self._startup_scan_request)
+        self._startup_scan_request = None
+        if not self._cancel_and_wait_request(self._import_request, 10.0):
+            self._quit_in_progress = False
+            self.force_quit = False
+            QMessageBox.warning(
+                self,
+                "ClipSave 正在导入",
+                "当前文件仍在完成本地复制或校验。为避免产生不完整文件，ClipSave 暂时不会退出。请稍后再次退出。",
+            )
+            return False
+        self._cancel_request(self._import_request)
+        self._import_request = None
+        monitoring_was_active = self.clipboard_service.timer.isActive()
+        persistence_stopped = self.clipboard_service.shutdown()
+        if not persistence_stopped:
+            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
+            self._quit_in_progress = False
+            self.force_quit = False
+            QMessageBox.warning(
+                self,
+                "ClipSave 正在保存",
+                "仍有剪贴板内容正在写入本地磁盘。为避免数据丢失，ClipSave 暂时不会退出。请稍后再次退出。",
+            )
+            return False
+        self._closing = True
+        self._cancel_semantic_request()
+        for request in list(self._ai_requests.values()):
+            self._cancel_request(request)
+        for request in list(self._ocr_requests.values()):
+            self._cancel_request(request)
+        self._ai_requests.clear()
+        self._ocr_requests.clear()
+        self._cancel_and_wait_for_async_tasks()
+        self._async_signals.clear()
+        if persistence_stopped:
+            try:
+                self.database.create_backup()
+            except Exception as exc:
+                self.database.recovery_report["backup_error"] = str(exc)
+            finally:
+                self.database.close()
         self.tray.hide()
         QApplication.quit()
+        return True
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.force_quit or not self.settings.get("close_to_tray", True):
-            self.quit_application()
-            event.accept()
+            if self.quit_application():
+                event.accept()
+            else:
+                event.ignore()
         else:
             event.ignore()
             self.hide()
-            self.tray.showMessage("ClipSave", "ClipSave 仍在后台保存剪贴板内容。", QSystemTrayIcon.MessageIcon.Information, 1800)
+            message = "ClipSave 仍在后台保存剪贴板内容。" if self.clipboard_service.timer.isActive() else "ClipSave 已隐藏到托盘，自动捕获当前暂停。"
+            self.tray.showMessage("ClipSave", message, QSystemTrayIcon.MessageIcon.Information, 1800)

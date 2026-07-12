@@ -6,6 +6,9 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
 
 # Build output
 build/
@@ -22,9 +25,25 @@ settings.json
 clipsave_history.json
 .env
 .env.*
+!.env.example
+!.env.sample
+*.secret
+*.secrets
+.secrets/
+secrets.json
+credentials.json
+service-account*.json
 *.key
 *.pem
 *.pfx
+*.p12
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+.npmrc
+.pypirc
+pip.conf
 *.log
 
 # Local-only migration and test artifacts

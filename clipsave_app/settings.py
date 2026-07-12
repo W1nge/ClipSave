@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
+from typing import Any
 
 from .constants import SETTINGS_PATH
 
 
 DEFAULTS = {
     "sidebar_collapsed": False,
-    "monitoring": True,
+    "monitoring": False,
     "view_mode": "grid",
     "sort": "newest",
     "theme": "light",
@@ -20,24 +23,119 @@ DEFAULTS = {
     "ai_embedding_model": "",
 }
 
+_BOOLEAN_KEYS = {"sidebar_collapsed", "monitoring", "close_to_tray"}
+_STRING_KEYS = {
+    "hotkey",
+    "ai_base_url",
+    "ai_api_key",
+    "ai_vision_model",
+    "ai_embedding_model",
+}
+_CHOICES = {
+    "view_mode": {"grid", "list"},
+    "sort": {"newest", "oldest", "name", "size", "type"},
+    "theme": {"light", "dark", "system"},
+}
+
+
+def _valid_value(key: str, value: Any) -> bool:
+    if key in _BOOLEAN_KEYS:
+        return type(value) is bool
+    if key in _STRING_KEYS:
+        return type(value) is str
+    if key in _CHOICES:
+        return type(value) is str and value in _CHOICES[key]
+    return False
+
+
+def _validated_settings(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {key: item for key, item in value.items() if key in DEFAULTS and _valid_value(key, item)}
+
+
+def _read_settings(path: Path) -> dict[str, Any] | None:
+    try:
+        return _validated_settings(json.loads(path.read_text(encoding="utf-8")))
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _write_json_temp(path: Path, data: dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return temporary_path
+
+
+def _sync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
 
 class Settings:
     def __init__(self, path: Path = SETTINGS_PATH):
         self.path = path
+        self.backup_path = path.with_name(f"{path.name}.bak")
         self.data = DEFAULTS.copy()
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                self.data.update(loaded)
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
+        loaded = _read_settings(path)
+        recovered = loaded is None
+        if loaded is None:
+            loaded = _read_settings(self.backup_path)
+        if loaded is not None:
+            self.data.update(loaded)
+        if recovered:
+            self.data["monitoring"] = False
 
     def get(self, key: str, default=None):
         return self.data.get(key, default)
 
     def set(self, key: str, value) -> None:
+        if key not in DEFAULTS:
+            raise KeyError(key)
+        if not _valid_value(key, value):
+            raise TypeError(f"Invalid value for setting {key!r}")
+        previous = self.data.get(key)
+        if previous == value:
+            return
         self.data[key] = value
-        self.save()
+        try:
+            self.save()
+        except Exception:
+            self.data[key] = previous
+            raise
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        data = DEFAULTS.copy()
+        data.update(_validated_settings(self.data) or {})
+        temporary_path = _write_json_temp(self.path, data)
+        backup_temporary = None
+        try:
+            current = _read_settings(self.path)
+            if current is not None:
+                backup_data = DEFAULTS.copy()
+                backup_data.update(current)
+                backup_temporary = _write_json_temp(self.backup_path, backup_data)
+                os.replace(backup_temporary, self.backup_path)
+                backup_temporary = None
+            os.replace(temporary_path, self.path)
+            _sync_directory(self.path.parent)
+            self.data = data
+        finally:
+            temporary_path.unlink(missing_ok=True)
+            if backup_temporary is not None:
+                backup_temporary.unlink(missing_ok=True)
