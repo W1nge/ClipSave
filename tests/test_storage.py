@@ -396,7 +396,7 @@ class StorageTests(unittest.TestCase):
                     storage.open_managed_binary(target, "xb", library)
             self.assertFalse((outside / target.name).exists())
         finally:
-            if parent.is_junction():
+            if storage._is_link_or_junction(parent):
                 parent.rmdir()
 
     def test_storage_layout_rejects_unc_root(self):
