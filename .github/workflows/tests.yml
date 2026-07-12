@@ -57,7 +57,7 @@ jobs:
       - name: Validate PyInstaller warnings
         run: .\.venv\Scripts\python.exe check_pyinstaller_warnings.py build\work\ClipSave\warn-ClipSave.txt
       - name: Validate release contents and version
-        shell: powershell
+        shell: pwsh
         run: |
           $required = @(
             'build\release\ClipSave\ClipSave.exe',
