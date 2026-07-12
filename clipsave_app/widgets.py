@@ -13,6 +13,7 @@ from PySide6.QtCore import (
     QItemSelectionModel,
     QModelIndex,
     QObject,
+    QPoint,
     QRect,
     QRunnable,
     QSize,
@@ -24,7 +25,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -572,7 +573,7 @@ class AutoHideScrollBar(QScrollBar):
             super().paintEvent(event)
             return
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#202020" if dark_theme_active() else "#f4f6f9"))
+        painter.fillRect(self.rect(), QColor("#202020" if dark_theme_active() else "#f6f6f6"))
         painter.end()
 
     def reveal_temporarily(self) -> None:
@@ -582,6 +583,32 @@ class AutoHideScrollBar(QScrollBar):
     def _slider_pressed(self) -> None:
         self.hide_timer.stop()
         self.set_active(True)
+
+    def enterEvent(self, event) -> None:
+        self.hide_timer.stop()
+        self.set_active(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        self.reveal_temporarily()
+
+
+def _half_speed_wheel_event(event: QWheelEvent) -> QWheelEvent:
+    pixel_delta = event.pixelDelta()
+    angle_delta = event.angleDelta()
+    return QWheelEvent(
+        event.position(),
+        event.globalPosition(),
+        QPoint(int(pixel_delta.x() / 2), int(pixel_delta.y() / 2)),
+        QPoint(int(angle_delta.x() / 2), int(angle_delta.y() / 2)),
+        event.buttons(),
+        event.modifiers(),
+        event.phase(),
+        event.inverted(),
+        event.source(),
+        event.device(),
+    )
 
 
 class WindowTitleBar(QFrame):
@@ -621,8 +648,7 @@ class WindowTitleBar(QFrame):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             handle = self.window().windowHandle()
-            if handle is not None:
-                handle.startSystemMove()
+            if handle is not None and handle.startSystemMove():
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -1064,6 +1090,11 @@ class AssetGrid(QListView):
         self._update_grid_size()
         self._thumbnail_refresh_timer.start()
 
+    def wheelEvent(self, event) -> None:
+        scaled_event = _half_speed_wheel_event(event)
+        super().wheelEvent(scaled_event)
+        event.setAccepted(scaled_event.isAccepted())
+
     def set_layout_updates_suspended(self, suspended: bool) -> None:
         if suspended == self._layout_updates_suspended:
             return
@@ -1291,6 +1322,11 @@ class AssetTable(QTableView):
         self.selected_id: int | None = None
         self._suppress_selection_signal = False
 
+    def wheelEvent(self, event) -> None:
+        scaled_event = _half_speed_wheel_event(event)
+        super().wheelEvent(scaled_event)
+        event.setAccepted(scaled_event.isAccepted())
+
     def set_items(self, items, selected_id: int | None = None) -> None:
         self.selected_id = selected_id
         self._suppress_selection_signal = True
@@ -1367,6 +1403,19 @@ def _startfile_or_warn(parent: QWidget, path: Path | str) -> None:
         QMessageBox.warning(parent, "Open failed", f"Could not open the requested location.\n\n{exc}")
 
 
+def _wrap_detail_text(value: object, interval: int = 24) -> str:
+    text = str(value)
+    output: list[str] = []
+    run_length = 0
+    for character in text:
+        output.append(character)
+        run_length += 1
+        if character in "\\/_-." or run_length >= interval:
+            output.append("\u200b")
+            run_length = 0
+    return "".join(output)
+
+
 class DetailPanel(QScrollArea):
     close_requested = Signal()
     copy_requested = Signal(int)
@@ -1394,8 +1443,10 @@ class DetailPanel(QScrollArea):
         self._thumbnail_generation = 0
         self._thumbnail_loader = _ThumbnailDecodeQueue(self)
         self._thumbnail_loader.decoded.connect(self._thumbnail_decoded)
+        self._image_source_pixmap = QPixmap()
         self.content_widget = QWidget()
         self.content_widget.setObjectName("DetailPanelContent")
+        self.content_widget.setMinimumWidth(0)
         layout = QVBoxLayout(self.content_widget)
         layout.setContentsMargins(16, 14, 16, 16)
         layout.setSpacing(10)
@@ -1411,11 +1462,15 @@ class DetailPanel(QScrollArea):
         self.title = QLabel("选择一项查看详情")
         self.title.setObjectName("Title")
         self.title.setWordWrap(True)
+        self.title.setMinimumWidth(0)
+        self.title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.title)
         self.preview_stack = QStackedWidget()
         self.image_preview = QLabel()
         self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_preview.setMinimumHeight(190)
+        self.image_preview.setMinimumWidth(0)
+        self.image_preview.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.image_preview.setObjectName("DetailPreview")
         self.text_preview = _SafeMarkdownBrowser()
         self.text_preview.setOpenExternalLinks(False)
@@ -1425,6 +1480,8 @@ class DetailPanel(QScrollArea):
         layout.addWidget(self.preview_stack, 1)
         self.meta = QLabel()
         self.meta.setWordWrap(True)
+        self.meta.setMinimumWidth(0)
+        self.meta.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.meta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.meta)
 
@@ -1442,7 +1499,11 @@ class DetailPanel(QScrollArea):
         add_tag.clicked.connect(lambda: self.current_item and self.add_tag_requested.emit(self.current_item["id"]))
         tag_title.addWidget(add_tag)
         layout.addLayout(tag_title)
-        self.tags_box = QHBoxLayout()
+        self.tags_box = QGridLayout()
+        self.tags_box.setHorizontalSpacing(4)
+        self.tags_box.setVerticalSpacing(4)
+        self.tags_box.setColumnStretch(0, 1)
+        self.tags_box.setColumnStretch(1, 1)
         layout.addLayout(self.tags_box)
 
         ocr_row = QHBoxLayout()
@@ -1456,6 +1517,8 @@ class DetailPanel(QScrollArea):
         self.ocr_text = QLabel("尚未识别")
         self.ocr_text.setObjectName("Muted")
         self.ocr_text.setWordWrap(True)
+        self.ocr_text.setMinimumWidth(0)
+        self.ocr_text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.ocr_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.ocr_text)
 
@@ -1470,6 +1533,8 @@ class DetailPanel(QScrollArea):
         self.ai_description = QLabel("尚未生成")
         self.ai_description.setObjectName("Muted")
         self.ai_description.setWordWrap(True)
+        self.ai_description.setMinimumWidth(0)
+        self.ai_description.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.ai_description.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.ai_description)
 
@@ -1526,10 +1591,12 @@ class DetailPanel(QScrollArea):
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
         self.current_item = item
+        self._image_source_pixmap = QPixmap()
         self.image_preview.clear()
         self.text_preview.clear()
         self.type_badge.setText(TYPE_LABELS.get(item["kind"], item["kind"]))
-        self.title.setText(item["title"])
+        self.title.setText(_wrap_detail_text(item["title"]))
+        self.title.setToolTip(item["title"])
         if item["kind"] == "image" and item["path"] and Path(item["path"]).exists():
             self.preview_stack.setCurrentWidget(self.image_preview)
             try:
@@ -1548,15 +1615,20 @@ class DetailPanel(QScrollArea):
                 self.text_preview.setPlainText(item["content"])
             self.preview_stack.setCurrentWidget(self.text_preview)
         dimensions = f"{item['width']} × {item['height']}\n" if item["width"] else ""
-        path_text = f"\n路径  {item['path']}" if item["path"] else ""
+        path_text = f"\n路径  {_wrap_detail_text(item['path'])}" if item["path"] else ""
         self.meta.setText(f"类型  {TYPE_LABELS.get(item['kind'], item['kind'])}\n{dimensions}大小  {human_size(item['file_size'])}\n时间  {item['created_at'].replace('T',' ')}\n来源  {item['source']}{path_text}")
+        self.meta.setToolTip(item["path"] or "")
         self.collection_combo.blockSignals(True)
         index = self.collection_combo.findData(item["collection_id"])
         self.collection_combo.setCurrentIndex(max(0, index))
         self.collection_combo.blockSignals(False)
         self._set_tags(item["tag_names"] or "", item["tag_colors"] or "")
-        self.ai_description.setText(item["ai_description"] or "尚未生成")
-        self.ocr_text.setText(item["ocr_text"] or "尚未识别")
+        self.ai_description.setText(
+            _wrap_detail_text(item["ai_description"]) if item["ai_description"] else "尚未生成"
+        )
+        self.ocr_text.setText(
+            _wrap_detail_text(item["ocr_text"]) if item["ocr_text"] else "尚未识别"
+        )
         is_image = item["kind"] == "image" and bool(item["path"]) and Path(item["path"]).exists()
         self.ai_button.setEnabled(is_image)
         self.ai_button.setText("重新生成" if item["ai_description"] else "生成描述")
@@ -1576,12 +1648,15 @@ class DetailPanel(QScrollArea):
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
         self.current_item = None
+        self._image_source_pixmap = QPixmap()
         self.type_badge.setText("详情")
         self.title.setText("选择一项查看详情")
+        self.title.setToolTip("")
         self.image_preview.clear()
         self.text_preview.clear()
         self.preview_stack.setCurrentWidget(self.text_preview)
         self.meta.clear()
+        self.meta.setToolTip("")
         self._set_tags("", "")
         self.ai_description.setText("尚未生成")
         self.ocr_text.setText("尚未识别")
@@ -1630,14 +1705,30 @@ class DetailPanel(QScrollArea):
     def _set_image_preview(self, pixmap: QPixmap | None) -> None:
         if pixmap is None or pixmap.isNull():
             return
+        self._image_source_pixmap = QPixmap(pixmap)
+        self._refresh_image_preview()
+
+    def _refresh_image_preview(self) -> None:
+        if self._image_source_pixmap.isNull():
+            return
+        available_width = max(
+            1,
+            min(self.image_preview.width(), self.viewport().width() - 32),
+        )
+        available_height = max(1, min(230, self.image_preview.height()))
         self.image_preview.setPixmap(
-            pixmap.scaled(
-                330,
-                230,
+            self._image_source_pixmap.scaled(
+                available_width,
+                available_height,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not self._image_source_pixmap.isNull():
+            self._refresh_image_preview()
 
     def set_ai_busy(self, busy: bool, failed: bool = False) -> None:
         is_image = bool(
@@ -1667,14 +1758,17 @@ class DetailPanel(QScrollArea):
         name_list = names.split("\x1f") if names else []
         color_list = colors.split("\x1f") if colors else []
         for index, name in enumerate(name_list[:4]):
-            button = QPushButton(name)
+            button = QPushButton()
             button.setObjectName("TagChip")
+            button.setText(button.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, 108))
+            button.setMinimumWidth(0)
+            button.setMaximumWidth(130)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             color = color_list[index] if index < len(color_list) else "#64748b"
             button.setIcon(QIcon(color_dot(color)))
-            button.setToolTip("点击移除标签")
+            button.setToolTip(f"{name}\n点击移除标签")
             button.clicked.connect(lambda _checked=False, tag=name: self.current_item and self.remove_tag_requested.emit(self.current_item["id"], tag))
-            self.tags_box.addWidget(button)
-        self.tags_box.addStretch()
+            self.tags_box.addWidget(button, index // 2, index % 2)
 
     def _collection_changed(self, _index: int) -> None:
         if self.current_item:

@@ -9,8 +9,8 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QByteArray, QPropertyAnimation, QRect, QThread, Qt, QUrl
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QTextDocument
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QPointF, QPropertyAnimation, QRect, QThread, Qt, QUrl
+from PySide6.QtGui import QColor, QEnterEvent, QImage, QPainter, QPixmap, QTextDocument, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QScrollArea, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QWidget
 
@@ -19,6 +19,7 @@ from clipsave_app.app import create_app_icon
 from clipsave_app.widgets import (
     AssetGrid,
     AssetTable,
+    AutoHideScrollBar,
     DetailPanel,
     MarkdownDialog,
     MAX_RICH_MARKDOWN_BYTES,
@@ -26,6 +27,7 @@ from clipsave_app.widgets import (
     SettingsDialog,
     _SafeMarkdownBrowser,
     _THUMBNAIL_CACHE,
+    _half_speed_wheel_event,
     _startfile_or_warn,
     thumbnail_pixmap,
 )
@@ -114,6 +116,38 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertEqual(first.cacheKey(), second.cacheKey())
         self.assertEqual(len(_THUMBNAIL_CACHE), 1)
         grid.close()
+
+    def test_home_view_wheel_delta_is_halved(self):
+        event = QWheelEvent(
+            QPointF(10, 10),
+            QPointF(10, 10),
+            QPoint(0, 18),
+            QPoint(0, 120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+
+        scaled = _half_speed_wheel_event(event)
+
+        self.assertEqual(scaled.pixelDelta(), QPoint(0, 9))
+        self.assertEqual(scaled.angleDelta(), QPoint(0, 60))
+
+    def test_auto_hide_scrollbar_stays_visible_while_hovered(self):
+        scroll_bar = AutoHideScrollBar()
+        scroll_bar.setRange(0, 100)
+
+        scroll_bar.enterEvent(
+            QEnterEvent(QPointF(2, 2), QPointF(2, 2), QPointF(2, 2))
+        )
+        self.assertTrue(scroll_bar.active)
+        self.assertFalse(scroll_bar.hide_timer.isActive())
+
+        scroll_bar.leaveEvent(QEvent(QEvent.Type.Leave))
+        self.assertTrue(scroll_bar.active)
+        self.assertTrue(scroll_bar.hide_timer.isActive())
+        scroll_bar.close()
 
     def test_grid_delegate_accepts_sqlite_rows_from_production_queries(self):
         connection = sqlite3.connect(":memory:")
@@ -434,10 +468,10 @@ class ThumbnailPixmapTests(unittest.TestCase):
             "created_at": "2026-07-12T10:00:00",
             "source": "test",
             "collection_id": None,
-            "tag_names": "",
-            "tag_colors": "",
-            "ai_description": "",
-            "ocr_text": "",
+            "tag_names": ("tag_" + "x" * 120) + "\x1f" + ("tag_" + "y" * 120),
+            "tag_colors": "#21a8fb\x1f#20a464",
+            "ai_description": "A" * 300,
+            "ocr_text": "B" * 300,
             "notes": "",
             "favorite": 0,
         }
@@ -471,6 +505,53 @@ class ThumbnailPixmapTests(unittest.TestCase):
         panel.show()
         self.assertTrue(wait_for(lambda: panel.verticalScrollBar().maximum() > 0))
         self.assertGreater(panel.content_widget.sizeHint().height(), panel.viewport().height())
+        panel.close()
+
+    def test_detail_long_filename_and_path_do_not_expand_panel(self):
+        image_path = Path(self.temp.name) / ("wide_" + "capture_" * 8 + ".png")
+        image = QImage(1600, 900, QImage.Format.Format_RGB32)
+        image.fill(QColor("#21a8fb"))
+        self.assertTrue(image.save(str(image_path)))
+        panel = DetailPanel()
+        panel.resize(340, 640)
+        panel.show()
+        item = {
+            "id": 1,
+            "title": image_path.name,
+            "kind": "image",
+            "path": str(image_path),
+            "content": "",
+            "width": 100,
+            "height": 100,
+            "file_size": 1024,
+            "created_at": "2026-07-13T01:58:02",
+            "source": "clipboard",
+            "collection_id": None,
+            "tag_names": "",
+            "tag_colors": "",
+            "ai_description": "",
+            "ocr_text": "",
+            "notes": "",
+            "favorite": 0,
+        }
+
+        panel.set_item(item)
+        self.assertTrue(wait_for(lambda: not panel.image_preview.pixmap().isNull()))
+
+        self.assertIn("\u200b", panel.title.text())
+        self.assertIn("\u200b", panel.meta.text())
+        self.assertEqual(panel.title.toolTip(), item["title"])
+        self.assertEqual(panel.meta.toolTip(), item["path"])
+        self.assertLessEqual(panel.content_widget.width(), panel.viewport().width())
+        self.assertLessEqual(panel.image_preview.pixmap().width(), panel.image_preview.width())
+        self.assertEqual(panel.horizontalScrollBar().maximum(), 0)
+        panel.resize(280, 640)
+        self.assertTrue(
+            wait_for(
+                lambda: panel.image_preview.pixmap().width()
+                <= panel.image_preview.width()
+            )
+        )
         panel.close()
 
     def test_settings_default_size_does_not_scroll(self):

@@ -5,33 +5,33 @@ LIGHT_STYLESHEET = """
     color: #172033;
 }
 QMainWindow, QWidget#AppRoot { background: transparent; }
-QDialog#FluentDialog { background: rgb(244,246,249); border: 1px solid rgba(105,121,145,55); }
+QDialog#FluentDialog { background: #f6f6f6; border: 1px solid rgba(105,121,145,55); }
 QDialog#FluentDialog[dateDialog="true"] { border: 1px solid #000000; }
-QWidget#DialogContent { background: rgb(244,246,249); }
-QFrame#DialogTitleBar { background: rgb(244,246,249); border-bottom: 1px solid rgba(115,129,150,38); }
-QFrame#DialogFooter { background: rgb(244,246,249); border-top: 1px solid rgba(115,129,150,38); }
-QScrollArea#DialogScroll { background: rgb(244,246,249); border: 0; }
+QWidget#DialogContent { background: #f6f6f6; }
+QFrame#DialogTitleBar { background: #f6f6f6; border-bottom: 1px solid rgba(115,129,150,38); }
+QFrame#DialogFooter { background: #f6f6f6; border-top: 1px solid rgba(115,129,150,38); }
+QScrollArea#DialogScroll { background: #f6f6f6; border: 0; }
 QListWidget#DateList { background: transparent; border: 0; outline: 0; }
-QListWidget#DateList::item { padding: 0 12px; border-radius: 4px; background: rgba(255,255,255,95); }
+QListWidget#DateList::item { padding: 0 12px; border-radius: 4px; background: #ffffff; }
 QListWidget#DateList::item:hover { background: rgba(39,75,125,16); }
 QListWidget#DateList::item:selected { background: rgba(47,125,246,28); color: #135fc7; }
 QWidget#WindowBody { background: transparent; }
 QFrame#WindowTitleBar { background: rgba(255, 255, 255, 204); border: 0; }
 QWidget#Sidebar { background: rgba(255, 255, 255, 204); border: 0; }
 QWidget#ContentSurface { background: transparent; }
-QWidget#DetailPanel { background: rgb(244, 246, 249); border-left: 1px solid rgba(115, 129, 150, 44); }
+QWidget#DetailPanel { background: #f6f6f6; border-left: 1px solid rgba(115, 129, 150, 44); }
 QFrame#TopBar { background: rgba(255, 255, 255, 204); border-bottom: 1px solid rgba(115,129,150,38); }
-QFrame#LibraryHeader { background: rgb(244, 246, 249); }
-QStackedWidget#ViewStack { background: rgb(244, 246, 249); }
-QFrame#Card { background: rgba(255,255,255,218); border: 1px solid rgba(105,121,145,40); border-radius: 7px; }
-QFrame#Card:hover { background: rgba(255,255,255,245); border-color: rgba(47,125,246,100); }
+QFrame#LibraryHeader { background: #f6f6f6; }
+QStackedWidget#ViewStack { background: #f6f6f6; }
+QFrame#Card { background: #ffffff; border: 1px solid rgba(105,121,145,40); border-radius: 7px; }
+QFrame#Card:hover { background: #ffffff; border-color: rgba(47,125,246,100); }
 QFrame#Card[selected="true"] { background: rgba(234,243,255,245); border: 2px solid #2f7df6; }
 QFrame#TagChip { background: rgba(236,240,246,210); border-radius: 6px; }
 QLabel#Muted { color: #6f7b8d; }
 QLabel#SectionTitle { font-size: 15px; font-weight: 600; color: #273247; }
 QLabel#Title { font-size: 17px; font-weight: 600; }
 QLineEdit, QTextEdit, QTextBrowser, QComboBox {
-    background: rgba(255,255,255,190);
+    background: #ffffff;
     border: 1px solid rgba(99,115,139,55);
     border-radius: 6px;
     padding: 7px 10px;
@@ -49,8 +49,8 @@ QPushButton:pressed { background: rgba(39,75,125,30); }
 QPushButton:disabled { color: rgba(53,64,82,105); background: transparent; }
 QPushButton#Primary { background: #2f7df6; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #246be0; }
-QPushButton#SettingsAction { text-align: left; background: rgba(255,255,255,150); border: 1px solid rgba(99,115,139,38); padding: 9px 12px; }
-QPushButton#SettingsAction:hover { background: rgba(255,255,255,220); border-color: rgba(47,125,246,75); }
+QPushButton#SettingsAction { text-align: left; background: #ffffff; border: 1px solid rgba(99,115,139,38); padding: 9px 12px; }
+QPushButton#SettingsAction:hover { background: #ffffff; border-color: rgba(47,125,246,75); }
 QPushButton#NavButton { text-align: left; padding: 9px 16px; border-radius: 6px; }
 QPushButton#NavButton[active="true"] { background: rgba(47,125,246,18); color: #135fc7; font-weight: 600; }
 QPushButton#IconButton { min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px; padding: 0; }
@@ -64,11 +64,11 @@ QPushButton#CaptureStatus:hover { background: rgba(255,255,255,80); }
 QScrollArea { border: 0; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QLabel#DetailPreview { background: rgba(235,239,245,160); border-radius: 6px; }
-QListView#AssetGrid { background: rgb(244,246,249); border: 0; outline: 0; }
-QTableView#AssetTable { background: rgb(244,246,249); alternate-background-color: rgb(240,243,247); border: 0; gridline-color: transparent; outline: 0; selection-color: #172033; selection-background-color: rgba(47,125,246,30); }
+QListView#AssetGrid { background: #f6f6f6; border: 0; outline: 0; }
+QTableView#AssetTable { background: #f6f6f6; alternate-background-color: #ffffff; border: 0; gridline-color: transparent; outline: 0; selection-color: #172033; selection-background-color: rgba(47,125,246,30); }
 QTableView#AssetTable::item { padding: 8px 10px; border-bottom: 1px solid rgba(115,129,150,24); }
 QTableView#AssetTable::item:selected { color: #172033; background: rgba(47,125,246,30); }
-QTableWidget { background: rgb(244,246,249); alternate-background-color: rgb(240,243,247); border: 0; gridline-color: transparent; selection-background-color: rgba(47,125,246,30); }
+QTableWidget { background: #f6f6f6; alternate-background-color: #ffffff; border: 0; gridline-color: transparent; selection-background-color: rgba(47,125,246,30); }
 QTableWidget::item { padding: 8px 10px; border-bottom: 1px solid rgba(115,129,150,24); }
 QTableWidget::item:selected { color: #172033; background: rgba(47,125,246,30); }
 QHeaderView::section { background: rgb(238,242,246); border: 0; border-bottom: 1px solid rgba(115,129,150,40); padding: 8px 10px; font-weight: 600; }
@@ -80,9 +80,9 @@ QSplitter::handle { background: transparent; width: 1px; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: rgba(87,101,122,80); border-radius: 4px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar#AutoHideScrollBar:vertical { background: rgb(244,246,249); width: 14px; margin: 0; }
-QScrollBar#AutoHideScrollBar::groove:vertical { background: rgb(244,246,249); }
-QScrollBar#AutoHideScrollBar::add-page:vertical, QScrollBar#AutoHideScrollBar::sub-page:vertical { background: rgb(244,246,249); }
+QScrollBar#AutoHideScrollBar:vertical { background: #f6f6f6; width: 14px; margin: 0; }
+QScrollBar#AutoHideScrollBar::groove:vertical { background: #f6f6f6; }
+QScrollBar#AutoHideScrollBar::add-page:vertical, QScrollBar#AutoHideScrollBar::sub-page:vertical { background: #f6f6f6; }
 QScrollBar#AutoHideScrollBar::handle:vertical { background: rgba(87,101,122,135); border-radius: 0; min-height: 32px; }
 QScrollBar#AutoHideScrollBar::handle:vertical:hover { background: rgba(71,84,103,180); }
 QScrollBar#AutoHideScrollBar::add-line:vertical, QScrollBar#AutoHideScrollBar::sub-line:vertical { height: 0; }

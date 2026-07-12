@@ -45,6 +45,14 @@ from .ocr_service import WindowsOCRService
 from .settings import Settings
 from .storage import is_under_local_store, recycle_managed_file
 from .styles import DARK_STYLESHEET, LIGHT_STYLESHEET
+from .windows_frame import (
+    WM_NCCALCSIZE,
+    enable_native_resize_frame,
+    handle_nccalcsize,
+    is_windows_qt_platform,
+    window_dpi_scale,
+    window_rect,
+)
 from .widgets import (
     AssetGrid,
     AssetTable,
@@ -98,6 +106,9 @@ class AsyncSignals(QObject):
 
 
 class MainWindow(QMainWindow):
+    RESIZE_EDGE_WIDTH = 8
+    RESIZE_CORNER_SIZE = 14
+
     def __init__(
         self,
         database: LibraryDatabase,
@@ -140,6 +151,9 @@ class MainWindow(QMainWindow):
         self._async_tasks_lock = threading.Lock()
         self._closing = False
         self._quit_in_progress = False
+        self._interactive_resize_active = False
+        self._native_resize_frame_enabled = False
+        self._native_resize_frame_hwnd: int | None = None
         self.global_hotkey_registered: bool | None = None
         self.dark_theme = self._desired_dark_theme()
         app = QApplication.instance()
@@ -154,6 +168,7 @@ class MainWindow(QMainWindow):
         self.build_ui()
         self.build_tray()
         self.build_shortcuts()
+        self._ensure_native_resize_frame()
         color_scheme_changed = getattr(QApplication.styleHints(), "colorSchemeChanged", None)
         if color_scheme_changed is not None:
             color_scheme_changed.connect(self._system_color_scheme_changed)
@@ -370,6 +385,12 @@ class MainWindow(QMainWindow):
         self._create_resize_handles(root)
 
     def _create_resize_handles(self, parent) -> None:
+        if os.name == "nt":
+            self.resize_handles = {}
+            return
+        self._install_resize_handles(parent)
+
+    def _install_resize_handles(self, parent) -> None:
         self.resize_handles = {
             "left": ResizeHandle(Qt.Edge.LeftEdge, Qt.CursorShape.SizeHorCursor, parent),
             "right": ResizeHandle(Qt.Edge.RightEdge, Qt.CursorShape.SizeHorCursor, parent),
@@ -382,8 +403,26 @@ class MainWindow(QMainWindow):
         }
         self._update_resize_handles()
 
+    def _ensure_native_resize_frame(self) -> None:
+        if not is_windows_qt_platform():
+            return
+        hwnd = int(self.winId())
+        if self._native_resize_frame_enabled and self._native_resize_frame_hwnd == hwnd:
+            return
+        enabled = enable_native_resize_frame(hwnd)
+        self._native_resize_frame_enabled = enabled
+        self._native_resize_frame_hwnd = hwnd if enabled else None
+        if enabled:
+            if self.resize_handles:
+                for handle in self.resize_handles.values():
+                    handle.deleteLater()
+                self.resize_handles = {}
+            return
+        if not self.resize_handles:
+            self._install_resize_handles(self.centralWidget())
+
     def _update_resize_handles(self) -> None:
-        if not hasattr(self, "resize_handles"):
+        if not getattr(self, "resize_handles", None):
             return
         hidden = self.isMaximized() or self.isFullScreen()
         for handle in self.resize_handles.values():
@@ -391,7 +430,7 @@ class MainWindow(QMainWindow):
         if hidden:
             return
         width, height = self.width(), self.height()
-        edge, corner = 6, 12
+        edge, corner = self.RESIZE_EDGE_WIDTH, self.RESIZE_CORNER_SIZE
         geometries = {
             "left": (0, corner, edge, max(0, height - 2 * corner)),
             "right": (width - edge, corner, edge, max(0, height - 2 * corner)),
@@ -404,7 +443,6 @@ class MainWindow(QMainWindow):
         }
         for key, geometry in geometries.items():
             self.resize_handles[key].setGeometry(*geometry)
-            self.resize_handles[key].raise_()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -423,33 +461,84 @@ class MainWindow(QMainWindow):
     def nativeEvent(self, event_type, message):
         if os.name == "nt" and event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
             msg = wintypes.MSG.from_address(int(message))
-            if msg.message == 0x0084 and not self.isMaximized():  # WM_NCHITTEST
-                rect = wintypes.RECT()
-                ctypes.windll.user32.GetWindowRect(int(self.winId()), ctypes.byref(rect))
+            if msg.message == WM_NCCALCSIZE:
+                handled, result = handle_nccalcsize(int(msg.hWnd), int(msg.wParam), int(msg.lParam))
+                if handled:
+                    return True, result
+            if msg.message == 0x0231:  # WM_ENTERSIZEMOVE
+                self._begin_interactive_resize()
+            elif msg.message == 0x0232:  # WM_EXITSIZEMOVE
+                self._end_interactive_resize()
+            if msg.message == 0x0084 and not (self.isMaximized() or self.isFullScreen()):  # WM_NCHITTEST
+                hwnd = int(msg.hWnd) or int(self.winId())
+                rect = window_rect(hwnd)
+                if rect is None:
+                    return super().nativeEvent(event_type, message)
                 x = ctypes.c_short(msg.lParam & 0xFFFF).value
                 y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
-                border = max(6, round(6 * self.devicePixelRatioF()))
-                left = x < rect.left + border
-                right = x >= rect.right - border
-                top = y < rect.top + border
-                bottom = y >= rect.bottom - border
-                if top and left:
-                    return True, 13  # HTTOPLEFT
-                if top and right:
-                    return True, 14  # HTTOPRIGHT
-                if bottom and left:
-                    return True, 16  # HTBOTTOMLEFT
-                if bottom and right:
-                    return True, 17  # HTBOTTOMRIGHT
-                if left:
-                    return True, 10  # HTLEFT
-                if right:
-                    return True, 11  # HTRIGHT
-                if top:
-                    return True, 12  # HTTOP
-                if bottom:
-                    return True, 15  # HTBOTTOM
+                hit = self._windows_resize_hit_test(
+                    x,
+                    y,
+                    *rect,
+                    window_dpi_scale(hwnd),
+                )
+                if hit is not None:
+                    return True, hit
         return super().nativeEvent(event_type, message)
+
+    @classmethod
+    def _windows_resize_hit_test(
+        cls,
+        x: int,
+        y: int,
+        left: int,
+        top: int,
+        right: int,
+        bottom: int,
+        device_pixel_ratio: float,
+    ) -> int | None:
+        if x < left or x >= right or y < top or y >= bottom:
+            return None
+        edge = max(1, round(cls.RESIZE_EDGE_WIDTH * device_pixel_ratio))
+        corner = max(edge, round(cls.RESIZE_CORNER_SIZE * device_pixel_ratio))
+        on_left = x < left + edge
+        on_right = x >= right - edge
+        on_top = y < top + edge
+        on_bottom = y >= bottom - edge
+        near_left = x < left + corner
+        near_right = x >= right - corner
+        near_top = y < top + corner
+        near_bottom = y >= bottom - corner
+        if (on_top and near_left) or (on_left and near_top):
+            return 13  # HTTOPLEFT
+        if (on_top and near_right) or (on_right and near_top):
+            return 14  # HTTOPRIGHT
+        if (on_bottom and near_left) or (on_left and near_bottom):
+            return 16  # HTBOTTOMLEFT
+        if (on_bottom and near_right) or (on_right and near_bottom):
+            return 17  # HTBOTTOMRIGHT
+        if on_left:
+            return 10  # HTLEFT
+        if on_right:
+            return 11  # HTRIGHT
+        if on_top:
+            return 12  # HTTOP
+        if on_bottom:
+            return 15  # HTBOTTOM
+        return None
+
+    def _begin_interactive_resize(self) -> None:
+        if self._interactive_resize_active:
+            return
+        self._interactive_resize_active = True
+        self.grid.set_layout_updates_suspended(True)
+
+    def _end_interactive_resize(self) -> None:
+        if not self._interactive_resize_active:
+            return
+        self._interactive_resize_active = False
+        self.grid.set_layout_updates_suspended(False)
+        QTimer.singleShot(0, self._constrain_to_available_screen)
 
     def build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.app_icon, self)
@@ -1668,6 +1757,7 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def showEvent(self, event) -> None:
+        self._ensure_native_resize_frame()
         super().showEvent(event)
         self.grid.set_preview_loading_enabled(self.view_stack.currentWidget() is self.grid)
         QTimer.singleShot(0, self._constrain_to_available_screen)

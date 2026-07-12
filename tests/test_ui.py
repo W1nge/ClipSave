@@ -67,8 +67,13 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(self.window.detail.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
         self.assertEqual(self.window.library_header.height(), 44)
         self.assertIsInstance(self.window.top_bar, DraggableBar)
-        self.assertEqual(len(self.window.resize_handles), 8)
-        self.assertEqual(self.window.resize_handles["right"].geometry().width(), 6)
+        if os.name == "nt":
+            self.assertEqual(self.window.resize_handles, {})
+            title_target = self.window.centralWidget().childAt(300, 15)
+            self.assertIsNotNone(title_target)
+            self.assertEqual(title_target.objectName(), "WindowTitleBar")
+        else:
+            self.assertEqual(len(self.window.resize_handles), 8)
         scroll_bar = self.window.grid.verticalScrollBar()
         self.assertEqual(scroll_bar.objectName(), "AutoHideScrollBar")
         self.assertFalse(bool(scroll_bar.property("active")))
@@ -132,6 +137,54 @@ class MainWindowTests(unittest.TestCase):
             self.window._constrain_to_available_screen()
         self.assertEqual(self.window.geometry(), QRect(200, 200, 800, 500))
 
+    def test_interactive_resize_defers_grid_layout_until_finished(self):
+        with patch.object(self.window.grid, "set_layout_updates_suspended") as suspended:
+            self.window._begin_interactive_resize()
+            self.window._begin_interactive_resize()
+            self.window._end_interactive_resize()
+            self.window._end_interactive_resize()
+
+        self.assertEqual([call.args for call in suspended.call_args_list], [(True,), (False,)])
+
+    def test_windows_resize_hit_test_only_uses_narrow_l_shaped_edges(self):
+        hit = self.window._windows_resize_hit_test
+        bounds = (0, 0, 1000, 700, 1.0)
+
+        self.assertEqual(hit(4, 350, *bounds), 10)
+        self.assertEqual(hit(996, 350, *bounds), 11)
+        self.assertEqual(hit(500, 4, *bounds), 12)
+        self.assertEqual(hit(500, 696, *bounds), 15)
+        self.assertEqual(hit(4, 10, *bounds), 13)
+        self.assertEqual(hit(10, 4, *bounds), 13)
+        self.assertIsNone(hit(10, 10, *bounds))
+        self.assertIsNone(hit(40, 660, *bounds))
+        self.assertIsNone(hit(-1, 350, *bounds))
+        self.assertIsNone(hit(1000, 350, *bounds))
+        self.assertIsNone(hit(500, -1, *bounds))
+        self.assertIsNone(hit(500, 700, *bounds))
+
+    def test_windows_resize_hit_test_covers_all_corners_and_scaled_monitors(self):
+        hit = self.window._windows_resize_hit_test
+        cases = (
+            ((-1200, 200, -200, 900, 1.0), (-1196, 204), 13),
+            ((-1200, 200, -200, 900, 1.0), (-204, 204), 14),
+            ((-1200, 200, -200, 900, 1.0), (-1196, 896), 16),
+            ((-1200, 200, -200, 900, 1.0), (-204, 896), 17),
+            ((100, -800, 1100, -100, 1.25), (105, -450), 10),
+            ((100, -800, 1100, -100, 1.5), (1094, -450), 11),
+            ((100, -800, 1100, -100, 2.0), (600, -785), 12),
+            ((100, -800, 1100, -100, 2.0), (600, -115), 15),
+        )
+        for bounds, point, expected in cases:
+            with self.subTest(bounds=bounds, point=point):
+                self.assertEqual(hit(*point, *bounds), expected)
+
+        scaled_bounds = (100, 100, 1100, 800, 2.0)
+        self.assertEqual(hit(115, 115, *scaled_bounds), 13)
+        self.assertIsNone(hit(117, 117, *scaled_bounds))
+        self.assertEqual(hit(115, 128, *scaled_bounds), 10)
+        self.assertIsNone(hit(116, 128, *scaled_bounds))
+
     def test_theme_follows_system_and_can_be_disabled_in_settings(self):
         self.settings.data["follow_system_theme"] = True
         with patch("clipsave_app.main_window.system_uses_dark_theme", return_value=True), patch(
@@ -170,7 +223,16 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertIn(
             "QScrollBar#AutoHideScrollBar::add-page:vertical, "
-            "QScrollBar#AutoHideScrollBar::sub-page:vertical { background: rgb(244,246,249); }",
+            "QScrollBar#AutoHideScrollBar::sub-page:vertical { background: #f6f6f6; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "QWidget#DialogContent { background: #f6f6f6; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "QListWidget#DateList::item { padding: 0 12px; border-radius: 4px; "
+            "background: #ffffff; }",
             self.window.styleSheet(),
         )
 
