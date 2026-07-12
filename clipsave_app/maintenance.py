@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import secrets
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -19,6 +20,28 @@ CONFIRMATION_PHRASE = "DELETE_INDEXED_DUPLICATES"
 PERMANENT_CONFIRMATION_PHRASE = "PERMANENTLY_DELETE_INDEXED_DUPLICATES"
 MAX_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_MANIFEST_RECORDS = 200_000
+
+
+def _write_manifest_atomic(path: Path, report: dict) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _path_key(path: Path | str) -> str:
@@ -100,9 +123,7 @@ def scan_orphans(
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     token = secrets.token_hex(6)
     output_path = output_dir / f"orphan_manifest_{stamp}_{token}.json"
-    temporary = output_dir / f".orphan_manifest_{stamp}_{token}.tmp"
-    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, output_path)
+    _write_manifest_atomic(output_path, report)
     return output_path, report
 
 
@@ -139,6 +160,11 @@ def clean_indexed_duplicates(
         ):
             raise ValueError("Maintenance manifest contains an invalid deletion record")
 
+    manifest_library = report.get("library_dir")
+    if not isinstance(manifest_library, str) or _path_key(manifest_library) != _path_key(LIBRARY_DIR):
+        raise ValueError("Maintenance manifest belongs to a different library")
+    library_root = Path(manifest_library).resolve()
+
     result = {
         "mode": "permanent" if permanent else "recycle_bin",
         "deleted": 0,
@@ -149,8 +175,9 @@ def clean_indexed_duplicates(
     for record in records:
         if record.get("classification") != "indexed_duplicate":
             continue
+        path_text = record["path"]
         try:
-            path = Path(record["path"])
+            path = Path(path_text)
             if not is_under_local_store(path) or not path.is_file() or path.is_symlink():
                 result["skipped"] += 1
                 continue
@@ -175,7 +202,7 @@ def clean_indexed_duplicates(
                     result["skipped"] += 1
                     continue
                 with open_managed_binary(
-                    indexed_path, "rb", LIBRARY_DIR, identity_locked=True
+                    indexed_path, "rb", library_root, identity_locked=True
                 ) as keeper:
                     keeper_stat = os.fstat(keeper.fileno())
                     if LibraryDatabase._stream_hash(keeper) != digest:
@@ -202,14 +229,14 @@ def clean_indexed_duplicates(
                     if permanent:
                         delete_managed_file(
                             path,
-                            LIBRARY_DIR,
+                            library_root,
                             expected_sha256=digest,
                             expected_size=stat.st_size,
                         )
                     else:
                         recycle_managed_file(
                             path,
-                            LIBRARY_DIR,
+                            library_root,
                             send2trash,
                             expected_sha256=digest,
                             expected_size=stat.st_size,
@@ -217,5 +244,5 @@ def clean_indexed_duplicates(
             result["deleted"] += 1
             result["deleted_bytes"] += stat.st_size
         except Exception as exc:
-            result["errors"].append({"path": str(path), "error": str(exc)})
+            result["errors"].append({"path": path_text, "error": str(exc)})
     return result

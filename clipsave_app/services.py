@@ -58,6 +58,10 @@ class OperationCancelled(RuntimeError):
     pass
 
 
+class _ClipboardBusy(RuntimeError):
+    pass
+
+
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise OperationCancelled("Operation cancelled")
@@ -129,15 +133,19 @@ def preflight_image_file(
 ) -> ImageFileSnapshot:
     snapshot = preflight_current_file(path, max_file_bytes=max_file_bytes)
     try:
-        with Image.open(snapshot.path) as image:
-            width, height = image.size
-            image.load()
+        image_context = Image.open(snapshot.path)
     except (OSError, ValueError) as exc:
         raise ValueError("图片文件无法读取或格式无效。") from exc
-    if width <= 0 or height <= 0:
-        raise ValueError("图片尺寸无效，已拒绝处理。")
-    if width * height > max_pixels:
-        raise ValueError("图片尺寸过大，已拒绝处理。")
+    with image_context as image:
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            raise ValueError("图片尺寸无效，已拒绝处理。")
+        if width * height > max_pixels:
+            raise ValueError("图片尺寸过大，已拒绝处理。")
+        try:
+            image.load()
+        except (OSError, ValueError) as exc:
+            raise ValueError("图片文件无法读取或格式无效。") from exc
     snapshot.require_current()
     return ImageFileSnapshot(
         snapshot.path,
@@ -397,6 +405,7 @@ class ClipboardService(QObject):
     CLIPBOARD_READ_ATTEMPTS = 3
     POLL_INTERVAL_MS = 700
     EVENT_FALLBACK_INTERVAL_MS = 5000
+    CLIPBOARD_RETRY_DELAYS_MS = (25, 50, 100, 200)
     WAIT_INTERVAL_SECONDS = 0.01
     PROCESS_EVENTS_MAX_MS = 2
     PERSISTENCE_QUEUE_SIZE = 4
@@ -420,6 +429,10 @@ class ClipboardService(QObject):
         self.timer.timeout.connect(self.poll)
         self.notifier = WindowsClipboardNotifier(self)
         self.notifier.changed.connect(self.poll)
+        self._clipboard_retry_attempt = 0
+        self._clipboard_retry_timer = QTimer(self)
+        self._clipboard_retry_timer.setSingleShot(True)
+        self._clipboard_retry_timer.timeout.connect(self.poll)
         self.last_text = ""
         self.last_image_key = ""
         self.last_clipboard_sequence: int | None = None
@@ -435,6 +448,7 @@ class ClipboardService(QObject):
         self._persistence_state_lock = threading.Lock()
         self._worker_lifecycle_lock = threading.Lock()
         self._worker_stop_requested = False
+        self._suppress_worker_signals = False
         self._worker_exited = threading.Event()
         self._worker = threading.Thread(target=self._persistence_loop, name="ClipSavePersistence", daemon=True)
         self._persistence_succeeded.connect(self._finish_task)
@@ -452,12 +466,16 @@ class ClipboardService(QObject):
             try:
                 image = self._snapshot_clipboard_image(clipboard)
                 self.last_image_key = self.image_key(image) if not image.isNull() else ""
+            except _ClipboardBusy:
+                self.last_image_key = ""
             except ValueError as exc:
                 self.last_image_key = ""
                 self.failed.emit(str(exc))
         elif mime.hasText():
             try:
                 self.last_text = self._snapshot_clipboard_text(clipboard)
+            except _ClipboardBusy:
+                self.last_text = ""
             except ValueError as exc:
                 self.last_text = ""
                 self.failed.emit(str(exc))
@@ -552,7 +570,7 @@ class ClipboardService(QObject):
         try:
             user32, kernel32 = ClipboardService._windows_clipboard_apis()
             if not user32.OpenClipboard(None):
-                return None
+                raise _ClipboardBusy("Clipboard is temporarily busy")
             try:
                 if not user32.IsClipboardFormatAvailable(format_id):
                     return None
@@ -573,7 +591,7 @@ class ClipboardService(QObject):
         try:
             user32, kernel32 = ClipboardService._windows_clipboard_apis()
             if not user32.OpenClipboard(None):
-                return None
+                raise _ClipboardBusy("Clipboard is temporarily busy")
             try:
                 descriptors = ClipboardService._registered_image_descriptors_locked(user32, kernel32)
                 results = []
@@ -633,7 +651,7 @@ class ClipboardService(QObject):
         try:
             user32, kernel32 = ClipboardService._windows_clipboard_apis()
             if not user32.OpenClipboard(None):
-                return None
+                raise _ClipboardBusy("Clipboard is temporarily busy")
             try:
                 registered = ClipboardService._registered_image_descriptors_locked(user32, kernel32)
                 dibs = []
@@ -676,7 +694,7 @@ class ClipboardService(QObject):
         try:
             user32, kernel32 = ClipboardService._windows_clipboard_apis()
             if not user32.OpenClipboard(None):
-                return None
+                raise _ClipboardBusy("Clipboard is temporarily busy")
             try:
                 if not user32.IsClipboardFormatAvailable(ClipboardService.CF_UNICODETEXT):
                     return None
@@ -684,11 +702,12 @@ class ClipboardService(QObject):
                 if not handle:
                     raise ValueError("Unable to inspect clipboard text data")
                 size = int(kernel32.GlobalSize(handle))
-                if size <= 0 or size % 2:
+                if size <= 0:
                     raise ValueError("Invalid clipboard Unicode text data")
                 if size > MAX_CLIPBOARD_TEXT_BYTES:
                     raise ValueError("剪贴板文字过大，已拒绝读取。")
                 payload = ClipboardService._copy_clipboard_payload_locked(kernel32, handle, size)
+                payload = payload[: len(payload) - (len(payload) % 2)]
                 terminator = next(
                     (offset for offset in range(0, len(payload), 2) if payload[offset:offset + 2] == b"\x00\x00"),
                     None,
@@ -818,6 +837,7 @@ class ClipboardService(QObject):
     def poll(self) -> None:
         try:
             snapshot = self._read_stable_snapshot()
+            self._clipboard_retry_attempt = 0
             if snapshot is None:
                 return
             kind, value, sequence = snapshot
@@ -836,7 +856,18 @@ class ClipboardService(QObject):
                     self.last_clipboard_sequence = sequence
                     return
                 self._enqueue_task("text", text, sequence)
+        except _ClipboardBusy:
+            if (
+                self._clipboard_retry_attempt < len(self.CLIPBOARD_RETRY_DELAYS_MS)
+                and not self._clipboard_retry_timer.isActive()
+            ):
+                index = self._clipboard_retry_attempt
+                self._clipboard_retry_attempt += 1
+                self._clipboard_retry_timer.start(self.CLIPBOARD_RETRY_DELAYS_MS[index])
+            elif not self._clipboard_retry_timer.isActive():
+                self._clipboard_retry_attempt = 0
         except Exception as exc:
+            self._clipboard_retry_attempt = 0
             self.failed.emit(str(exc))
 
     def _enqueue_task(self, kind: str, value: QImage | str, sequence: int | None) -> None:
@@ -890,15 +921,25 @@ class ClipboardService(QObject):
             try:
                 if task.kind == "image":
                     key = self.image_key(task.value)
-                    if key != self.last_image_key:
+                    with self._persistence_state_lock:
+                        is_duplicate = key == self.last_image_key
+                    if not is_duplicate:
                         self.save_image(task.value)
+                    with self._persistence_state_lock:
+                        self.last_image_key = key
                     result = key
                 else:
                     self.save_text(task.value)
                     result = task.value
-                self._persistence_succeeded.emit(task, result)
+                if self._suppress_worker_signals:
+                    self._finish_task_without_signal(task, result)
+                else:
+                    self._persistence_succeeded.emit(task, result)
             except Exception as exc:
-                self._persistence_failed.emit(task, str(exc))
+                if self._suppress_worker_signals:
+                    self._finish_task_without_signal(task, None)
+                else:
+                    self._persistence_failed.emit(task, str(exc))
             finally:
                 with self._persistence_state_lock:
                     self._tasks.task_done()
@@ -923,6 +964,14 @@ class ClipboardService(QObject):
             self.last_text = result
         if task.sequence is not None:
             self.last_clipboard_sequence = task.sequence
+
+    def _finish_task_without_signal(self, task: _ClipboardTask, result) -> None:
+        self._release_pending(task)
+        with self._persistence_state_lock:
+            if task.kind == "text" and result is not None:
+                self.last_text = result
+            if task.sequence is not None:
+                self.last_clipboard_sequence = task.sequence
 
     def _fail_task(self, task: _ClipboardTask, message: str) -> None:
         self._release_pending(task)
@@ -952,12 +1001,14 @@ class ClipboardService(QObject):
         deadline = time.monotonic() + max(timeout, 0.0)
         self.prepare_for_shutdown()
         if not self.wait_for_idle(max(0.0, deadline - time.monotonic())):
+            self._suppress_worker_signals = True
             return False
         with self._worker_lifecycle_lock:
             self._worker_stop_requested = True
         while self._worker.is_alive():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self._suppress_worker_signals = True
                 return False
             self._worker.join(min(remaining, self.WAIT_INTERVAL_SECONDS))
         self._shutdown_complete = not self._worker.is_alive()
@@ -972,6 +1023,7 @@ class ClipboardService(QObject):
         if self._shutdown_complete:
             return
         with self._worker_lifecycle_lock:
+            self._suppress_worker_signals = False
             self._worker_stop_requested = False
             if self._worker_exited.is_set() or not self._worker.is_alive():
                 self._worker_exited = threading.Event()
@@ -1073,11 +1125,13 @@ class ClipboardService(QObject):
                     raise RuntimeError("Captured image changed before it could be indexed")
                 item_id = self.database.add_image(path, now)
                 if item_id:
-                    self.captured.emit(item_id)
+                    if not self._suppress_worker_signals:
+                        self.captured.emit(item_id)
                     return True
                 owner = self._database_image_owner(payload_hash)
                 if owner is not None and owner["resolved_path"] == self.database._path_key(path):
-                    self.captured.emit(owner["id"])
+                    if not self._suppress_worker_signals:
+                        self.captured.emit(owner["id"])
                     return True
         except BaseException as exc:
             self._remove_new_image(
@@ -1093,6 +1147,8 @@ class ClipboardService(QObject):
             expected_size=len(payload),
         )
         if owner is not None:
+            if not self._suppress_worker_signals:
+                self.captured.emit(owner["id"])
             return True
         raise RuntimeError("图片文件已写入，但数据库未能保存该记录。")
 
@@ -1117,8 +1173,9 @@ class ClipboardService(QObject):
                     handle.write(entry)
         except (OSError, RuntimeError, UnicodeError) as exc:
             warning = f"文字已保存到数据库，但写入每日 Markdown 失败: {exc}"
-        self.captured.emit(item_id)
-        if warning:
+        if not self._suppress_worker_signals:
+            self.captured.emit(item_id)
+        if warning and not self._suppress_worker_signals:
             self.failed.emit(warning)
         return True
 
@@ -1175,7 +1232,10 @@ class AIService:
             method="POST",
         )
         try:
-            with self._open_request(request, timeout=1.0) as response:
+            remaining_timeout = deadline - time.monotonic()
+            if remaining_timeout <= 0:
+                raise TimeoutError("AI service request timed out")
+            with self._open_request(request, timeout=remaining_timeout) as response:
                 chunks: list[bytes] = []
                 remaining = MAX_AI_RESPONSE_BYTES + 1
                 read_chunk = getattr(response, "read1", response.read)

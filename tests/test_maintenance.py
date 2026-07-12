@@ -58,6 +58,15 @@ class MaintenanceTests(unittest.TestCase):
         self.assertTrue(first.exists())
         self.assertTrue(second.exists())
 
+    def test_manifest_replace_failure_leaves_no_temporary_file(self):
+        output = self.root / "reports"
+        with patch("clipsave_app.maintenance.os.replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                scan_orphans(self.database, self.library, output)
+
+        self.assertEqual(list(output.glob("*.tmp")), [])
+        self.assertEqual(list(output.glob("*.json")), [])
+
     def test_cleanup_requires_confirmation_and_revalidates_manifest(self):
         indexed = self.library / "indexed.png"
         Image.new("RGB", (8, 8), "red").save(indexed)
@@ -83,6 +92,7 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(result["deleted"], 1)
         self.assertEqual(len(recycled), 1)
         recycled_path = Path(recycled[0])
+
         self.assertEqual(recycled_path.name, duplicate.name)
         self.assertEqual(
             recycled_path.parent.parent,
@@ -102,6 +112,16 @@ class MaintenanceTests(unittest.TestCase):
             result = clean_indexed_duplicates(self.database, manifest, CONFIRMATION_PHRASE)
         self.assertEqual(result["skipped"], 1)
         send.assert_not_called()
+
+    def test_cleanup_rejects_manifest_from_another_library(self):
+        manifest, _report = scan_orphans(self.database, self.library, self.root / "reports")
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["library_dir"] = str(self.root / "another-library")
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+
+        with patch("clipsave_app.maintenance.LIBRARY_DIR", self.library):
+            with self.assertRaisesRegex(ValueError, "different library"):
+                clean_indexed_duplicates(self.database, manifest, CONFIRMATION_PHRASE)
 
     def test_permanent_cleanup_uses_distinct_confirmation_and_unlinks(self):
         indexed = self.library / "indexed.png"

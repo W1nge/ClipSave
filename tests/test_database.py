@@ -1815,6 +1815,21 @@ class LibraryDatabaseTests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in results], [tagged_id])
 
+    def test_search_treats_like_wildcards_as_literal_characters(self):
+        self.database.add_text("100% complete")
+        self.database.add_text("1000 complete")
+        self.database.add_text("under_score")
+        self.database.add_text("underXscore")
+
+        self.assertEqual(
+            [row["content"] for row in self.database.query_items(query="100%")],
+            ["100% complete"],
+        )
+        self.assertEqual(
+            [row["content"] for row in self.database.query_items(query="under_score")],
+            ["under_score"],
+        )
+
     def test_summary_query_bounds_payload_and_supports_pagination(self):
         ids = []
         for index in range(3):

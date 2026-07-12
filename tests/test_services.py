@@ -132,6 +132,31 @@ class ClipboardServiceTests(unittest.TestCase):
         self.service.poll()
         self.assertTrue(self.service.wait_for_idle())
 
+    def test_clipboard_busy_retries_without_reporting_user_error(self):
+        failures = []
+        self.service.failed.connect(failures.append)
+        with patch.object(
+            self.service,
+            "_read_stable_snapshot",
+            side_effect=services_module._ClipboardBusy("busy"),
+        ):
+            self.service.poll()
+
+        self.assertEqual(failures, [])
+        self.assertTrue(self.service._clipboard_retry_timer.isActive())
+
+    def test_worker_updates_image_dedupe_key_before_gui_signal_delivery(self):
+        image = QImage(16, 16, QImage.Format.Format_RGBA8888)
+        image.fill(QColor("#123456"))
+        saved = []
+        self.service.save_image = lambda _image: saved.append(True) or True
+
+        self.service._enqueue_task("image", image, 101)
+        self.service._enqueue_task("image", image.copy(), 102)
+
+        self.assertTrue(self.service.wait_for_idle(1))
+        self.assertEqual(saved, [True])
+
     def test_resume_after_failed_shutdown_does_not_rebaseline_clipboard(self):
         self.service.last_text = "before shutdown"
         self.service.last_clipboard_sequence = 17
@@ -326,6 +351,21 @@ class ClipboardServiceTests(unittest.TestCase):
         user32.CloseClipboard.assert_called_once_with()
         kernel32.GlobalLock.assert_called_once_with(123)
         kernel32.GlobalUnlock.assert_called_once_with(123)
+
+    def test_native_unicode_text_accepts_odd_allocation_size(self):
+        payload = "hello\0".encode("utf-16-le") + b"x"
+        user32 = Mock()
+        kernel32 = Mock()
+        user32.OpenClipboard.return_value = 1
+        user32.IsClipboardFormatAvailable.return_value = 1
+        user32.GetClipboardData.return_value = 123
+        kernel32.GlobalSize.return_value = len(payload)
+        kernel32.GlobalLock.return_value = 456
+
+        with patch("clipsave_app.services.os.name", "nt"), patch.object(
+            ClipboardService, "_windows_clipboard_apis", return_value=(user32, kernel32)
+        ), patch("clipsave_app.services.ctypes.string_at", return_value=payload):
+            self.assertEqual(self.service._native_clipboard_text_snapshot(), "hello")
 
     def test_stable_text_snapshot_does_not_reread_qt_clipboard_text(self):
         clipboard = Mock()
@@ -726,6 +766,17 @@ class AIServiceTests(unittest.TestCase):
         self.assertTrue(service.configured)
         self.assertIsNone(request.get_header("Authorization"))
         self.assertLessEqual(response.read_limit, 64 * 1024)
+
+    def test_ai_open_timeout_uses_remaining_overall_deadline(self):
+        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        response = FakeResponse(b'{"ok": true}')
+        with patch(
+            "clipsave_app.services.time.monotonic",
+            side_effect=[100.0, 100.25, 100.5, 100.75],
+        ), patch.object(service, "_open_request", return_value=response) as open_request:
+            self.assertEqual(service._post("/test", {}), {"ok": True})
+
+        self.assertAlmostEqual(open_request.call_args.kwargs["timeout"], 9.75)
 
     def test_ai_response_size_and_shape_are_validated(self):
         service = AIService("http://localhost/v1", "", "vision", "embedding")

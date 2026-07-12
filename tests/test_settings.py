@@ -88,6 +88,16 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), original)
         self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
 
+    def test_post_publish_sync_failure_keeps_memory_aligned_with_disk(self):
+        settings = Settings(self.path)
+
+        with patch("clipsave_app.settings._sync_directory", side_effect=OSError("sync failed")):
+            with self.assertRaises(OSError):
+                settings.set("view_mode", "list")
+
+        self.assertEqual(settings.get("view_mode"), "list")
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["view_mode"], "list")
+
     def test_set_rejects_invalid_types(self):
         settings = Settings(self.path)
 

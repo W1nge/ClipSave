@@ -1899,12 +1899,28 @@ class LibraryDatabase:
     def add_image(self, path: Path, created_at: dt.datetime | None = None) -> int | None:
         created_at = created_at or dt.datetime.now()
         try:
-            digest = self.file_hash(path)
-            with Image.open(path) as image:
-                width, height = image.size
-                if width * height > MAX_IMAGE_PIXELS:
+            if is_under_local_store(path):
+                source = storage.open_managed_binary(
+                    path, "rb", storage.LIBRARY_DIR, identity_locked=True
+                )
+            else:
+                source = path.open("rb")
+            with source:
+                initial_stat = os.fstat(source.fileno())
+                digest = self._stream_hash(source)
+                source.seek(0)
+                with Image.open(source) as image:
+                    width, height = image.size
+                    if width * height > MAX_IMAGE_PIXELS:
+                        return None
+                    image.load()
+                final_stat = os.fstat(source.fileno())
+                identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+                if any(
+                    getattr(initial_stat, field, None) != getattr(final_stat, field, None)
+                    for field in identity_fields
+                ):
                     return None
-            stat = path.stat()
         except (OSError, ValueError):
             return None
         timestamp = created_at.isoformat(timespec="seconds")
@@ -1925,7 +1941,7 @@ class LibraryDatabase:
                     digest,
                     timestamp,
                     timestamp,
-                    stat.st_size,
+                    final_stat.st_size,
                     width,
                     height,
                 ),
@@ -1965,17 +1981,19 @@ class LibraryDatabase:
         if query:
             clauses.append(
                 """(
-                    i.title LIKE ? OR i.content LIKE ? OR i.ocr_text LIKE ?
-                    OR i.ai_description LIKE ? OR i.notes LIKE ?
+                    i.title LIKE ? ESCAPE '\\' OR i.content LIKE ? ESCAPE '\\'
+                    OR i.ocr_text LIKE ? ESCAPE '\\' OR i.ai_description LIKE ? ESCAPE '\\'
+                    OR i.notes LIKE ? ESCAPE '\\'
                     OR EXISTS(
                         SELECT 1
                         FROM item_tags search_link
                         JOIN tags search_tag ON search_tag.id=search_link.tag_id
-                        WHERE search_link.item_id=i.id AND search_tag.name LIKE ?
+                        WHERE search_link.item_id=i.id AND search_tag.name LIKE ? ESCAPE '\\'
                     )
                 )"""
             )
-            token = f"%{query}%"
+            escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            token = f"%{escaped_query}%"
             parameters.extend([token] * 6)
         if kind:
             clauses.append("i.kind = ?")

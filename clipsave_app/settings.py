@@ -95,6 +95,10 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+class _SettingsPublishedError(OSError):
+    """The primary file was replaced before the final durability sync failed."""
+
+
 class Settings:
     def __init__(self, path: Path = SETTINGS_PATH):
         self.path = path
@@ -123,6 +127,8 @@ class Settings:
         self.data[key] = value
         try:
             self.save()
+        except _SettingsPublishedError:
+            raise
         except Exception:
             self.data[key] = previous
             raise
@@ -137,6 +143,8 @@ class Settings:
         self.data.update(values)
         try:
             self.save()
+        except _SettingsPublishedError:
+            raise
         except Exception:
             self.data.clear()
             self.data.update(previous)
@@ -156,8 +164,17 @@ class Settings:
                 os.replace(backup_temporary, self.backup_path)
                 backup_temporary = None
             os.replace(temporary_path, self.path)
-            _sync_directory(self.path.parent)
             self.data = data
+            try:
+                _sync_directory(self.path.parent)
+            except Exception as exc:
+                loaded = _read_settings(self.path)
+                self.data = DEFAULTS.copy()
+                if loaded is not None:
+                    self.data.update(loaded)
+                raise _SettingsPublishedError(
+                    "Settings were saved, but the directory sync failed"
+                ) from exc
         finally:
             temporary_path.unlink(missing_ok=True)
             if backup_temporary is not None:

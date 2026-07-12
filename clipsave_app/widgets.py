@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QScrollBar,
     QSizePolicy,
     QStackedWidget,
+    QStyleOptionViewItem,
     QStyledItemDelegate,
     QStyle,
     QTableView,
@@ -409,7 +410,11 @@ def friendly_day(value: str) -> str:
 
 
 def color_dot(color: str, size: int = 12) -> QPixmap:
-    pixmap = QPixmap(size, size)
+    screen = QApplication.primaryScreen()
+    dpr = screen.devicePixelRatio() if screen is not None else 1.0
+    physical_size = max(1, round(size * dpr))
+    pixmap = QPixmap(physical_size, physical_size)
+    pixmap.setDevicePixelRatio(dpr)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -499,7 +504,12 @@ class BrandLabel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
     def paintEvent(self, event) -> None:
-        source = QPixmap(self.size())
+        dpr = self.devicePixelRatioF()
+        source = QPixmap(
+            max(1, round(self.width() * dpr)),
+            max(1, round(self.height() * dpr)),
+        )
+        source.setDevicePixelRatio(dpr)
         source.fill(Qt.GlobalColor.transparent)
         source_painter = QPainter(source)
         source_painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -520,11 +530,12 @@ class BrandLabel(QWidget):
 
         target_height = max(1, round(self.height() * self.vertical_scale))
         compressed = source.scaled(
-            self.width(),
-            target_height,
+            max(1, round(self.width() * dpr)),
+            max(1, round(target_height * dpr)),
             Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+        compressed.setDevicePixelRatio(dpr)
         painter = QPainter(self)
         painter.drawPixmap(0, (self.height() - target_height) // 2, compressed)
         painter.end()
@@ -594,14 +605,35 @@ class AutoHideScrollBar(QScrollBar):
         self.reveal_temporarily()
 
 
-def _half_speed_wheel_event(event: QWheelEvent) -> QWheelEvent:
+@dataclass
+class _WheelRemainder:
+    pixel_x: float = 0.0
+    pixel_y: float = 0.0
+    angle_x: float = 0.0
+    angle_y: float = 0.0
+
+
+def _half_speed_wheel_event(
+    event: QWheelEvent, remainder: _WheelRemainder | None = None
+) -> QWheelEvent:
+    remainder = remainder or _WheelRemainder()
     pixel_delta = event.pixelDelta()
     angle_delta = event.angleDelta()
+    pixel_x = pixel_delta.x() / 2 + remainder.pixel_x
+    pixel_y = pixel_delta.y() / 2 + remainder.pixel_y
+    angle_x = angle_delta.x() / 2 + remainder.angle_x
+    angle_y = angle_delta.y() / 2 + remainder.angle_y
+    scaled_pixel = QPoint(int(pixel_x), int(pixel_y))
+    scaled_angle = QPoint(int(angle_x), int(angle_y))
+    remainder.pixel_x = pixel_x - scaled_pixel.x()
+    remainder.pixel_y = pixel_y - scaled_pixel.y()
+    remainder.angle_x = angle_x - scaled_angle.x()
+    remainder.angle_y = angle_y - scaled_angle.y()
     return QWheelEvent(
         event.position(),
         event.globalPosition(),
-        QPoint(int(pixel_delta.x() / 2), int(pixel_delta.y() / 2)),
-        QPoint(int(angle_delta.x() / 2), int(angle_delta.y() / 2)),
+        scaled_pixel,
+        scaled_angle,
         event.buttons(),
         event.modifiers(),
         event.phase(),
@@ -1099,6 +1131,7 @@ class AssetGrid(QListView):
         self._thumbnail_refresh_timer.timeout.connect(self._refresh_thumbnail_generation)
         self._favorite_press_row = -1
         self._suppress_selection_signal = False
+        self._wheel_remainder = _WheelRemainder()
         self.selectionModel().currentChanged.connect(self._index_selected)
         self.selectionModel().selectionChanged.connect(self._selection_changed)
         self.doubleClicked.connect(self._index_activated)
@@ -1125,7 +1158,7 @@ class AssetGrid(QListView):
         self._thumbnail_refresh_timer.start()
 
     def wheelEvent(self, event) -> None:
-        scaled_event = _half_speed_wheel_event(event)
+        scaled_event = _half_speed_wheel_event(event, self._wheel_remainder)
         super().wheelEvent(scaled_event)
         event.setAccepted(scaled_event.isAccepted())
 
@@ -1322,6 +1355,44 @@ class AssetGrid(QListView):
         super().mouseDoubleClickEvent(event)
 
 
+class _AssetTableFavoriteDelegate(QStyledItemDelegate):
+    @staticmethod
+    def favorite_rect(cell: QRect) -> QRect:
+        return QRect(cell.right() - 34, cell.top(), 34, cell.height())
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        if index.column() != 0:
+            super().paint(painter, option, index)
+            return
+        base_option = QStyleOptionViewItem(option)
+        title = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        base_option.text = ""
+        super().paint(painter, base_option, index)
+        painter.save()
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        painter.setPen(
+            option.palette.highlightedText().color()
+            if selected
+            else option.palette.text().color()
+        )
+        text_rect = option.rect.adjusted(8, 0, -38, 0)
+        title = option.fontMetrics.elidedText(
+            title, Qt.TextElideMode.ElideRight, max(0, text_rect.width())
+        )
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter, title)
+        favorite = bool(index.data(AssetItemModel.FavoriteRole))
+        painter.setPen(QColor("#21a8fb") if favorite else QColor("#8a8a8a"))
+        font = QFont(option.font)
+        font.setPointSizeF(max(10.0, font.pointSizeF() + 1.0))
+        painter.setFont(font)
+        painter.drawText(
+            self.favorite_rect(option.rect),
+            Qt.AlignmentFlag.AlignCenter,
+            "★" if favorite else "☆",
+        )
+        painter.restore()
+
+
 class AssetTable(QTableView):
     item_selected = Signal(int)
     selection_cleared = Signal()
@@ -1342,6 +1413,8 @@ class AssetTable(QTableView):
         self.setObjectName("AssetTable")
         self._asset_model = AssetItemModel(self)
         self.setModel(self._asset_model)
+        self._favorite_delegate = _AssetTableFavoriteDelegate(self)
+        self.setItemDelegateForColumn(0, self._favorite_delegate)
         self.verticalHeader().hide()
         self.verticalHeader().setDefaultSectionSize(44)
         self.horizontalHeader().setStretchLastSection(False)
@@ -1355,9 +1428,11 @@ class AssetTable(QTableView):
         self.doubleClicked.connect(self._index_activated)
         self.selected_id: int | None = None
         self._suppress_selection_signal = False
+        self._wheel_remainder = _WheelRemainder()
+        self._favorite_press_row = -1
 
     def wheelEvent(self, event) -> None:
-        scaled_event = _half_speed_wheel_event(event)
+        scaled_event = _half_speed_wheel_event(event, self._wheel_remainder)
         super().wheelEvent(scaled_event)
         event.setAccepted(scaled_event.isAccepted())
 
@@ -1393,6 +1468,11 @@ class AssetTable(QTableView):
     def clear_selection(self) -> None:
         self.clear_selected_item()
 
+    def select_item(self, item_id: int) -> None:
+        self.selected_id = item_id
+        self.sync_selection_from_selected_id()
+        self.item_selected.emit(item_id)
+
     def _selection_changed(self, _selected=None, _deselected=None) -> None:
         if self._suppress_selection_signal:
             return
@@ -1409,6 +1489,42 @@ class AssetTable(QTableView):
         record = self._asset_model.item(index.row())
         if record is not None:
             self.item_activated.emit(int(record["id"]))
+
+    def mousePressEvent(self, event) -> None:
+        index = self.indexAt(event.position().toPoint())
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and index.isValid()
+            and index.column() == 0
+            and self._favorite_delegate.favorite_rect(self.visualRect(index)).contains(
+                event.position().toPoint()
+            )
+        ):
+            self._favorite_press_row = index.row()
+            event.accept()
+            return
+        self._favorite_press_row = -1
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._favorite_press_row >= 0 and event.button() == Qt.MouseButton.LeftButton:
+            index = self.indexAt(event.position().toPoint())
+            pressed_row = self._favorite_press_row
+            self._favorite_press_row = -1
+            if (
+                index.isValid()
+                and index.row() == pressed_row
+                and index.column() == 0
+                and self._favorite_delegate.favorite_rect(self.visualRect(index)).contains(
+                    event.position().toPoint()
+                )
+            ):
+                record = index.data(AssetItemModel.ItemRole)
+                self.select_item(int(record["id"]))
+                self.favorite_requested.emit(int(record["id"]), not bool(record["favorite"]))
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class _SafeMarkdownBrowser(QTextBrowser):

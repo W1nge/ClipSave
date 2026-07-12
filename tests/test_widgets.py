@@ -27,6 +27,7 @@ from clipsave_app.widgets import (
     SettingsDialog,
     _SafeMarkdownBrowser,
     _THUMBNAIL_CACHE,
+    _WheelRemainder,
     _half_speed_wheel_event,
     _startfile_or_warn,
     thumbnail_pixmap,
@@ -133,6 +134,25 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
         self.assertEqual(scaled.pixelDelta(), QPoint(0, 9))
         self.assertEqual(scaled.angleDelta(), QPoint(0, 60))
+
+    def test_touchpad_fractional_wheel_delta_accumulates_between_events(self):
+        remainder = _WheelRemainder()
+        event = QWheelEvent(
+            QPointF(10, 10),
+            QPointF(10, 10),
+            QPoint(0, 1),
+            QPoint(0, 0),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+
+        first = _half_speed_wheel_event(event, remainder)
+        second = _half_speed_wheel_event(event, remainder)
+
+        self.assertEqual(first.pixelDelta(), QPoint(0, 0))
+        self.assertEqual(second.pixelDelta(), QPoint(0, 1))
 
     def test_auto_hide_scrollbar_stays_visible_while_hovered(self):
         scroll_bar = AutoHideScrollBar()
@@ -452,6 +472,25 @@ class ThumbnailPixmapTests(unittest.TestCase):
         cleared.assert_called_once_with()
         self.assertIsNone(grid.selected_id)
         grid.close()
+
+    def test_table_favorite_control_emits_requested_change(self):
+        table = AssetTable()
+        table.resize(720, 300)
+        table.show()
+        table.set_items(asset_records(2))
+        self.app.processEvents()
+        index = table.model().index(0, 0)
+        selected = Mock()
+        favorite = Mock()
+        table.item_selected.connect(selected)
+        table.favorite_requested.connect(favorite)
+
+        point = table._favorite_delegate.favorite_rect(table.visualRect(index)).center()
+        QTest.mouseClick(table.viewport(), Qt.MouseButton.LeftButton, pos=point)
+
+        favorite.assert_called_once_with(1, True)
+        selected.assert_called_with(1)
+        table.close()
 
     def test_detail_clears_preview_and_updates_image_only_buttons(self):
         image_path = Path(self.temp.name) / "preview.png"

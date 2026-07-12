@@ -353,6 +353,31 @@ class StorageTests(unittest.TestCase):
             storage.delete_managed_file(linked, library)
         self.assertEqual(outside.read_bytes(), b"outside")
 
+    @unittest.skipUnless(os.name == "nt", "Windows handle validation")
+    def test_new_open_always_file_is_removed_if_stream_setup_fails(self):
+        library = self.root / "Library"
+        library.mkdir()
+        target = library / "new.bin"
+
+        with patch.object(storage, "_truncate_handle", side_effect=OSError("truncate failed")):
+            with self.assertRaisesRegex(OSError, "truncate failed"):
+                storage.open_managed_binary(target, "wb", library)
+
+        self.assertFalse(target.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle validation")
+    def test_existing_open_always_file_survives_stream_setup_failure(self):
+        library = self.root / "Library"
+        library.mkdir()
+        target = library / "existing.bin"
+        target.write_bytes(b"original")
+
+        with patch.object(storage.msvcrt, "open_osfhandle", side_effect=OSError("fd failed")):
+            with self.assertRaisesRegex(OSError, "fd failed"):
+                storage.open_managed_binary(target, "ab", library)
+
+        self.assertEqual(target.read_bytes(), b"original")
+
     @unittest.skipUnless(os.name == "nt", "Windows Junction behavior")
     def test_handle_open_catches_parent_junction_swap(self):
         library = self.root / "Library"

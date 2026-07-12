@@ -347,12 +347,30 @@ def open_managed_binary(
         if mode != "rb" or identity_locked
         else _FILE_SHARE_READ | _FILE_SHARE_DELETE
     )
-    handle = _verified_windows_handle(candidate, root, desired_access, disposition, share_mode)
+    created = disposition == _CREATE_NEW
+    if disposition == _OPEN_ALWAYS:
+        try:
+            handle = _verified_windows_handle(
+                candidate, root, desired_access, _OPEN_EXISTING, share_mode
+            )
+            created = False
+        except FileNotFoundError:
+            handle = _verified_windows_handle(
+                candidate, root, desired_access, _CREATE_NEW, share_mode
+            )
+            created = True
+    else:
+        handle = _verified_windows_handle(candidate, root, desired_access, disposition, share_mode)
     try:
         if mode == "wb":
             _truncate_handle(handle)
         descriptor = msvcrt.open_osfhandle(handle, descriptor_flags | os.O_BINARY)
     except BaseException:
+        if created:
+            try:
+                _mark_handle_for_delete(handle)
+            except OSError:
+                pass
         _close_handle(handle)
         raise
     return io.open(descriptor, descriptor_mode, closefd=True)

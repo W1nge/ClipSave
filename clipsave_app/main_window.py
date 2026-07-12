@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QStackedLayout,
     QStackedWidget,
     QSystemTrayIcon,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -155,6 +157,7 @@ class MainWindow(QMainWindow):
         self._interactive_resize_active = False
         self._native_resize_frame_enabled = False
         self._native_resize_frame_hwnd: int | None = None
+        self._initial_position_constrained = False
         self.global_hotkey_registered: bool | None = None
         self.dark_theme = self._desired_dark_theme()
         app = QApplication.instance()
@@ -223,6 +226,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: apply_windows_acrylic(self, dark))
 
     def build_ui(self) -> None:
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(220)
+        self.search_timer.timeout.connect(self.refresh_items)
         root = QWidget()
         root.setObjectName("AppRoot")
         self.setCentralWidget(root)
@@ -334,6 +341,7 @@ class MainWindow(QMainWindow):
         self.table.item_selected.connect(self.select_item)
         self.table.selection_cleared.connect(self.clear_item_selection)
         self.table.item_activated.connect(self.activate_item)
+        self.table.favorite_requested.connect(self.set_favorite)
         self.table_page = QWidget()
         table_page_layout = QVBoxLayout(self.table_page)
         table_page_layout.setContentsMargins(0, 44, 0, 0)
@@ -374,10 +382,6 @@ class MainWindow(QMainWindow):
         content_row.addWidget(self.detail)
         middle_layout.addLayout(content_row, 1)
 
-        self.search_timer = QTimer(self)
-        self.search_timer.setSingleShot(True)
-        self.search_timer.setInterval(220)
-        self.search_timer.timeout.connect(self.refresh_items)
         self.set_view_mode(self.settings.get("view_mode", "grid"))
         self.sidebar.set_collapsed(bool(self.settings.get("sidebar_collapsed", False)), animate=False)
         self._create_resize_handles(root)
@@ -536,7 +540,6 @@ class MainWindow(QMainWindow):
             return
         self._interactive_resize_active = False
         self.grid.set_layout_updates_suspended(False)
-        QTimer.singleShot(0, self._constrain_to_available_screen)
 
     def _begin_sidebar_animation(self) -> None:
         self.grid.set_layout_updates_suspended(True)
@@ -569,8 +572,22 @@ class MainWindow(QMainWindow):
             QShortcut(QKeySequence("Ctrl+B"), self, activated=self.sidebar.toggle_collapsed),
             QShortcut(QKeySequence("Ctrl+I"), self, activated=self.toggle_detail),
             QShortcut(QKeySequence("Delete"), self, activated=lambda: self.current_item_id and self.delete_item(self.current_item_id)),
-            QShortcut(QKeySequence("Ctrl+C"), self, activated=lambda: self.current_item_id and self.copy_item(self.current_item_id)),
+            QShortcut(QKeySequence("Ctrl+C"), self, activated=self._copy_focused_selection_or_item),
         ]
+
+    def _copy_focused_selection_or_item(self) -> None:
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QTextEdit)):
+            if (isinstance(focused, QLineEdit) and focused.hasSelectedText()) or (
+                isinstance(focused, QTextEdit) and focused.textCursor().hasSelection()
+            ):
+                focused.copy()
+                return
+        if isinstance(focused, QLabel) and focused.hasSelectedText():
+            QApplication.clipboard().setText(focused.selectedText())
+            return
+        if self.current_item_id:
+            self.copy_item(self.current_item_id)
 
     def _set_interactions_enabled(self, enabled: bool) -> None:
         self.centralWidget().setEnabled(enabled)
@@ -723,7 +740,6 @@ class MainWindow(QMainWindow):
         else:
             self.detail.setVisible(True)
             self.detail_button.setToolTip("收起详情")
-            QTimer.singleShot(0, self._constrain_to_available_screen)
             if self.current_item_id:
                 self.update_detail(self.current_item_id)
 
@@ -1770,7 +1786,9 @@ class MainWindow(QMainWindow):
         self._ensure_native_resize_frame()
         super().showEvent(event)
         self.grid.set_preview_loading_enabled(self.view_stack.currentWidget() is self.grid)
-        QTimer.singleShot(0, self._constrain_to_available_screen)
+        if not self._initial_position_constrained:
+            self._initial_position_constrained = True
+            QTimer.singleShot(0, self._constrain_to_available_screen)
 
     def _constrain_to_available_screen(self) -> None:
         if self.isMaximized() or self.isFullScreen():
@@ -1805,8 +1823,10 @@ class MainWindow(QMainWindow):
 
     def show_error_status(self, text: str) -> None:
         self._status_generation = getattr(self, "_status_generation", 0) + 1
+        generation = self._status_generation
         message = f"ClipSave 操作失败：{text[:160]}"
         self.capture_status.setToolTip(message)
+        QTimer.singleShot(5000, lambda: self._restore_capture_tooltip(generation))
         if hasattr(self, "tray") and self.tray.isVisible():
             self.tray.showMessage("ClipSave", message, QSystemTrayIcon.MessageIcon.Warning, 5000)
 

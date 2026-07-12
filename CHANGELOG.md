@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1 - 2026-07-13
+
+- Fixed AI requests failing before slower local or remote model backends could return their first response byte.
+- Preserved cross-monitor and partially off-screen window placement after moving, resizing, and opening details.
+- Restored precision-touchpad scrolling by accumulating fractional wheel deltas.
+- Added clipboard contention retries, safer persistence shutdown, and worker-side image deduplication state.
+- Escaped SQLite search wildcards and made image metadata indexing use one stable file handle.
+- Added acknowledged single-instance wake-up messages and moved the global hotkey ID into the valid application range.
+- Kept settings memory aligned with atomically published files after durability-sync failures.
+- Added list-view favorite controls, selected-detail text copying, transient error tooltips, and high-DPI rendering fixes.
+- Hardened maintenance manifests and Windows managed-file creation against temporary files, cross-library cleanup, and empty-file residue.
+- Expanded the regression suite to 368 tests and validated the frozen Windows build with real HWND and startup smoke probes.
+
 ## 0.3.0 - 2026-07-12
 
 - Fixed clipboard retry, duplicate-image cleanup, text fidelity, and resource-limit bugs.

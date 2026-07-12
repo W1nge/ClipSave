@@ -148,6 +148,14 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertEqual([call.args for call in suspended.call_args_list], [(True,), (False,)])
 
+    def test_move_resize_and_detail_toggle_do_not_force_window_back_on_screen(self):
+        with patch.object(self.window, "_constrain_to_available_screen") as constrain:
+            self.window._begin_interactive_resize()
+            self.window._end_interactive_resize()
+            self.window.toggle_detail()
+
+        constrain.assert_not_called()
+
     def test_sidebar_animation_suspends_grid_and_table_repaints(self):
         with patch.object(self.window.grid, "set_layout_updates_suspended") as grid, patch.object(
             self.window.table, "setUpdatesEnabled"
@@ -322,6 +330,24 @@ class MainWindowTests(unittest.TestCase):
         self.window._restore_capture_tooltip(old_generation)
         self.assertEqual(self.window.capture_status.toolTip(), error_tooltip)
         self.assertIn("backup unavailable", error_tooltip)
+
+    def test_copy_shortcut_preserves_selected_detail_text(self):
+        self.window.detail.ocr_text.setText("selected OCR text")
+        self.window.detail.ocr_text.setSelection(0, 8)
+        self.window.detail.ocr_text.setFocus()
+        with patch.object(self.window, "copy_item") as copy_item, patch.object(
+            QApplication.clipboard(), "setText"
+        ) as set_text:
+            self.window._copy_focused_selection_or_item()
+
+        set_text.assert_called_once_with("selected")
+        copy_item.assert_not_called()
+
+    def test_error_tooltip_schedules_restore(self):
+        with patch("clipsave_app.main_window.QTimer.singleShot") as single_shot:
+            self.window.show_error_status("temporary failure")
+
+        self.assertEqual(single_shot.call_args.args[0], 5000)
 
     def test_favorite_mutation_preserves_semantic_result_order(self):
         item_id = self.window.current_items[0]["id"]

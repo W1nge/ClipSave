@@ -23,6 +23,8 @@ from .storage import ensure_storage_directories, migrate_legacy_layout
 
 
 SHOW_MESSAGE = b"show\n"
+SHOW_ACK = b"ok\n"
+GLOBAL_HOTKEY_ID = 0x051A
 
 
 def _configure_windows_dpi_awareness() -> bool:
@@ -229,7 +231,7 @@ class GlobalHotkeyFilter(QAbstractNativeEventFilter):
         if os.name == "nt" and event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
             try:
                 msg = wintypes.MSG.from_address(int(message))
-                if msg.message == 0x0312 and msg.wParam == 0xC51A:
+                if msg.message == 0x0312 and msg.wParam == GLOBAL_HOTKEY_ID:
                     self.callback()
                     return True, 0
             except (TypeError, ValueError):
@@ -297,8 +299,10 @@ class SingleInstance:
         written = socket.write(SHOW_MESSAGE)
         socket.flush()
         delivered = written == len(SHOW_MESSAGE) and socket.waitForBytesWritten(300)
+        acknowledged = delivered and socket.waitForReadyRead(500) and bytes(socket.readAll()) == SHOW_ACK
         socket.disconnectFromServer()
-        return delivered
+        socket.waitForDisconnected(300)
+        return acknowledged
 
     @staticmethod
     def _configure_server(server: QLocalServer) -> None:
@@ -355,6 +359,8 @@ class SingleInstance:
             if len(buffer) == len(SHOW_MESSAGE):
                 if _is_show_message(bytes(buffer)):
                     callback()
+                    connection.write(SHOW_ACK)
+                    connection.flush()
                 self._close_connection(connection)
 
         connection.readyRead.connect(ready_read)
@@ -513,7 +519,7 @@ def main() -> int:
     if os.name == "nt":
         registered = bool(
             _windows_hotkey_api().RegisterHotKey(
-                None, 0xC51A, 0x0002 | 0x0001, ord("V")
+                None, GLOBAL_HOTKEY_ID, 0x0002 | 0x0001, ord("V")
             )
         )
     window.global_hotkey_registered = registered
@@ -594,6 +600,6 @@ def main() -> int:
             pass
         sys.excepthook = original_excepthook
     if registered:
-        _windows_hotkey_api().UnregisterHotKey(None, 0xC51A)
+        _windows_hotkey_api().UnregisterHotKey(None, GLOBAL_HOTKEY_ID)
     single.close()
     return exit_code

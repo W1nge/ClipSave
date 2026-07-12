@@ -47,6 +47,7 @@ class _LocalConnection:
         self.buffer = b""
         self.disconnected_called = False
         self.delete_later_called = False
+        self.written = b""
 
     def bytesAvailable(self):
         return len(self.buffer)
@@ -58,6 +59,13 @@ class _LocalConnection:
 
     def disconnectFromServer(self):
         self.disconnected_called = True
+
+    def write(self, payload):
+        self.written += bytes(payload)
+        return len(payload)
+
+    def flush(self):
+        return True
 
     def deleteLater(self):
         self.delete_later_called = True
@@ -111,8 +119,8 @@ class AppTests(unittest.TestCase):
         ]):
             self.assertEqual(constants._configured_local_root(), Path("C:/override"))
 
-    def test_release_version_is_0_3_0(self):
-        self.assertEqual(constants.APP_VERSION, "0.3.0")
+    def test_release_version_is_0_3_1(self):
+        self.assertEqual(constants.APP_VERSION, "0.3.1")
 
     @unittest.skipUnless(os.name == "nt", "Windows SID lookup is Windows-only")
     def test_windows_user_sid_uses_real_process_token(self):
@@ -231,6 +239,31 @@ class AppTests(unittest.TestCase):
         self.assertFalse(notified)
         remove_server.assert_not_called()
 
+    def test_notification_requires_server_acknowledgement(self):
+        socket = MagicMock()
+        socket.waitForConnected.return_value = True
+        socket.write.return_value = len(app.SHOW_MESSAGE)
+        socket.waitForBytesWritten.return_value = True
+        socket.waitForReadyRead.return_value = True
+        socket.readAll.return_value = app.SHOW_ACK
+        with patch("clipsave_app.app.QLocalSocket", return_value=socket):
+            self.assertTrue(app.SingleInstance("test.endpoint").notify_existing())
+
+        socket.waitForDisconnected.assert_called_once_with(300)
+
+    def test_notification_without_ack_is_not_reported_as_delivered(self):
+        socket = MagicMock()
+        socket.waitForConnected.return_value = True
+        socket.write.return_value = len(app.SHOW_MESSAGE)
+        socket.waitForBytesWritten.return_value = True
+        socket.waitForReadyRead.return_value = False
+        with patch("clipsave_app.app.QLocalSocket", return_value=socket):
+            self.assertFalse(app.SingleInstance("test.endpoint").notify_existing())
+
+    def test_global_hotkey_id_stays_in_application_range(self):
+        self.assertGreaterEqual(app.GLOBAL_HOTKEY_ID, 0)
+        self.assertLessEqual(app.GLOBAL_HOTKEY_ID, 0xBFFF)
+
     def test_closed_and_rejected_connections_are_scheduled_for_deletion(self):
         instance = app.SingleInstance("test.endpoint")
         accepted = MagicMock()
@@ -292,6 +325,7 @@ class AppTests(unittest.TestCase):
         connection.readyRead.callback()
 
         self.assertEqual(callbacks, [True])
+        self.assertEqual(connection.written, app.SHOW_ACK)
         self.assertTrue(connection.disconnected_called)
         self.assertTrue(connection.delete_later_called)
         self.assertNotIn(connection, single._connections)
