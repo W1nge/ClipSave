@@ -849,18 +849,23 @@ class ClipboardService(QObject):
         self._next_task_token += 1
         with self._persistence_state_lock:
             self._idle_event.clear()
+            if sequence is None:
+                self._pending_without_sequence = True
+            else:
+                self._pending_sequences.add(sequence)
+            self._pending_bytes += estimated_bytes
             try:
                 self._tasks.put_nowait(task)
             except queue.Full:
+                self._pending_bytes = max(0, self._pending_bytes - estimated_bytes)
+                if sequence is None:
+                    self._pending_without_sequence = False
+                else:
+                    self._pending_sequences.discard(sequence)
                 if self._tasks.unfinished_tasks == 0:
                     self._idle_event.set()
                 self.failed.emit("剪贴板保存队列已满；如果内容仍在剪贴板中，ClipSave 会稍后重试。")
                 return
-        if sequence is None:
-            self._pending_without_sequence = True
-        else:
-            self._pending_sequences.add(sequence)
-        self._pending_bytes += estimated_bytes
 
     def _persistence_loop(self) -> None:
         while True:
@@ -887,15 +892,18 @@ class ClipboardService(QObject):
             finally:
                 with self._persistence_state_lock:
                     self._tasks.task_done()
-                    if self._tasks.unfinished_tasks == 0:
+                    if self._tasks.unfinished_tasks == 0 and self._pending_bytes == 0:
                         self._idle_event.set()
 
     def _release_pending(self, task: _ClipboardTask) -> None:
-        self._pending_bytes = max(0, self._pending_bytes - task.estimated_bytes)
-        if task.sequence is None:
-            self._pending_without_sequence = False
-        else:
-            self._pending_sequences.discard(task.sequence)
+        with self._persistence_state_lock:
+            self._pending_bytes = max(0, self._pending_bytes - task.estimated_bytes)
+            if task.sequence is None:
+                self._pending_without_sequence = False
+            else:
+                self._pending_sequences.discard(task.sequence)
+            if self._tasks.unfinished_tasks == 0 and self._pending_bytes == 0:
+                self._idle_event.set()
 
     def _finish_task(self, task: _ClipboardTask, result) -> None:
         self._release_pending(task)

@@ -71,7 +71,7 @@ class _SQLiteLeafLock:
         writable: bool,
         replaceable: bool,
     ):
-        self.path = Path(path)
+        self.path = storage.normalized_absolute_path(path)
         self.managed_root = Path(managed_root)
         self.handle = handle
         self.identity = identity
@@ -318,7 +318,7 @@ class LibraryDatabase:
     }
 
     def __init__(self, path: Path = DATABASE_PATH):
-        self.path = Path(path)
+        self.path = storage.normalized_absolute_path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._backup_lock = threading.Lock()
@@ -1644,7 +1644,7 @@ class LibraryDatabase:
         copied_size: int | None = None
         identity_handle = None
         try:
-            path = path.resolve()
+            path = storage.normalized_absolute_path(path.resolve())
             if not path.exists() or not path.is_file():
                 if strict:
                     raise FileNotFoundError(f"Import file does not exist: {path}")
@@ -1738,7 +1738,7 @@ class LibraryDatabase:
                         if strict:
                             raise RuntimeError("Imported copy hash did not match the source")
                         return False
-                path = Path(os.path.abspath(target))
+                path = storage.normalized_absolute_path(target)
 
             identity_root = (
                 MARKDOWN_DIR if kind == "markdown" else PICTURE_DIR

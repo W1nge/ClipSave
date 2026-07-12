@@ -141,7 +141,7 @@ class LibraryDatabaseTests(unittest.TestCase):
 
         def flaky_open(path, mode="xb", managed_root=None, **kwargs):
             nonlocal source_opens
-            if Path(path) == source and mode == "rb":
+            if LibraryDatabase._path_key(path) == LibraryDatabase._path_key(source) and mode == "rb":
                 source_opens += 1
                 if source_opens == 2:
                     return FailingReader(source.read_bytes())

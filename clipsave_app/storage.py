@@ -145,11 +145,11 @@ def _final_path_from_handle(handle: int) -> str:
     return ntpath.normcase(ntpath.abspath(path))
 
 
-def _normalized_requested_path(path: Path) -> str:
-    """Normalize an existing Windows path without resolving reparse points."""
+def _long_requested_path(path: Path) -> str:
+    """Expand short names in an existing path without resolving reparse points."""
     requested = ntpath.abspath(str(path))
     if os.name != "nt":
-        return ntpath.normcase(requested)
+        return requested
     get_long_path = _kernel32_function(
         "GetLongPathNameW",
         [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD],
@@ -162,7 +162,28 @@ def _normalized_requested_path(path: Path) -> str:
     written = get_long_path(requested, buffer, len(buffer))
     if not written or written >= len(buffer):
         raise ctypes.WinError(ctypes.get_last_error())
-    return ntpath.normcase(ntpath.abspath(buffer.value))
+    return ntpath.abspath(buffer.value)
+
+
+def _normalized_requested_path(path: Path) -> str:
+    return ntpath.normcase(_long_requested_path(path))
+
+
+def normalized_absolute_path(path: Path) -> Path:
+    """Expand Windows short names while preserving a non-existent leaf suffix."""
+    candidate = Path(os.path.abspath(path))
+    if os.name != "nt":
+        return candidate
+    existing = candidate
+    suffix: list[str] = []
+    while not existing.exists():
+        parent = existing.parent
+        if parent == existing:
+            return candidate
+        suffix.append(existing.name)
+        existing = parent
+    normalized = Path(_long_requested_path(existing))
+    return normalized.joinpath(*reversed(suffix))
 
 
 def _file_information(handle: int) -> _ByHandleFileInformation:
@@ -240,8 +261,8 @@ def _verified_windows_handle(
     disposition: int,
     share_mode: int = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
 ) -> int:
-    root = Path(os.path.abspath(managed_root))
-    candidate = Path(os.path.abspath(path))
+    root = normalized_absolute_path(managed_root)
+    candidate = normalized_absolute_path(path)
     try:
         candidate.relative_to(root)
     except ValueError as exc:
@@ -340,8 +361,8 @@ def open_managed_binary(
 @contextmanager
 def hold_managed_directory(path: Path, managed_root: Path | None = None):
     """Hold a verified directory identity so it cannot be replaced on Windows."""
-    candidate = Path(os.path.abspath(path))
-    root = Path(os.path.abspath(managed_root or candidate))
+    candidate = normalized_absolute_path(path)
+    root = normalized_absolute_path(managed_root or candidate)
     validate_managed_directory(candidate, root)
     if os.name != "nt":
         yield candidate
@@ -557,8 +578,8 @@ def _is_link_or_junction(path: Path) -> bool:
 
 
 def path_has_reparse_ancestor(path: Path, stop_at: Path | None = None) -> bool:
-    candidate = Path(os.path.abspath(path))
-    stop = Path(os.path.abspath(stop_at)) if stop_at is not None else None
+    candidate = normalized_absolute_path(path)
+    stop = normalized_absolute_path(stop_at) if stop_at is not None else None
     while True:
         if candidate.exists() and _is_link_or_junction(candidate):
             return True
@@ -889,8 +910,8 @@ def ensure_storage_directories() -> None:
 
 def is_under_local_store(path: Path) -> bool:
     try:
-        root = Path(os.path.abspath(LIBRARY_DIR))
-        candidate = Path(os.path.abspath(path))
+        root = normalized_absolute_path(LIBRARY_DIR)
+        candidate = normalized_absolute_path(path)
         relative = candidate.relative_to(root)
         current = root
         if _is_link_or_junction(current):
@@ -906,8 +927,8 @@ def is_under_local_store(path: Path) -> bool:
 
 
 def validate_managed_write_path(path: Path, managed_root: Path = LIBRARY_DIR) -> Path:
-    candidate = Path(os.path.abspath(path))
-    root = Path(os.path.abspath(managed_root))
+    candidate = normalized_absolute_path(path)
+    root = normalized_absolute_path(managed_root)
     try:
         candidate.parent.relative_to(root)
         candidate.parent.resolve(strict=False).relative_to(root.resolve(strict=False))
@@ -927,8 +948,8 @@ def validate_managed_write_path(path: Path, managed_root: Path = LIBRARY_DIR) ->
 
 
 def validate_managed_directory(path: Path, managed_root: Path) -> Path:
-    candidate = Path(os.path.abspath(path))
-    root = Path(os.path.abspath(managed_root))
+    candidate = normalized_absolute_path(path)
+    root = normalized_absolute_path(managed_root)
     try:
         candidate.relative_to(root)
         candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
