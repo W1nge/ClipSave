@@ -20,6 +20,7 @@ from .database import LibraryDatabase
 from .main_window import MainWindow
 from .settings import Settings
 from .storage import ensure_storage_directories, migrate_legacy_layout
+from .startup import set_start_with_windows
 
 
 SHOW_MESSAGE = b"show\n"
@@ -499,6 +500,12 @@ def main() -> int:
         QMessageBox.critical(None, "ClipSave 无法启动", str(exc))
         return 1
     settings = Settings()
+    startup_error = None
+    if smoke_profile_path is None and settings.get("start_with_windows", False):
+        try:
+            set_start_with_windows(True)
+        except OSError as exc:
+            startup_error = str(exc)
     window = MainWindow(
         database,
         settings,
@@ -523,6 +530,8 @@ def main() -> int:
             )
         )
     window.global_hotkey_registered = registered
+    if startup_error:
+        window.show_error_status(f"开机自启动设置无法更新：{startup_error}")
     if os.name == "nt" and not registered:
         window.show_error_status("全局快捷键 Ctrl+Alt+V 注册失败，可能已被其他软件占用")
 

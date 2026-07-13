@@ -114,6 +114,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(dialog.objectName(), "FluentDialog")
         self.assertEqual(dialog.layout().contentsMargins().left(), 1)
         self.assertEqual(dialog.import_button.text(), "导入文件")
+        self.assertFalse(dialog.start_with_windows.isChecked())
         self.assertTrue(dialog.follow_system_theme.isChecked())
         self.assertFalse(dialog.dark_theme_switch.isEnabled())
         import_requests = []
@@ -692,6 +693,37 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertIn("注册失败", dialog.hotkey_status.text())
         dialog.close()
+
+    def test_settings_applies_start_with_windows_change(self):
+        def enable_startup(dialog):
+            dialog.start_with_windows.setChecked(True)
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(
+            self.window, "_exec_transient_dialog", side_effect=enable_startup
+        ), patch("clipsave_app.main_window.set_start_with_windows") as set_startup:
+            self.window.open_settings()
+
+        self.assertTrue(self.settings.get("start_with_windows"))
+        set_startup.assert_called_once_with(True)
+
+    def test_start_with_windows_failure_restores_setting(self):
+        def enable_startup(dialog):
+            dialog.start_with_windows.setChecked(True)
+            dialog.accept()
+            return dialog.result()
+
+        with patch.object(
+            self.window, "_exec_transient_dialog", side_effect=enable_startup
+        ), patch(
+            "clipsave_app.main_window.set_start_with_windows",
+            side_effect=OSError("access denied"),
+        ), patch("clipsave_app.main_window.QMessageBox.warning") as warning:
+            self.window.open_settings()
+
+        self.assertFalse(self.settings.get("start_with_windows"))
+        warning.assert_called_once()
 
     def test_delete_defaults_to_no_and_keeps_item_when_recycle_fails(self):
         text_id = self.window.current_items[0]["id"]

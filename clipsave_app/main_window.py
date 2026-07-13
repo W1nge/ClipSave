@@ -45,6 +45,7 @@ from .services import (
 )
 from .ocr_service import WindowsOCRService
 from .settings import Settings
+from .startup import set_start_with_windows
 from .storage import is_under_local_store, recycle_managed_file
 from .styles import DARK_STYLESHEET, LIGHT_STYLESHEET
 from .windows_frame import (
@@ -1188,9 +1189,21 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         previous_follow_system = self.settings.get("follow_system_theme", True)
         previous_theme_mode = self.settings.get("theme_mode", "light")
+        previous_start_with_windows = self.settings.get("start_with_windows", False)
         dialog = SettingsDialog(self.settings, self)
         dialog.import_requested.connect(lambda: self.import_files(dialog))
         result = self._exec_transient_dialog(dialog)
+        if result:
+            start_with_windows = self.settings.get("start_with_windows", False)
+            if start_with_windows != previous_start_with_windows:
+                try:
+                    set_start_with_windows(start_with_windows)
+                except OSError as exc:
+                    try:
+                        self.settings.set("start_with_windows", previous_start_with_windows)
+                    except OSError:
+                        pass
+                    QMessageBox.warning(self, "开机自启动设置失败", str(exc))
         if result and (
             self.settings.get("follow_system_theme", True) != previous_follow_system
             or self.settings.get("theme_mode", "light") != previous_theme_mode

@@ -7,6 +7,11 @@ ClipSave is a local-first Windows clipboard library for text, images, and Markdo
 Keep the complete extracted directory together, then run `ClipSave\ClipSave.exe`.
 The adjacent `ClipSave\_internal` directory is required and must not be moved separately.
 
+For a normal per-user installation, run the `windows-x64-installer.exe` asset from the
+GitHub release. It installs under `%LOCALAPPDATA%\Programs\ClipSave`, creates a Start
+Menu shortcut, and does not require administrator permission. Uninstalling the program
+does not remove the separate `%LOCALAPPDATA%\ClipSave` data directory.
+
 ## Local data
 
 ClipSave stores captured files only under:

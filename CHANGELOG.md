@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 - 2026-07-13
+
+- Added an optional per-user Windows startup setting with rollback when the startup entry cannot be changed.
+- Added a no-admin Windows installer that preserves the separate local ClipSave data directory during uninstall.
+- Published an installer checksum alongside the portable ZIP and its checksum.
+
 ## 0.3.1 - 2026-07-13
 
 - Fixed AI requests failing before slower local or remote model backends could return their first response byte.

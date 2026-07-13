@@ -20,6 +20,7 @@ class SettingsTests(unittest.TestCase):
         settings = Settings(self.path)
 
         self.assertFalse(settings.get("monitoring"))
+        self.assertFalse(settings.get("start_with_windows"))
         self.assertTrue(settings.get("follow_system_theme"))
         self.assertEqual(settings.get("theme_mode"), "light")
 
@@ -107,6 +108,8 @@ class SettingsTests(unittest.TestCase):
             settings.set("unknown", "value")
         with self.assertRaises(TypeError):
             settings.set("follow_system_theme", "yes")
+        with self.assertRaises(TypeError):
+            settings.set("start_with_windows", 1)
 
     def test_current_sort_options_pass_validation(self):
         settings = Settings(self.path)

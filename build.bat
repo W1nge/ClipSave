@@ -151,9 +151,35 @@ if errorlevel 1 goto :failed
 powershell -NoProfile -Command "$hash=(Get-FileHash -LiteralPath '%releaseArchive%' -Algorithm SHA256).Hash; Set-Content -LiteralPath ('%releaseArchive%' + '.sha256') -Value ($hash + '  ' + [IO.Path]::GetFileName('%releaseArchive%')) -Encoding ASCII"
 if errorlevel 1 goto :failed
 
+set "installerPath=%releaseDir%\ClipSave-%appVersion%%archiveLabel%-windows-x64-installer.exe"
+set "installerCompiler="
+if defined INNO_SETUP_COMPILER if exist "%INNO_SETUP_COMPILER%" set "installerCompiler=%INNO_SETUP_COMPILER%"
+if not defined installerCompiler if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "installerCompiler=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+if not defined installerCompiler if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "installerCompiler=%ProgramFiles%\Inno Setup 6\ISCC.exe"
+if not defined installerCompiler if exist "%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe" set "installerCompiler=%ProgramFiles(x86)%\Inno Setup 7\ISCC.exe"
+if not defined installerCompiler if exist "%ProgramFiles%\Inno Setup 7\ISCC.exe" set "installerCompiler=%ProgramFiles%\Inno Setup 7\ISCC.exe"
+if not defined installerCompiler if "%CLIPSAVE_OFFICIAL_BUILD%"=="1" (
+  echo ERROR: Official releases require the Inno Setup compiler.
+  goto :missing_installer
+)
+if defined installerCompiler (
+  if defined archiveLabel (
+    "%installerCompiler%" /Qp /DMyAppVersion=%appVersion% /DMyBuildSuffix=%archiveLabel% "%~dp0installer.iss"
+  ) else (
+    "%installerCompiler%" /Qp /DMyAppVersion=%appVersion% "%~dp0installer.iss"
+  )
+  if errorlevel 1 goto :failed
+  if not exist "%installerPath%" goto :missing_installer
+  powershell -NoProfile -Command "$hash=(Get-FileHash -LiteralPath '%installerPath%' -Algorithm SHA256).Hash; Set-Content -LiteralPath ('%installerPath%' + '.sha256') -Value ($hash + '  ' + [IO.Path]::GetFileName('%installerPath%')) -Encoding ASCII"
+  if errorlevel 1 goto :failed
+) else (
+  echo WARNING: Inno Setup was not found; the portable ZIP was built without an installer.
+)
+
 echo.
 echo Built: %stagedExe%
 echo Release: %releaseArchive%
+if exist "%installerPath%" echo Installer: %installerPath%
 pause
 exit /b 0
 
@@ -185,6 +211,10 @@ set "exitCode=1"
 goto :report_failure
 
 :missing_output
+set "exitCode=1"
+goto :report_failure
+
+:missing_installer
 set "exitCode=1"
 goto :report_failure
 

@@ -22,7 +22,18 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn('set "buildLabel=UNOFFICIAL - local or unverified build"', script)
         self.assertIn('set "archiveLabel=-UNOFFICIAL"', script)
         self.assertIn("ClipSave-%appVersion%%archiveLabel%-windows-x64.zip", script)
+        self.assertIn(
+            "ClipSave-%appVersion%%archiveLabel%-windows-x64-installer.exe",
+            script,
+        )
         self.assertIn("Build channel %buildLabel%", script)
+
+    def test_installer_is_per_user_and_keeps_data_outside_program_directory(self):
+        installer = Path("installer.iss").read_text(encoding="ascii")
+        self.assertIn("PrivilegesRequired=lowest", installer)
+        self.assertIn("DefaultDirName={localappdata}\\Programs\\ClipSave", installer)
+        self.assertIn('Source: "build\\release\\ClipSave\\*"', installer)
+        self.assertNotIn("{localappdata}\\ClipSave", installer)
 
     def test_official_build_revalidates_source_before_release_metadata(self):
         script = Path("build.bat").read_text(encoding="ascii")

@@ -601,6 +601,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertEqual(dialog.layout().contentsMargins().left(), 1)
         self.assertTrue(dialog.property("settingsDialog"))
         self.assertTrue(dialog.follow_system_theme.isChecked())
+        self.assertFalse(dialog.start_with_windows.isChecked())
         self.assertFalse(dialog.dark_theme_switch.isEnabled())
         dialog.follow_system_theme.setChecked(False)
         self.assertTrue(dialog.dark_theme_switch.isEnabled())

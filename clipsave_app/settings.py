@@ -15,6 +15,7 @@ DEFAULTS = {
     "view_mode": "grid",
     "sort": "newest",
     "close_to_tray": True,
+    "start_with_windows": False,
     "follow_system_theme": True,
     "theme_mode": "light",
     "ai_base_url": "",
@@ -30,7 +31,13 @@ _STRING_LIMITS = {
     "ai_embedding_model": 512,
 }
 
-_BOOLEAN_KEYS = {"sidebar_collapsed", "monitoring", "close_to_tray", "follow_system_theme"}
+_BOOLEAN_KEYS = {
+    "sidebar_collapsed",
+    "monitoring",
+    "close_to_tray",
+    "start_with_windows",
+    "follow_system_theme",
+}
 _STRING_KEYS = {
     "ai_base_url",
     "ai_api_key",

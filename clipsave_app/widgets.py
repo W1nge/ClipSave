@@ -2055,7 +2055,7 @@ class SettingsDialog(QDialog):
         content.setObjectName("DialogContent")
         layout = QVBoxLayout(content)
         layout.setContentsMargins(24, 8, 24, 8)
-        layout.setSpacing(5)
+        layout.setSpacing(4)
         heading = QLabel("常规")
         heading.setObjectName("SectionTitle")
         layout.addWidget(heading)
@@ -2064,6 +2064,10 @@ class SettingsDialog(QDialog):
         self.close_to_tray.addItem("关闭窗口时退出", False)
         self.close_to_tray.setCurrentIndex(0 if settings.get("close_to_tray", True) else 1)
         layout.addWidget(self.close_to_tray)
+        self.start_with_windows = ToggleSwitch("开机时自动启动 ClipSave")
+        self.start_with_windows.setChecked(settings.get("start_with_windows", False))
+        self.start_with_windows.setToolTip("登录 Windows 后自动启动 ClipSave")
+        layout.addWidget(self.start_with_windows)
         self.follow_system_theme = ToggleSwitch("跟随 Windows 深浅色主题")
         self.follow_system_theme.setChecked(settings.get("follow_system_theme", True))
         layout.addWidget(self.follow_system_theme)
@@ -2145,6 +2149,7 @@ class SettingsDialog(QDialog):
     def accept(self) -> None:
         values = {
             "close_to_tray": self.close_to_tray.currentData(),
+            "start_with_windows": self.start_with_windows.isChecked(),
             "follow_system_theme": self.follow_system_theme.isChecked(),
             "theme_mode": "dark" if self.dark_theme_switch.isChecked() else "light",
             "ai_base_url": self.base_url.text().strip(),
