@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+## 0.3.3 - 2026-07-14
+
+- Added asynchronous, recoverable deletion for large managed files and indexed content.
+- Added bounded homepage pagination, independent sidebar scrolling, expandable tag entries,
+  responsive dialogs, and disabled detail controls when no item is selected.
+- Added embedding provider/model/dimension/revision metadata and filtered semantic search so
+  vectors from incompatible configurations are never compared.
+- Migrated database timestamps to UTC storage while keeping date navigation in local time.
+
 ## 0.3.2 - 2026-07-13
 
 - Added an optional per-user Windows startup setting with rollback when the startup entry cannot be changed.
@@ -25,7 +36,7 @@
 - Added atomic settings recovery, validated local storage roots, and hardened single-instance IPC.
 - Added SQLite schema migrations, locking, stable queries, path repair, and safer import deduplication.
 - Fixed stale UI selections, asynchronous result races, hidden preview work, and file-operation errors.
-- Expanded regression coverage from 8 to 69 tests and documented the full audit in `AUDIT.md`.
+- Expanded regression coverage from 8 to 69 tests and documented the full audit conclusions.
 - Added a dry-run orphan manifest and explicitly confirmed duplicate-file cleanup tool.
 - Moved clipboard image encoding, hashing and database persistence to a bounded background queue.
 - Replaced per-item grid and table widgets with Qt model/delegate views for large-library performance.

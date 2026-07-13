@@ -72,7 +72,7 @@ def _read_settings(path: Path) -> dict[str, Any] | None:
         if path.stat().st_size > MAX_SETTINGS_BYTES:
             return None
         return _validated_settings(json.loads(path.read_text(encoding="utf-8")))
-    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
 
 

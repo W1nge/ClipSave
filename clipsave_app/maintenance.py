@@ -23,14 +23,19 @@ MAX_MANIFEST_RECORDS = 200_000
 
 
 def _write_manifest_atomic(path: Path, report: dict) -> None:
+    records = report.get("orphans")
+    if not isinstance(records, list) or len(records) > MAX_MANIFEST_RECORDS:
+        raise ValueError("Maintenance manifest has too many records")
+    payload = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if len(payload) > MAX_MANIFEST_BYTES:
+        raise ValueError("Maintenance manifest exceeds the configured size limit")
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent
     )
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(report, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -82,7 +87,17 @@ def scan_orphans(
 
     orphan_records = []
     errors = []
+    truncated = False
     for path in iter_safe_files(library_dir):
+        if len(orphan_records) >= MAX_MANIFEST_RECORDS:
+            truncated = True
+            errors.append(
+                {
+                    "path": str(library_dir),
+                    "error": "Scan stopped at the maintenance manifest record limit",
+                }
+            )
+            break
         try:
             if path.is_symlink() or not path.is_file():
                 continue
@@ -112,6 +127,7 @@ def scan_orphans(
         "library_dir": str(library_dir.resolve()),
         "indexed_file_count": len(indexed),
         "orphan_file_count": len(orphan_records),
+        "truncated": truncated,
         "summary": {
             key: {"files": counts[key], "bytes": bytes_by_class[key]}
             for key in ("indexed_duplicate", "orphan_duplicate", "unindexed_unique")

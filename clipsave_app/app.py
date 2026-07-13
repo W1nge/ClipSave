@@ -11,7 +11,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QByteArray, QTimer
-from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtNetwork import QAbstractSocket, QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -501,9 +501,9 @@ def main() -> int:
         return 1
     settings = Settings()
     startup_error = None
-    if smoke_profile_path is None and settings.get("start_with_windows", False):
+    if smoke_profile_path is None:
         try:
-            set_start_with_windows(True)
+            set_start_with_windows(bool(settings.get("start_with_windows", False)))
         except OSError as exc:
             startup_error = str(exc)
     window = MainWindow(

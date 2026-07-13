@@ -92,6 +92,24 @@ class WindowsFrameTests(unittest.TestCase):
         self.assertEqual((handled, result), (True, 0))
         self.assertEqual((rect.left, rect.top, rect.right, rect.bottom), (10, 20, 810, 620))
 
+    def test_ncactivate_updates_state_without_redrawing_native_frame(self):
+        user32 = Mock()
+        user32.DefWindowProcW.return_value = 1
+
+        with patch.object(windows_frame, "is_windows_qt_platform", return_value=True), patch.object(
+            windows_frame, "_user32", return_value=user32
+        ):
+            handled, result = windows_frame.handle_ncactivate(123, 0)
+
+        self.assertEqual((handled, result), (True, 1))
+        user32.DefWindowProcW.assert_called_once_with(
+            123, windows_frame.WM_NCACTIVATE, 0, -1
+        )
+
+    def test_ncactivate_is_not_intercepted_off_windows(self):
+        with patch.object(windows_frame, "is_windows_qt_platform", return_value=False):
+            self.assertEqual(windows_frame.handle_ncactivate(123, 1), (False, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

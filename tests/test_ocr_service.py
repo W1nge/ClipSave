@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import threading
 from pathlib import Path
@@ -115,6 +116,23 @@ class WindowsOCRServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "too many pixels"):
                 await WindowsOCRService.recognize_async(Path("image.png"))
         winrt_types.assert_not_called()
+
+    async def test_ocr_timeout_cancels_pending_winrt_operation(self):
+        types, stream, bitmap = fake_winrt_types()
+
+        class SlowStorageFile:
+            @staticmethod
+            async def get_file_from_path_async(_path):
+                await asyncio.Event().wait()
+
+        slow_types = (types[0], types[1], types[2], SlowStorageFile)
+        with (
+            patch("clipsave_app.ocr_service.preflight_image_file", return_value=Snapshot()),
+            patch.object(WindowsOCRService, "_winrt_types", return_value=slow_types),
+            patch.object(WindowsOCRService, "OCR_TIMEOUT_SECONDS", 0.01),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                await WindowsOCRService.recognize_async(Path("image.png"))
 
 
 if __name__ == "__main__":

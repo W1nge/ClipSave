@@ -158,6 +158,30 @@ def preflight_image_file(
     )
 
 
+def require_snapshot_hash(
+    snapshot: FileSnapshot,
+    expected_sha256: str,
+    managed_root: Path = PICTURE_DIR,
+) -> None:
+    digest = hashlib.sha256()
+    with open_managed_binary(
+        snapshot.path, "rb", managed_root, identity_locked=True
+    ) as handle:
+        current = os.fstat(handle.fileno())
+        if (
+            current.st_size != snapshot.size_bytes
+            or current.st_mtime_ns != snapshot.modified_ns
+            or current.st_dev != snapshot.device
+            or current.st_ino != snapshot.inode
+        ):
+            raise RuntimeError("File changed before processing")
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    snapshot.require_current()
+    if digest.hexdigest() != expected_sha256:
+        raise RuntimeError("File content no longer matches the indexed item")
+
+
 @dataclass
 class TaskHandle:
     cancel_event: threading.Event
@@ -413,7 +437,11 @@ class ClipboardService(QObject):
     REGISTERED_IMAGE_FORMATS = {"PNG", "image/png"}
     CF_DIB = 8
     CF_UNICODETEXT = 13
+    CF_HDROP = 15
     CF_DIBV5 = 17
+    MAX_FILE_PATHS = 1024
+    MAX_FILE_PATH_CHARS = 32_767
+    DRAG_QUERY_FILE_COUNT = 0xFFFFFFFF
 
     captured = Signal(int)
     failed = Signal(str)
@@ -426,13 +454,14 @@ class ClipboardService(QObject):
         self.database = database
         self.timer = QTimer(self)
         self.timer.setInterval(self.POLL_INTERVAL_MS)
-        self.timer.timeout.connect(self.poll)
+        self.timer.timeout.connect(self._poll_if_monitoring)
         self.notifier = WindowsClipboardNotifier(self)
-        self.notifier.changed.connect(self.poll)
+        self.notifier.changed.connect(self._poll_if_monitoring)
+        self._monitoring_enabled = False
         self._clipboard_retry_attempt = 0
         self._clipboard_retry_timer = QTimer(self)
         self._clipboard_retry_timer.setSingleShot(True)
-        self._clipboard_retry_timer.timeout.connect(self.poll)
+        self._clipboard_retry_timer.timeout.connect(self._poll_if_monitoring)
         self.last_text = ""
         self.last_image_key = ""
         self.last_clipboard_sequence: int | None = None
@@ -462,7 +491,17 @@ class ClipboardService(QObject):
             return
         clipboard = QApplication.clipboard()
         mime = clipboard.mimeData()
-        if mime.hasImage():
+        file_paths = None
+        if mime.hasUrls():
+            try:
+                file_paths = self._snapshot_clipboard_file_paths()
+            except _ClipboardBusy:
+                file_paths = None
+            except ValueError as exc:
+                self.failed.emit(str(exc))
+        if file_paths is not None:
+            self.last_text = file_paths
+        elif mime.hasImage():
             try:
                 image = self._snapshot_clipboard_image(clipboard)
                 self.last_image_key = self.image_key(image) if not image.isNull() else ""
@@ -482,6 +521,7 @@ class ClipboardService(QObject):
         self._start_monitoring()
 
     def _start_monitoring(self) -> None:
+        self._monitoring_enabled = True
         notifier_window = self.parent()
         notifier_active = self.notifier.start(notifier_window)
         self.timer.setInterval(self.EVENT_FALLBACK_INTERVAL_MS if notifier_active else self.POLL_INTERVAL_MS)
@@ -489,12 +529,19 @@ class ClipboardService(QObject):
         self.state_changed.emit(True)
 
     def stop(self) -> None:
+        self._monitoring_enabled = False
+        self._clipboard_retry_timer.stop()
+        self._clipboard_retry_attempt = 0
         self.timer.stop()
         self.notifier.stop()
         self.state_changed.emit(False)
 
     def toggle(self) -> None:
         self.stop() if self.timer.isActive() else self.start()
+
+    def _poll_if_monitoring(self) -> None:
+        if self._monitoring_enabled and self._accepting_tasks:
+            self.poll()
 
     @staticmethod
     def _validate_image(image: QImage) -> None:
@@ -562,6 +609,19 @@ class ClipboardService(QObject):
         kernel32.SetLastError.argtypes = [wintypes.DWORD]
         kernel32.SetLastError.restype = None
         return user32, kernel32
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _windows_shell_api():
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.DragQueryFileW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.UINT,
+            wintypes.LPWSTR,
+            wintypes.UINT,
+        ]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        return shell32
 
     @staticmethod
     def _native_clipboard_format_size(format_id: int) -> int | None:
@@ -653,7 +713,12 @@ class ClipboardService(QObject):
             if not user32.OpenClipboard(None):
                 raise _ClipboardBusy("Clipboard is temporarily busy")
             try:
-                registered = ClipboardService._registered_image_descriptors_locked(user32, kernel32)
+                errors: list[ValueError] = []
+                try:
+                    registered = ClipboardService._registered_image_descriptors_locked(user32, kernel32)
+                except ValueError as exc:
+                    registered = []
+                    errors.append(exc)
                 dibs = []
                 for format_id, name in (
                     (ClipboardService.CF_DIBV5, "DIBV5"),
@@ -661,25 +726,36 @@ class ClipboardService(QObject):
                 ):
                     if not user32.IsClipboardFormatAvailable(format_id):
                         continue
-                    handle = user32.GetClipboardData(format_id)
-                    if not handle:
-                        raise ValueError("Unable to inspect clipboard DIB data")
-                    size = int(kernel32.GlobalSize(handle))
-                    if size <= 0:
-                        raise ValueError("Invalid clipboard DIB data")
-                    if size > MAX_CLIPBOARD_IMAGE_BYTES:
-                        raise ValueError("Clipboard image payload is too large")
-                    dibs.append((name, handle, size))
+                    try:
+                        handle = user32.GetClipboardData(format_id)
+                        if not handle:
+                            raise ValueError("Unable to inspect clipboard DIB data")
+                        size = int(kernel32.GlobalSize(handle))
+                        if size <= 0:
+                            raise ValueError("Invalid clipboard DIB data")
+                        if size > MAX_CLIPBOARD_IMAGE_BYTES:
+                            raise ValueError("Clipboard image payload is too large")
+                        dibs.append((name, handle, size))
+                    except ValueError as exc:
+                        errors.append(exc)
                 candidates = registered + dibs
-                if not candidates:
-                    return None
-                name, handle, size = candidates[0]
-                payload = ClipboardService._copy_clipboard_payload_locked(kernel32, handle, size)
-                if name in ClipboardService.REGISTERED_IMAGE_FORMATS:
-                    ClipboardService._validate_registered_image_header(name, size, payload[:32])
-                else:
-                    ClipboardService._dib_as_bmp(name, payload)
-                return name, payload
+                for name, handle, size in candidates:
+                    try:
+                        payload = ClipboardService._copy_clipboard_payload_locked(
+                            kernel32, handle, size
+                        )
+                        if name in ClipboardService.REGISTERED_IMAGE_FORMATS:
+                            ClipboardService._validate_registered_image_header(
+                                name, size, payload[:32]
+                            )
+                        else:
+                            ClipboardService._dib_as_bmp(name, payload)
+                        return name, payload
+                    except ValueError as exc:
+                        errors.append(exc)
+                if errors:
+                    raise errors[-1]
+                return None
             finally:
                 user32.CloseClipboard()
         except ValueError:
@@ -723,6 +799,63 @@ class ClipboardService(QObject):
         except ValueError:
             raise
         except (AttributeError, OSError, TypeError, UnicodeDecodeError):
+            return None
+
+    @staticmethod
+    def _native_clipboard_file_paths_snapshot() -> tuple[str, ...] | None:
+        if os.name != "nt":
+            return None
+        try:
+            user32, _kernel32 = ClipboardService._windows_clipboard_apis()
+            shell32 = ClipboardService._windows_shell_api()
+            if not user32.OpenClipboard(None):
+                raise _ClipboardBusy("Clipboard is temporarily busy")
+            try:
+                if not user32.IsClipboardFormatAvailable(ClipboardService.CF_HDROP):
+                    return None
+                drop_handle = user32.GetClipboardData(ClipboardService.CF_HDROP)
+                if not drop_handle:
+                    raise ValueError("Unable to inspect clipboard file paths")
+                count = int(
+                    shell32.DragQueryFileW(
+                        drop_handle,
+                        ClipboardService.DRAG_QUERY_FILE_COUNT,
+                        None,
+                        0,
+                    )
+                )
+                if count <= 0:
+                    return ()
+                if count > ClipboardService.MAX_FILE_PATHS:
+                    raise ValueError("Clipboard file selection contains too many paths")
+                paths = []
+                total_bytes = 0
+                for index in range(count):
+                    length = int(shell32.DragQueryFileW(drop_handle, index, None, 0))
+                    if length <= 0 or length > ClipboardService.MAX_FILE_PATH_CHARS:
+                        raise ValueError("Invalid clipboard file path")
+                    buffer = ctypes.create_unicode_buffer(length + 1)
+                    copied = int(
+                        shell32.DragQueryFileW(
+                            drop_handle,
+                            index,
+                            buffer,
+                            len(buffer),
+                        )
+                    )
+                    if copied != length or not buffer.value:
+                        raise ValueError("Unable to inspect clipboard file path")
+                    path = buffer.value
+                    total_bytes += len(path.encode("utf-8")) + (1 if paths else 0)
+                    if total_bytes > MAX_CLIPBOARD_TEXT_BYTES:
+                        raise ValueError("Clipboard file path list is too large")
+                    paths.append(path)
+                return tuple(paths)
+            finally:
+                user32.CloseClipboard()
+        except ValueError:
+            raise
+        except (AttributeError, OSError, TypeError, UnicodeEncodeError):
             return None
 
     @staticmethod
@@ -823,6 +956,15 @@ class ClipboardService(QObject):
                 raise ValueError("Unable to safely inspect the clipboard text")
         if len(text.encode("utf-8")) > MAX_CLIPBOARD_TEXT_BYTES:
             raise ValueError("剪贴板文字过大，已拒绝读取。")
+        return text
+
+    def _snapshot_clipboard_file_paths(self) -> str | None:
+        paths = self._native_clipboard_file_paths_snapshot()
+        if paths is None:
+            return None
+        text = "\n".join(paths)
+        if len(text.encode("utf-8")) > MAX_CLIPBOARD_TEXT_BYTES:
+            raise ValueError("Clipboard file path list is too large")
         return text
 
     def _reject_oversized_native_clipboard(self, kind: str) -> list[tuple[str, bytes]] | None:
@@ -984,7 +1126,11 @@ class ClipboardService(QObject):
             remaining = deadline - time.monotonic()
             if app is not None and remaining >= 0.001:
                 event_budget_ms = min(self.PROCESS_EVENTS_MAX_MS, max(1, int(remaining * 1000)))
-                app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, event_budget_ms)
+                flags = (
+                    QEventLoop.ProcessEventsFlag.AllEvents
+                    | QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+                )
+                app.processEvents(flags, event_budget_ms)
             if self._idle_event.is_set():
                 return True
             remaining = deadline - time.monotonic()
@@ -1036,7 +1182,7 @@ class ClipboardService(QObject):
         self._accepting_tasks = True
         if restart_monitoring and not self.timer.isActive():
             self._start_monitoring()
-            QTimer.singleShot(0, self.poll)
+            QTimer.singleShot(0, self._poll_if_monitoring)
 
     def _read_stable_snapshot(self) -> tuple[str, QImage | str, int | None] | None:
         for _attempt in range(self.CLIPBOARD_READ_ATTEMPTS):
@@ -1045,15 +1191,37 @@ class ClipboardService(QObject):
                 return None
             clipboard = self._clipboard()
             mime = clipboard.mimeData()
-            if mime.hasImage():
-                snapshot: tuple[str, QImage | str] | None = (
-                    "image",
-                    self._snapshot_clipboard_image(clipboard),
+            snapshot: tuple[str, QImage | str] | None
+            candidate_errors: list[ValueError] = []
+            file_paths = None
+            if mime.hasUrls():
+                try:
+                    file_paths = self._snapshot_clipboard_file_paths()
+                except ValueError as exc:
+                    candidate_errors.append(exc)
+            if file_paths is not None:
+                snapshot = (
+                    "text",
+                    file_paths,
                 )
-            elif mime.hasText():
-                snapshot = ("text", self._snapshot_clipboard_text(clipboard))
+            elif mime.hasImage():
+                try:
+                    snapshot = (
+                        "image",
+                        self._snapshot_clipboard_image(clipboard),
+                    )
+                except ValueError as exc:
+                    candidate_errors.append(exc)
+                    snapshot = None
             else:
                 snapshot = None
+            if snapshot is None and mime.hasText():
+                try:
+                    snapshot = ("text", self._snapshot_clipboard_text(clipboard))
+                except ValueError as exc:
+                    candidate_errors.append(exc)
+            if snapshot is None and candidate_errors:
+                raise candidate_errors[-1]
             sequence_after = self.clipboard_sequence()
             if (
                 sequence_before is not None
@@ -1093,7 +1261,7 @@ class ClipboardService(QObject):
 
     def save_image(self, image: QImage) -> bool:
         self._validate_image(image)
-        now = dt.datetime.now()
+        now = dt.datetime.now().astimezone()
         folder = PICTURE_DIR / f"{now:%Y-%m-%d}"
         validate_managed_write_path(folder / "capture.tmp", PICTURE_DIR)
         folder.mkdir(parents=True, exist_ok=True)
@@ -1156,7 +1324,7 @@ class ClipboardService(QObject):
         byte_size = len(text.encode("utf-8"))
         if byte_size > MAX_CLIPBOARD_TEXT_BYTES:
             raise ValueError(f"剪贴板文字超过 {MAX_CLIPBOARD_TEXT_BYTES // (1024 * 1024)} MiB，已拒绝保存。")
-        now = dt.datetime.now()
+        now = dt.datetime.now().astimezone()
         item_id = self.database.add_text(text, now)
         if not item_id:
             return True
@@ -1189,11 +1357,34 @@ class ClipboardService(QObject):
 
 
 class AIService:
+    REQUEST_DEADLINE_SECONDS = 90.0
+    EMBEDDING_REVISION = 1
+
     def __init__(self, base_url: str, api_key: str, vision_model: str, embedding_model: str):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.vision_model = vision_model
         self.embedding_model = embedding_model
+
+    @property
+    def embedding_provider(self) -> str:
+        """Return a stable, non-secret identity for the configured endpoint."""
+        try:
+            parsed = urllib.parse.urlsplit(self.base_url)
+            scheme = parsed.scheme.lower()
+            host = (parsed.hostname or "").lower()
+            port = parsed.port
+            if port is None:
+                port = 443 if scheme == "https" else 80 if scheme == "http" else None
+            host_text = f"[{host}]" if ":" in host and not host.startswith("[") else host
+            netloc = host_text if port is None else f"{host_text}:{port}"
+            endpoint = urllib.parse.urlunsplit(
+                (scheme, netloc, parsed.path.rstrip("/"), "", "")
+            )
+        except (TypeError, ValueError):
+            endpoint = self.base_url
+        digest = hashlib.sha256(endpoint.encode("utf-8", errors="replace")).hexdigest()
+        return f"openai-compatible:{digest}"
 
     @property
     def configured(self) -> bool:
@@ -1221,7 +1412,7 @@ class AIService:
 
     def _post(self, path: str, payload: dict, cancel_event: threading.Event | None = None) -> dict:
         _raise_if_cancelled(cancel_event)
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + self.REQUEST_DEADLINE_SECONDS
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -1236,25 +1427,55 @@ class AIService:
             if remaining_timeout <= 0:
                 raise TimeoutError("AI service request timed out")
             with self._open_request(request, timeout=remaining_timeout) as response:
+                watcher_stop = threading.Event()
+                watcher = None
+                if cancel_event is not None:
+                    def close_on_cancel() -> None:
+                        while not watcher_stop.wait(0.02):
+                            if not cancel_event.is_set():
+                                continue
+                            close = getattr(response, "close", None)
+                            if callable(close):
+                                try:
+                                    close()
+                                except Exception:
+                                    pass
+                            return
+
+                    watcher = threading.Thread(
+                        target=close_on_cancel,
+                        name="ClipSaveAIRequestCancel",
+                        daemon=True,
+                    )
+                    watcher.start()
                 chunks: list[bytes] = []
                 remaining = MAX_AI_RESPONSE_BYTES + 1
                 read_chunk = getattr(response, "read1", response.read)
-                while remaining:
-                    _raise_if_cancelled(cancel_event)
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("AI service request timed out")
-                    chunk = read_chunk(min(64 * 1024, remaining))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    remaining -= len(chunk)
-                raw = b"".join(chunks)
-                if len(raw) > MAX_AI_RESPONSE_BYTES:
-                    raise RuntimeError("AI 服务响应过大，已停止读取。")
+                try:
+                    while remaining:
+                        _raise_if_cancelled(cancel_event)
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("AI service request timed out")
+                        chunk = read_chunk(min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    raw = b"".join(chunks)
+                    if len(raw) > MAX_AI_RESPONSE_BYTES:
+                        raise RuntimeError("AI 服务响应过大，已停止读取。")
+                finally:
+                    watcher_stop.set()
+                    if watcher is not None:
+                        watcher.join(0.2)
         except urllib.error.HTTPError as exc:
             detail = exc.read(301).decode("utf-8", errors="replace")
             raise RuntimeError(f"AI 服务返回 {exc.code}: {detail[:300]}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except OperationCancelled:
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise OperationCancelled("Operation cancelled") from exc
             raise RuntimeError("AI 服务连接超时或不可用。") from exc
         try:
             result = json.loads(raw.decode("utf-8"))
@@ -1301,6 +1522,8 @@ class AIService:
         self,
         source: Path | ImageFileSnapshot,
         cancel_event: threading.Event | None = None,
+        *,
+        expected_sha256: str | None = None,
     ) -> str:
         _raise_if_cancelled(cancel_event)
         snapshot = source if isinstance(source, ImageFileSnapshot) else preflight_image_file(source)
@@ -1315,6 +1538,13 @@ class AIService:
                 or current.st_ino != snapshot.inode
             ):
                 raise RuntimeError("Image changed before AI processing")
+            if expected_sha256 is not None:
+                digest = hashlib.sha256()
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+                if digest.hexdigest() != expected_sha256:
+                    raise RuntimeError("Image content no longer matches the indexed item")
+                handle.seek(0)
             with Image.open(handle) as image:
                 image.load()
                 if image.size != (snapshot.width, snapshot.height):

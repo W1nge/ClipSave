@@ -12,15 +12,31 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QByteArray, QEvent, QPoint, QPointF, QPropertyAnimation, QRect, QSize, QThread, Qt, QUrl
 from PySide6.QtGui import QColor, QEnterEvent, QImage, QPainter, QPixmap, QTextDocument, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFrame, QScrollArea, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFrame,
+    QProxyStyle,
+    QScrollArea,
+    QStyle,
+    QStyleOptionViewItem,
+    QTableWidget,
+    QTableWidgetItem,
+    QWidget,
+)
 
 import clipsave_app.widgets as widgets_module
 from clipsave_app.app import create_app_icon
+from clipsave_app.styles import DARK_STYLESHEET
 from clipsave_app.widgets import (
     AssetGrid,
     AssetTable,
     AutoHideScrollBar,
+    CopyToast,
+    DateDialog,
     DetailPanel,
+    FluentComboBox,
+    FluentMessageDialog,
     MarkdownDialog,
     MAX_RICH_MARKDOWN_BYTES,
     Sidebar,
@@ -69,6 +85,34 @@ class ThumbnailPixmapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_copy_toast_is_bottom_right_nonblocking_and_animates_out(self):
+        parent = QWidget()
+        parent.resize(900, 600)
+        parent.show()
+        toast = CopyToast(parent)
+        toast.reposition()
+
+        self.assertEqual(toast.pos(), QPoint(612, 522))
+        self.assertFalse(toast.isVisible())
+        self.assertTrue(
+            toast.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        )
+        self.assertEqual(toast.message_label.text(), "已复制到剪贴板")
+        self.assertEqual(toast._hide_timer.interval(), 2300)
+
+        toast.show_confirmation()
+        self.app.processEvents()
+        self.assertTrue(toast.isVisible())
+        self.assertTrue(toast._hide_timer.isActive())
+
+        toast._hide_timer.stop()
+        toast._motion.stop()
+        toast._fade.stop()
+        toast._opacity_effect.setOpacity(1.0)
+        toast._begin_hide()
+        self.assertTrue(wait_for(lambda: not toast.isVisible(), timeout=0.5))
+        parent.close()
 
     def setUp(self):
         _THUMBNAIL_CACHE.clear()
@@ -135,6 +179,14 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertEqual(scaled.pixelDelta(), QPoint(0, 9))
         self.assertEqual(scaled.angleDelta(), QPoint(0, 60))
 
+    def test_home_views_do_not_show_title_tooltips(self):
+        for view in (AssetGrid(), AssetTable()):
+            with self.subTest(view=type(view).__name__):
+                view.set_items(asset_records(1))
+                index = view.model().index(0, 0)
+                self.assertIsNone(index.data(Qt.ItemDataRole.ToolTipRole))
+                view.close()
+
     def test_touchpad_fractional_wheel_delta_accumulates_between_events(self):
         remainder = _WheelRemainder()
         event = QWheelEvent(
@@ -168,6 +220,68 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertTrue(scroll_bar.active)
         self.assertTrue(scroll_bar.hide_timer.isActive())
         scroll_bar.close()
+
+    def test_dark_combo_box_has_no_native_drop_down_edge(self):
+        previous_stylesheet = self.app.styleSheet()
+        previous_dark_theme = self.app.property("darkTheme")
+        combo = FluentComboBox()
+        try:
+            self.app.setProperty("darkTheme", True)
+            self.app.setStyleSheet(DARK_STYLESHEET)
+            combo.addItem("未分类")
+            combo.resize(220, 36)
+            combo.show()
+            self.app.processEvents()
+            image = QImage(combo.size(), QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.transparent)
+            combo.render(image)
+            right_strip = [
+                image.pixelColor(x, y).name()
+                for x in range(image.width() - 6, image.width() - 1)
+                for y in range(image.height())
+            ]
+            self.assertNotIn("#0e0e0e", right_strip)
+            self.assertGreater(
+                sum(color not in {"#292929", "#505050", "#202020"} for color in right_strip),
+                4,
+            )
+        finally:
+            combo.close()
+            self.app.setStyleSheet(previous_stylesheet)
+            self.app.setProperty("darkTheme", previous_dark_theme)
+
+    def test_fluent_message_dialog_uses_dark_surface_and_safe_delete_default(self):
+        previous_stylesheet = self.app.styleSheet()
+        previous_dark_theme = self.app.property("darkTheme")
+        dialog = FluentMessageDialog(
+            "删除标签",
+            "确定删除标签吗？\n\n剪贴板内容不会被删除。",
+            kind="question",
+            accept_text="删除",
+            cancel_text="取消",
+            destructive=True,
+            default_accept=False,
+        )
+        try:
+            self.app.setProperty("darkTheme", True)
+            self.app.setStyleSheet(DARK_STYLESHEET)
+            dialog.show()
+            self.app.processEvents()
+
+            self.assertTrue(dialog.windowFlags() & Qt.WindowType.FramelessWindowHint)
+            self.assertEqual(dialog.objectName(), "FluentDialog")
+            self.assertTrue(dialog.property("messageDialog"))
+            self.assertEqual(dialog.accept_button.objectName(), "Danger")
+            self.assertTrue(dialog.cancel_button.isDefault())
+            self.assertFalse(dialog.accept_button.isDefault())
+            image = QImage(dialog.size(), QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.transparent)
+            dialog.render(image)
+            self.assertEqual(image.pixelColor(240, 100).name(), "#202020")
+        finally:
+            dialog.close()
+            self.app.setStyleSheet(previous_stylesheet)
+            self.app.setProperty("darkTheme", previous_dark_theme)
 
     def test_grid_delegate_accepts_sqlite_rows_from_production_queries(self):
         connection = sqlite3.connect(":memory:")
@@ -294,6 +408,23 @@ class ThumbnailPixmapTests(unittest.TestCase):
             )
 
         cancel.assert_called_once_with()
+        grid.close()
+
+    def test_grid_exact_fit_width_keeps_the_last_column_on_the_first_row(self):
+        grid = AssetGrid()
+        grid.resize(1040, 400)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(20))
+        grid.show()
+        self.app.processEvents()
+        grid.resize(grid.width() + (-grid.viewport().width() % 4), grid.height())
+        self.app.processEvents()
+
+        self.assertEqual(grid.columns, 4)
+        self.assertEqual(grid.viewport().width() % grid.columns, 0)
+        first_row_top = grid.visualRect(grid.model().index(0, 0)).top()
+        self.assertEqual(grid.visualRect(grid.model().index(3, 0)).top(), first_row_top)
+        self.assertGreater(grid.visualRect(grid.model().index(4, 0)).top(), first_row_top)
         grid.close()
 
     def test_table_keeps_fixed_row_height_without_full_resize(self):
@@ -492,6 +623,34 @@ class ThumbnailPixmapTests(unittest.TestCase):
         selected.assert_called_with(1)
         table.close()
 
+    def test_table_favorite_delegate_keeps_title_out_of_style_paint(self):
+        class RecordingStyle(QProxyStyle):
+            def __init__(self):
+                super().__init__()
+                self.item_texts = []
+
+            def drawControl(self, element, option, painter, widget=None):
+                if element == QStyle.ControlElement.CE_ItemViewItem:
+                    self.item_texts.append(option.text)
+                super().drawControl(element, option, painter, widget)
+
+        table = AssetTable()
+        style = RecordingStyle()
+        table.setStyle(style)
+        table.set_items(asset_records(1))
+        canvas = QImage(400, 44, QImage.Format.Format_ARGB32)
+        canvas.fill(Qt.GlobalColor.transparent)
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 400, 44)
+        option.widget = table
+        painter = QPainter(canvas)
+
+        table._favorite_delegate.paint(painter, option, table.model().index(0, 0))
+
+        painter.end()
+        self.assertEqual(style.item_texts, [""])
+        table.close()
+
     def test_detail_clears_preview_and_updates_image_only_buttons(self):
         image_path = Path(self.temp.name) / "preview.png"
         image = QImage(64, 40, QImage.Format.Format_RGB32)
@@ -535,6 +694,46 @@ class ThumbnailPixmapTests(unittest.TestCase):
         panel.clear_item()
         self.assertIsNone(panel.current_item)
         self.assertTrue(all(not button.isEnabled() for button in panel.item_action_buttons))
+        self.assertFalse(panel.notes.isEnabled())
+        self.assertFalse(panel.collection_combo.isEnabled())
+        self.assertFalse(panel.add_tag_button.isEnabled())
+        panel.close()
+
+    def test_detail_tags_offer_more_entry_without_losing_hidden_tags(self):
+        panel = DetailPanel()
+        item = {
+            "id": 1,
+            "title": "tagged",
+            "kind": "text",
+            "path": None,
+            "content": "text",
+            "width": 0,
+            "height": 0,
+            "file_size": 4,
+            "created_at": "2026-07-13T01:58:02",
+            "source": "clipboard",
+            "collection_id": None,
+            "tag_names": "one\x1ftwo\x1fthree\x1ffour\x1ffive\x1fsix",
+            "tag_colors": "#111111\x1f#222222\x1f#333333\x1f#444444\x1f#555555\x1f#666666",
+            "ai_description": "",
+            "ocr_text": "",
+            "notes": "",
+            "favorite": 0,
+        }
+
+        panel.set_item(item)
+        self.assertIsNotNone(panel.tags_more_button)
+        self.assertIn("+2", panel.tags_more_button.text())
+        panel.tags_more_button.click()
+        self.assertEqual(
+            [
+                panel.tags_box.itemAt(index).widget().text()
+                for index in range(panel.tags_box.count())
+                if panel.tags_box.itemAt(index).widget().objectName() == "TagChip"
+            ],
+            ["one", "two", "three", "four", "five", "six"],
+        )
+        self.assertEqual(panel.tags_more_button.text(), "收起标签")
         panel.close()
 
     def test_detail_panel_scrolls_in_a_small_work_area(self):
@@ -577,8 +776,8 @@ class ThumbnailPixmapTests(unittest.TestCase):
         panel.set_item(item)
         self.assertTrue(wait_for(lambda: not panel.image_preview.pixmap().isNull()))
 
-        self.assertIn("\u200b", panel.title.text())
-        self.assertIn("\u200b", panel.meta.text())
+        self.assertNotIn("\u200b", panel.title.text())
+        self.assertNotIn("\u200b", panel.meta.text())
         self.assertEqual(panel.title.toolTip(), item["title"])
         self.assertEqual(panel.meta.toolTip(), item["path"])
         self.assertLessEqual(panel.content_widget.width(), panel.viewport().width())
@@ -613,6 +812,32 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertIsNotNone(content)
         self.assertLessEqual(content.sizeHint().height(), content.height())
         dialog.close()
+
+    def test_dialogs_fit_small_available_screen_without_unbounded_geometry(self):
+        screen = Mock()
+        screen.availableGeometry.return_value = QRect(0, 0, 500, 400)
+        settings = Mock()
+        settings.get.side_effect = lambda _key, default=None: default
+
+        with patch.object(SettingsDialog, "screen", return_value=screen):
+            settings_dialog = SettingsDialog(settings)
+        self.assertLessEqual(settings_dialog.width(), 468)
+        self.assertLessEqual(settings_dialog.height(), 368)
+        self.assertIsNotNone(settings_dialog.findChild(QScrollArea, "DialogScroll"))
+
+        with patch.object(DateDialog, "screen", return_value=screen):
+            date_dialog = DateDialog([])
+        self.assertLessEqual(date_dialog.width(), 420)
+        self.assertLessEqual(date_dialog.height(), 368)
+
+        with patch.object(FluentMessageDialog, "screen", return_value=screen):
+            message_dialog = FluentMessageDialog("提示", "内容" * 100)
+        self.assertLessEqual(message_dialog.width(), 468)
+        self.assertLessEqual(message_dialog.height(), 368)
+
+        settings_dialog.close()
+        date_dialog.close()
+        message_dialog.close()
 
     def test_sidebar_brand_divider_matches_toolbar_height(self):
         sidebar = Sidebar()
@@ -824,6 +1049,97 @@ class WidgetSafetyTests(unittest.TestCase):
 
         self.assertTrue(sidebar.tag_buttons[0].collapsed)
         self.assertEqual(sidebar.tag_buttons[0].text(), "")
+        sidebar.close()
+
+    def test_sidebar_delete_buttons_align_with_add_buttons_and_hide_when_collapsed(self):
+        sidebar = Sidebar()
+        sidebar.resize(242, 720)
+        sidebar.set_primary({"all": 2, "favorite": 1, "image": 1, "text": 1, "markdown": 0})
+        sidebar.set_collections([{"id": 3, "name": "Work", "amount": 2}])
+        sidebar.set_tags([{"id": 7, "name": "Red", "amount": 1, "color": "#ff0000"}])
+        deleted_collections = []
+        deleted_tags = []
+        sidebar.delete_collection_requested.connect(
+            lambda ident, name: deleted_collections.append((ident, name))
+        )
+        sidebar.delete_tag_requested.connect(
+            lambda ident, name: deleted_tags.append((ident, name))
+        )
+        sidebar.show()
+        self.app.processEvents()
+
+        collection_delete = sidebar.collection_delete_buttons[3]
+        tag_delete = sidebar.tag_delete_buttons[7]
+        collection_add_x = sidebar.collection_heading.add_button.mapTo(
+            sidebar, sidebar.collection_heading.add_button.rect().center()
+        ).x()
+        tag_add_x = sidebar.tag_heading.add_button.mapTo(
+            sidebar, sidebar.tag_heading.add_button.rect().center()
+        ).x()
+        self.assertEqual(
+            collection_delete.mapTo(sidebar, collection_delete.rect().center()).x(),
+            collection_add_x,
+        )
+        self.assertEqual(
+            tag_delete.mapTo(sidebar, tag_delete.rect().center()).x(),
+            tag_add_x,
+        )
+
+        collection_delete.click()
+        tag_delete.click()
+        self.assertEqual(deleted_collections, [(3, "Work")])
+        self.assertEqual(deleted_tags, [(7, "Red")])
+
+        sidebar.set_collapsed(True, animate=False)
+        self.app.processEvents()
+        self.assertTrue(collection_delete.isHidden())
+        self.assertTrue(tag_delete.isHidden())
+        primary_button = sidebar.nav_buttons["all"]
+        collection_button = sidebar.collection_buttons[0]
+        tag_button = sidebar.tag_buttons[0]
+        primary_left = primary_button.mapTo(sidebar, QPoint(0, 0)).x()
+        self.assertEqual(collection_button.mapTo(sidebar, QPoint(0, 0)).x(), primary_left)
+        self.assertEqual(tag_button.mapTo(sidebar, QPoint(0, 0)).x(), primary_left)
+        self.assertEqual(collection_button.width(), primary_button.width())
+        self.assertEqual(tag_button.width(), primary_button.width())
+        sidebar.close()
+
+    def test_sidebar_large_classifications_scroll_and_offer_more_tags(self):
+        sidebar = Sidebar()
+        sidebar.resize(242, 360)
+        sidebar.set_primary({"all": 1})
+        sidebar.set_collections(
+            [{"id": index, "name": f"Collection {index}", "amount": index} for index in range(20)]
+        )
+        sidebar.set_tags(
+            [{"id": 100 + index, "name": f"Tag {index}", "amount": index, "color": "#21a8fb"} for index in range(10)]
+        )
+        sidebar.show()
+        self.app.processEvents()
+
+        self.assertGreater(sidebar.classification_scroll.verticalScrollBar().maximum(), 0)
+        self.assertIsNotNone(sidebar.tags_more_button)
+        self.assertIn("2", sidebar.tags_more_button.text())
+        sidebar.tags_more_button.click()
+        self.assertEqual(len(sidebar.tag_delete_buttons), 10)
+        self.assertIn("收起标签", sidebar.tags_more_button.text())
+        sidebar.tags_more_button.click()
+        self.assertEqual(len(sidebar.tag_delete_buttons), 8)
+        sidebar.close()
+
+    def test_sidebar_collapse_only_renders_the_changed_collapse_icon(self):
+        sidebar = Sidebar()
+        sidebar.set_primary({"all": 2, "favorite": 1, "image": 1, "text": 1, "markdown": 0})
+        sidebar.set_collections([{"id": 3, "name": "Work", "amount": 2}])
+        sidebar.set_tags([{"id": 7, "name": "Red", "amount": 1, "color": "#ff0000"}])
+
+        with patch.object(
+            widgets_module, "lucide_icon", wraps=widgets_module.lucide_icon
+        ) as render_icon:
+            sidebar.set_collapsed(True, animate=False)
+            sidebar.set_collapsed(False, animate=False)
+
+        self.assertEqual(render_icon.call_count, 2)
         sidebar.close()
 
     def test_table_clear_selection_also_clears_current_index(self):

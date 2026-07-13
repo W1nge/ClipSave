@@ -4,6 +4,8 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -13,7 +15,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from clipsave_app.constants import MARKDOWN_DIR, PICTURE_DIR
-from clipsave_app.database import BackupValidation, ImportFileResult, LibraryDatabase
+from clipsave_app.database import BackupValidation, ImportFileResult, LibraryDatabase, _SQLiteLeafLock
 from clipsave_app import storage as storage_module
 
 
@@ -44,6 +46,109 @@ class LibraryDatabaseTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual((result[0]["width"], result[0]["height"]), (640, 480))
 
+    def test_ai_and_ocr_compare_and_set_reject_stale_content_hash(self):
+        path = self.root / "versioned.png"
+        Image.new("RGB", (16, 16), "blue").save(path)
+        item_id = self.database.add_image(path)
+        item = self.database.get_item(item_id)
+
+        self.assertFalse(
+            self.database.update_ai_if_current(
+                item_id, "0" * 64, "stale description", [1.0]
+            )
+        )
+        self.assertFalse(
+            self.database.update_ocr_if_current(item_id, "0" * 64, "stale text")
+        )
+        self.assertEqual(self.database.get_item(item_id)["ai_description"], "")
+        self.assertEqual(self.database.get_item(item_id)["ocr_text"], "")
+
+        self.assertTrue(
+            self.database.update_ai_if_current(
+                item_id, item["content_hash"], "current description", [1.0]
+            )
+        )
+        self.assertTrue(
+            self.database.update_ocr_if_current(
+                item_id, item["content_hash"], "current text"
+            )
+        )
+
+    def test_embedding_batches_use_bounded_keyset_pagination(self):
+        ids = []
+        for index in range(5):
+            item_id = self.database.add_text(f"embedded {index}")
+            self.database.update_ai(item_id, "description", [float(index)])
+            ids.append(item_id)
+
+        first = self.database.embedded_items_batch(0, 2)
+        second = self.database.embedded_items_batch(first[-1]["id"], 2)
+        third = self.database.embedded_items_batch(second[-1]["id"], 2)
+
+        self.assertEqual(self.database.embedded_item_count(), 5)
+        self.assertEqual(
+            [row["id"] for row in first + second + third],
+            ids,
+        )
+
+    def test_embedding_profile_filters_old_provider_and_dimension(self):
+        compatible_id = self.database.add_text("compatible embedding")
+        other_model_id = self.database.add_text("other model embedding")
+        other_dimension_id = self.database.add_text("other dimension embedding")
+        self.database.update_ai(
+            compatible_id,
+            "description",
+            [0.1, 0.2],
+            embedding_provider="openai-compatible:one",
+            embedding_model="embed-a",
+            embedding_revision=1,
+        )
+        self.database.update_ai(
+            other_model_id,
+            "description",
+            [0.1, 0.2],
+            embedding_provider="openai-compatible:one",
+            embedding_model="embed-b",
+            embedding_revision=1,
+        )
+        self.database.update_ai(
+            other_dimension_id,
+            "description",
+            [0.1, 0.2, 0.3],
+            embedding_provider="openai-compatible:one",
+            embedding_model="embed-a",
+            embedding_revision=1,
+        )
+
+        kwargs = {
+            "embedding_provider": "openai-compatible:one",
+            "embedding_model": "embed-a",
+            "embedding_dimensions": 2,
+            "embedding_revision": 1,
+        }
+        self.assertEqual(self.database.embedded_item_count(**kwargs), 1)
+        self.assertEqual(
+            [row["id"] for row in self.database.embedded_items_batch(0, 10, **kwargs)],
+            [compatible_id],
+        )
+        stored = self.database.get_item(compatible_id)
+        self.assertEqual(stored["embedding_provider"], "openai-compatible:one")
+        self.assertEqual(stored["embedding_model"], "embed-a")
+        self.assertEqual(stored["embedding_dimensions"], 2)
+        self.assertEqual(stored["embedding_revision"], 1)
+
+    def test_new_timestamps_are_utc_and_days_use_local_calendar(self):
+        aware = dt.datetime(2026, 7, 12, 23, 30, tzinfo=dt.timezone.utc)
+        item_id = self.database.add_text("utc timestamp", aware)
+        stored = self.database.get_item(item_id)
+        self.assertTrue(stored["created_at"].endswith("Z"))
+        self.assertEqual(stored["created_at"], "2026-07-12T23:30:00Z")
+        self.assertEqual(
+            dt.datetime.fromisoformat(stored["created_at"].replace("Z", "+00:00")),
+            aware,
+        )
+        self.assertIn((aware.astimezone().date().isoformat(), 1), self.database.days())
+
     def test_collection_tags_favorite_and_notes(self):
         item_id = self.database.add_text("organize me")
         collection_id = self.database.create_collection("Work")
@@ -55,6 +160,27 @@ class LibraryDatabaseTests(unittest.TestCase):
         self.assertEqual(result["collection_name"], "Work")
         self.assertEqual(result["tag_names"], "Important")
         self.assertEqual(result["notes"], "Remember this")
+
+    def test_deleting_collection_and_tag_preserves_clipboard_item(self):
+        item_id = self.database.add_text("keep this clipboard content")
+        collection_id = self.database.create_collection("Temporary collection")
+        self.database.set_collection(item_id, collection_id)
+        tag_id = self.database.add_tag(item_id, "Temporary tag")
+
+        self.database.delete_collection(collection_id)
+
+        item = self.database.get_item(item_id)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["content"], "keep this clipboard content")
+        self.assertIsNone(item["collection_id"])
+        self.assertNotIn(collection_id, {row["id"] for row in self.database.collections()})
+
+        self.database.delete_tag(tag_id)
+
+        item = self.database.get_item(item_id)
+        self.assertIsNotNone(item)
+        self.assertFalse(item["tag_names"])
+        self.assertNotIn(tag_id, {row["id"] for row in self.database.tags()})
 
     def test_set_notes_if_unchanged_is_atomic(self):
         item_id = self.database.add_text("session notes")
@@ -628,6 +754,9 @@ class LibraryDatabaseTests(unittest.TestCase):
             patch.object(self.database, "import_file", side_effect=import_one),
         ):
             self.assertEqual(self.database.scan_legacy_files(), 1)
+        self.assertEqual(self.database.last_scan_report["scanned"], 2)
+        self.assertEqual(self.database.last_scan_report["failed"], 1)
+        self.assertEqual(len(self.database.last_scan_report["errors"]), 1)
 
     def test_schema_version_and_busy_timeout_are_initialized(self):
         version = self.database.connection.execute("PRAGMA user_version").fetchone()[0]
@@ -651,6 +780,26 @@ class LibraryDatabaseTests(unittest.TestCase):
             LibraryDatabase(path)
 
         self.assertEqual(sentinel.read_bytes(), b"x" * 8192)
+
+    @unittest.skipUnless(os.name == "nt", "Windows file identity locking")
+    def test_leaf_lock_does_not_delete_file_created_by_another_process(self):
+        path = self.root / "concurrent-create.db"
+        path.write_bytes(b"other process")
+
+        with patch.object(
+            storage_module,
+            "_create_file",
+            side_effect=FileExistsError("already exists"),
+        ):
+            with self.assertRaises(FileExistsError):
+                _SQLiteLeafLock.acquire(
+                    path,
+                    self.root,
+                    create=True,
+                    writable=True,
+                )
+
+        self.assertEqual(path.read_bytes(), b"other process")
 
     @unittest.skipUnless(os.name == "nt", "Windows file identity locking")
     def test_connect_time_sidecar_hardlink_swap_cannot_modify_external_files(self):
@@ -796,8 +945,12 @@ class LibraryDatabaseTests(unittest.TestCase):
         connection = sqlite3.connect(path)
         connection.execute(f"PRAGMA user_version = {LibraryDatabase.SCHEMA_VERSION + 1}")
         connection.close()
+        before = path.read_bytes()
         with self.assertRaises(RuntimeError):
             LibraryDatabase(path)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(Path(f"{path}-wal").exists())
+        self.assertFalse(Path(f"{path}-shm").exists())
 
     def test_backups_rotate_and_remain_valid_sqlite_databases(self):
         for index in range(LibraryDatabase.BACKUP_LIMIT + 2):
@@ -1098,6 +1251,60 @@ class LibraryDatabaseTests(unittest.TestCase):
             self.assertEqual(preserved_shm.read_bytes(), b"stale shm")
         finally:
             recovered.close()
+
+    def test_missing_primary_without_backup_preserves_orphan_sidecars(self):
+        path = self.root / "orphan-only.db"
+        wal = Path(f"{path}-wal")
+        shm = Path(f"{path}-shm")
+        wal.write_bytes(b"orphan wal")
+        shm.write_bytes(b"orphan shm")
+
+        recovered = LibraryDatabase(path)
+        try:
+            state = recovered.recovery_state()
+            self.assertEqual(state["action"], "rebuilt")
+            preserved = [Path(candidate) for candidate in state["preserved_paths"]]
+            self.assertEqual(len(preserved), 2)
+            self.assertTrue(all(candidate.exists() for candidate in preserved))
+            self.assertIn(b"orphan wal", {candidate.read_bytes() for candidate in preserved})
+            self.assertIn(b"orphan shm", {candidate.read_bytes() for candidate in preserved})
+        finally:
+            recovered.close()
+
+    def test_slow_online_backup_does_not_hold_database_write_lock(self):
+        started = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        class SlowSource:
+            def backup(self, _destination):
+                started.set()
+                release.wait(2)
+                raise OSError("stop after concurrency check")
+
+            def close(self):
+                return None
+
+        def backup():
+            try:
+                self.database.create_backup()
+            except OSError as exc:
+                errors.append(str(exc))
+
+        with patch.object(self.database, "_open_backup_source", return_value=SlowSource()):
+            thread = threading.Thread(target=backup, daemon=True)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            try:
+                before = time.monotonic()
+                self.assertIsNotNone(self.database.add_text("write during slow backup"))
+                self.assertLess(time.monotonic() - before, 0.5)
+            finally:
+                release.set()
+                thread.join(2)
+
+        self.assertEqual(errors, ["stop after concurrency check"])
+        self.assertTrue(self.database.backup_state()["dirty"])
 
     def test_non_corruption_schema_error_does_not_trigger_recovery(self):
         path = self.root / "busy-migration.db"
@@ -1477,7 +1684,7 @@ class LibraryDatabaseTests(unittest.TestCase):
             self.assertEqual(row["ocr_text"], "keep ocr")
             self.assertEqual(row["ai_description"], "keep ai")
             self.assertEqual(row["embedding"], "[0.1, 0.2]")
-            self.assertEqual(row["created_at"], timestamp)
+            self.assertEqual(row["created_at"], LibraryDatabase._utc_timestamp(timestamp))
             self.assertEqual(row["external"], 1)
             self.assertEqual(
                 migrated.connection.execute("PRAGMA user_version").fetchone()[0],

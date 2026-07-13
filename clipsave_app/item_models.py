@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import os
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
@@ -11,6 +12,17 @@ def normalized_thumbnail_path(path) -> str | None:
     if not path:
         return None
     return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def format_local_timestamp(value) -> str:
+    text = str(value or "")
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text.replace("T", " ")
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _human_size(value: int) -> str:
@@ -74,8 +86,6 @@ class AssetItemModel(QAbstractTableModel):
             return normalized_thumbnail_path(record["path"]) if record["kind"] == "image" else None
         if role == self.GenerationRole:
             return self._generation
-        if role == Qt.ItemDataRole.ToolTipRole and index.column() == 0:
-            return str(record["title"])
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if index.column() == 0:
@@ -86,7 +96,7 @@ class AssetItemModel(QAbstractTableModel):
         if index.column() == 2:
             return (record["tag_names"] or "").replace("\x1f", ", ")
         if index.column() == 3:
-            return str(record["created_at"]).replace("T", " ")
+            return format_local_timestamp(record["created_at"])
         if index.column() == 4:
             return _human_size(record["file_size"])
         return None

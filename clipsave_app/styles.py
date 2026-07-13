@@ -18,6 +18,7 @@ QListWidget#DateList::item:selected { background: rgba(47,125,246,28); color: #1
 QWidget#WindowBody { background: transparent; }
 QFrame#WindowTitleBar { background: rgba(255, 255, 255, 204); border: 0; }
 QWidget#Sidebar { background: rgba(255, 255, 255, 204); border: 0; }
+QScrollArea#SidebarClassificationScroll, QScrollArea#SidebarClassificationScroll > QWidget > QWidget { background: transparent; border: 0; }
 QWidget#ContentSurface { background: transparent; }
 QWidget#DetailPanel { background: #f6f6f6; border-left: 1px solid rgba(115, 129, 150, 44); }
 QFrame#TopBar { background: rgba(255, 255, 255, 204); border-bottom: 1px solid rgba(115,129,150,38); }
@@ -34,9 +35,17 @@ QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     background: #ffffff;
     border: 1px solid rgba(99,115,139,55);
     border-radius: 6px;
-    padding: 7px 10px;
+    padding: 7px 34px 7px 10px;
     selection-background-color: #2f7df6;
 }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 28px;
+    border: 0;
+    background: transparent;
+}
+QComboBox::down-arrow { image: none; }
 QLineEdit:focus, QTextEdit:focus, QComboBox:focus { border: 1px solid #2f7df6; }
 QPushButton {
     background: transparent;
@@ -49,6 +58,8 @@ QPushButton:pressed { background: rgba(39,75,125,30); }
 QPushButton:disabled { color: rgba(53,64,82,105); background: transparent; }
 QPushButton#Primary { background: #2f7df6; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #246be0; }
+QPushButton#Danger { background: #c42b1c; color: white; font-weight: 600; }
+QPushButton#Danger:hover { background: #a4262c; }
 QPushButton#SettingsAction { text-align: left; background: #ffffff; border: 1px solid rgba(99,115,139,38); padding: 9px 12px; }
 QPushButton#SettingsAction:hover { background: #ffffff; border-color: rgba(47,125,246,75); }
 QPushButton#NavButton { text-align: left; padding: 9px 16px; border-radius: 6px; }
@@ -61,6 +72,9 @@ QPushButton#CloseWindowButton { min-width: 46px; max-width: 46px; min-height: 32
 QPushButton#CloseWindowButton:hover { background: #c42b1c; }
 QPushButton#CaptureStatus { min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px; padding: 0; border-radius: 6px; }
 QPushButton#CaptureStatus:hover { background: rgba(255,255,255,80); }
+QFrame#CopyToast { background: rgba(255,255,255,230); border: 1px solid rgba(76,94,120,70); border-radius: 6px; }
+QLabel#CopyToastIcon { background: #2f7df6; border-radius: 17px; }
+QLabel#CopyToastText { color: #1f2b3d; font-size: 15px; font-weight: 600; }
 QScrollArea { border: 0; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QLabel#DetailPreview { background: rgba(235,239,245,160); border-radius: 6px; }
@@ -109,6 +123,7 @@ QListWidget#DateList::item:selected { background: #26384d; color: #79c4ff; }
 QWidget#WindowBody { background: transparent; }
 QFrame#WindowTitleBar { background: rgba(32,32,32,204); border: 0; }
 QWidget#Sidebar { background: rgba(32,32,32,204); border: 0; }
+QScrollArea#SidebarClassificationScroll, QScrollArea#SidebarClassificationScroll > QWidget > QWidget { background: transparent; border: 0; }
 QWidget#ContentSurface { background: transparent; }
 QWidget#DetailPanel { background: #202020; border-left: 1px solid #3c3c3c; }
 QWidget#DetailPanelContent { background: #202020; }
@@ -127,10 +142,18 @@ QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     background: #292929;
     border: 1px solid #505050;
     border-radius: 6px;
-    padding: 7px 10px;
+    padding: 7px 34px 7px 10px;
     color: #f2f2f2;
     selection-background-color: #2f7df6;
 }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 28px;
+    border: 0;
+    background: transparent;
+}
+QComboBox::down-arrow { image: none; }
 QLineEdit:focus, QTextEdit:focus, QComboBox:focus { border: 1px solid #4da3ff; }
 QComboBox QAbstractItemView { background: #292929; color: #f2f2f2; selection-background-color: #365a80; }
 QPushButton { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 7px 10px; }
@@ -139,6 +162,8 @@ QPushButton:pressed { background: rgba(255,255,255,28); }
 QPushButton:disabled { color: #737373; background: transparent; }
 QPushButton#Primary { background: #2f7df6; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #438bf7; }
+QPushButton#Danger { background: #d13438; color: white; font-weight: 600; }
+QPushButton#Danger:hover { background: #e5484d; }
 QPushButton#SettingsAction { text-align: left; background: #292929; border: 1px solid #4a4a4a; padding: 9px 12px; }
 QPushButton#SettingsAction:hover { background: #343434; border-color: #4d8bc7; }
 QPushButton#NavButton { text-align: left; padding: 9px 16px; border-radius: 6px; }
@@ -151,6 +176,9 @@ QPushButton#CloseWindowButton { min-width: 46px; max-width: 46px; min-height: 32
 QPushButton#CloseWindowButton:hover { background: #c42b1c; }
 QPushButton#CaptureStatus { min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px; padding: 0; border-radius: 6px; }
 QPushButton#CaptureStatus:hover { background: rgba(255,255,255,18); }
+QFrame#CopyToast { background: rgba(40,40,40,230); border: 1px solid rgba(255,255,255,48); border-radius: 6px; }
+QLabel#CopyToastIcon { background: #2f7df6; border-radius: 17px; }
+QLabel#CopyToastText { color: #f7f7f7; font-size: 15px; font-weight: 600; }
 QScrollArea { border: 0; background: #202020; }
 QScrollArea > QWidget > QWidget { background: #202020; }
 QListView#AssetGrid { background: #202020; border: 0; outline: 0; }

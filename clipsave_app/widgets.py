@@ -33,11 +33,10 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCheckBox,
     QDialog,
-    QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListView,
@@ -60,7 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 from .constants import TYPE_LABELS
-from .item_models import AssetItemModel, normalized_thumbnail_path
+from .item_models import AssetItemModel, format_local_timestamp, normalized_thumbnail_path
 from lucide import _render_icon
 
 
@@ -138,11 +137,11 @@ class _ThumbnailPixmapCache(OrderedDict):
         previous = self._keys_by_path.get(key.path)
         if previous is not None and previous != key:
             self.discard_key(previous)
-        self._keys_by_path[key.path] = key
         try:
             pixmap = OrderedDict.__getitem__(self, key)
         except KeyError:
             return None
+        self._keys_by_path[key.path] = key
         OrderedDict.move_to_end(self, key)
         return pixmap
 
@@ -444,6 +443,35 @@ class IconButton(QPushButton):
         self.setIcon(lucide_icon(self.glyph, theme_icon_color()))
 
 
+class FluentComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._arrow_theme: bool | None = None
+        self._arrow_icon = QIcon()
+
+    def _refresh_arrow(self) -> None:
+        dark = dark_theme_active()
+        if dark == self._arrow_theme:
+            return
+        self._arrow_theme = dark
+        self._arrow_icon = lucide_icon(
+            "chevron-down",
+            "#a7adb7" if dark else "#6f7b8d",
+            14,
+        )
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        self._refresh_arrow()
+        painter = QPainter(self)
+        self._arrow_icon.paint(
+            painter,
+            QRect(self.width() - 28, 0, 28, self.height()),
+            Qt.AlignmentFlag.AlignCenter,
+        )
+        painter.end()
+
+
 class ToggleSwitch(QCheckBox):
     def __init__(self, text: str, parent=None):
         super().__init__(text, parent)
@@ -557,6 +585,108 @@ class CaptureStatusButton(QPushButton):
         self.setIcon(QIcon(color_dot(color, 10)))
         self.setIconSize(QSize(10, 10))
         self.setToolTip("本地自动捕获已开启" if active else "本地自动捕获已暂停")
+
+
+class CopyToast(QFrame):
+    WIDTH = 268
+    HEIGHT = 58
+    MARGIN = 20
+    DISPLAY_MS = 2300
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CopyToast")
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAccessibleName("已复制到剪贴板")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(13, 10, 16, 10)
+        layout.setSpacing(12)
+        icon = QLabel()
+        icon.setObjectName("CopyToastIcon")
+        icon.setFixedSize(34, 34)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setPixmap(lucide_icon("check", "#ffffff", 18).pixmap(QSize(18, 18)))
+        layout.addWidget(icon)
+        message = QLabel("已复制到剪贴板")
+        message.setObjectName("CopyToastText")
+        layout.addWidget(message, 1)
+        self.icon_label = icon
+        self.message_label = message
+
+        self._opacity_effect = QGraphicsOpacityEffect(self)
+        self._opacity_effect.setOpacity(0.0)
+        self.setGraphicsEffect(self._opacity_effect)
+        self._motion = QPropertyAnimation(self, b"pos", self)
+        self._motion.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade = QPropertyAnimation(self._opacity_effect, b"opacity", self)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade.finished.connect(self._animation_finished)
+        self._hiding = False
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(self.DISPLAY_MS)
+        self._hide_timer.timeout.connect(self._begin_hide)
+        self.hide()
+
+    def target_position(self) -> QPoint:
+        parent = self.parentWidget()
+        if parent is None:
+            return QPoint()
+        return QPoint(
+            max(self.MARGIN, parent.width() - self.width() - self.MARGIN),
+            max(self.MARGIN, parent.height() - self.height() - self.MARGIN),
+        )
+
+    def reposition(self) -> None:
+        self._motion.stop()
+        self.move(self.target_position())
+
+    def show_confirmation(self) -> None:
+        self._hide_timer.stop()
+        self._motion.stop()
+        self._fade.stop()
+        target = self.target_position()
+        first_show = not self.isVisible()
+        self._hiding = False
+        if first_show:
+            self.move(target + QPoint(0, 10))
+            self._opacity_effect.setOpacity(0.0)
+            self.show()
+        else:
+            self.move(target)
+        self.raise_()
+        self._motion.setDuration(170)
+        self._motion.setStartValue(self.pos())
+        self._motion.setEndValue(target)
+        self._fade.setDuration(150)
+        self._fade.setStartValue(self._opacity_effect.opacity())
+        self._fade.setEndValue(1.0)
+        self._motion.start()
+        self._fade.start()
+        self._hide_timer.start()
+
+    def _begin_hide(self) -> None:
+        if not self.isVisible():
+            return
+        self._motion.stop()
+        self._fade.stop()
+        target = self.target_position()
+        self._hiding = True
+        self._motion.setDuration(140)
+        self._motion.setStartValue(self.pos())
+        self._motion.setEndValue(target + QPoint(0, 7))
+        self._fade.setDuration(130)
+        self._fade.setStartValue(self._opacity_effect.opacity())
+        self._fade.setEndValue(0.0)
+        self._motion.start()
+        self._fade.start()
+
+    def _animation_finished(self) -> None:
+        if self._hiding:
+            self.hide()
 
 
 class AutoHideScrollBar(QScrollBar):
@@ -713,6 +843,21 @@ class DraggableBar(QFrame):
         super().mouseDoubleClickEvent(event)
 
 
+def _available_dialog_size(widget: QWidget, margin: int = 32) -> QSize:
+    screen = widget.screen()
+    if screen is None:
+        screen = QApplication.primaryScreen()
+    if screen is None:
+        return QSize(1_000_000, 1_000_000)
+    available = screen.availableGeometry()
+    return QSize(max(1, available.width() - margin), max(1, available.height() - margin))
+
+
+def _fit_dialog_size(widget: QWidget, preferred: QSize, margin: int = 32) -> QSize:
+    available = _available_dialog_size(widget, margin)
+    return QSize(min(preferred.width(), available.width()), min(preferred.height(), available.height()))
+
+
 class DialogTitleBar(DraggableBar):
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
@@ -728,6 +873,168 @@ class DialogTitleBar(DraggableBar):
         layout.addStretch(1)
         self.close_button = IconButton("close", "关闭")
         layout.addWidget(self.close_button)
+
+
+class FluentMessageDialog(QDialog):
+    _ICONS = {
+        "information": ("info", "#21a8fb"),
+        "warning": ("triangle-alert", "#f5a623"),
+        "critical": ("circle-x", "#d13438"),
+        "question": ("circle-alert", "#21a8fb"),
+    }
+
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        parent=None,
+        *,
+        kind: str = "information",
+        accept_text: str = "确定",
+        cancel_text: str | None = None,
+        destructive: bool = False,
+        default_accept: bool = True,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setObjectName("FluentDialog")
+        self.setProperty("messageDialog", True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setModal(True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(1, 1, 1, 1)
+        root.setSpacing(0)
+        title_bar = DialogTitleBar(title)
+        title_bar.close_button.clicked.connect(self.reject)
+        root.addWidget(title_bar)
+
+        content = QWidget()
+        content.setObjectName("DialogContent")
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(24, 20, 24, 20)
+        content_layout.setSpacing(14)
+
+        glyph, color = self._ICONS.get(kind, self._ICONS["information"])
+        icon = QLabel()
+        icon.setObjectName("MessageIcon")
+        icon.setFixedSize(24, 24)
+        icon.setPixmap(lucide_icon(glyph, color, 22).pixmap(22, 22))
+        icon.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        content_layout.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.message_label = QLabel(message)
+        self.message_label.setObjectName("MessageText")
+        self.message_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.message_label.setWordWrap(True)
+        self.message_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.message_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        message_container = QWidget()
+        message_layout = QVBoxLayout(message_container)
+        message_layout.setContentsMargins(0, 0, 0, 0)
+        message_layout.addWidget(self.message_label)
+        message_layout.addStretch(1)
+
+        dialog_width = _fit_dialog_size(self, QSize(480, 200)).width()
+        message_width = min(360, max(80, dialog_width - 110))
+        text_height = self.message_label.fontMetrics().boundingRect(
+            QRect(0, 0, message_width, 10_000),
+            Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap,
+            message,
+        ).height()
+        message_height = max(56, min(260, text_height + 8))
+        message_scroll = QScrollArea()
+        message_scroll.setObjectName("MessageScroll")
+        message_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        message_scroll.setWidgetResizable(True)
+        message_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        message_scroll.setVerticalScrollBar(AutoHideScrollBar())
+        message_scroll.setFixedHeight(message_height)
+        message_scroll.setWidget(message_container)
+        content_layout.addWidget(message_scroll, 1)
+        root.addWidget(content, 1)
+
+        footer = QFrame()
+        footer.setObjectName("DialogFooter")
+        footer.setFixedHeight(58)
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(16, 10, 16, 12)
+        footer_layout.addStretch(1)
+        self.cancel_button = None
+        if cancel_text is not None:
+            self.cancel_button = QPushButton(cancel_text)
+            self.cancel_button.clicked.connect(self.reject)
+            footer_layout.addWidget(self.cancel_button)
+        self.accept_button = QPushButton(accept_text)
+        self.accept_button.setObjectName("Danger" if destructive else "Primary")
+        self.accept_button.clicked.connect(self.accept)
+        footer_layout.addWidget(self.accept_button)
+        root.addWidget(footer)
+
+        default_button = self.accept_button if default_accept else self.cancel_button
+        if default_button is not None:
+            default_button.setDefault(True)
+            default_button.setFocus()
+        preferred_size = QSize(480, 46 + 40 + message_height + 58 + 2)
+        dialog_size = _fit_dialog_size(self, preferred_size)
+        content_height = max(32, dialog_size.height() - 46 - 58 - 42)
+        message_scroll.setFixedHeight(min(message_height, content_height))
+        self.setFixedSize(dialog_size)
+
+
+class FluentMessageBox:
+    StandardButton = QMessageBox.StandardButton
+
+    @staticmethod
+    def _exec(dialog: FluentMessageDialog) -> int:
+        try:
+            return dialog.exec()
+        finally:
+            dialog.deleteLater()
+
+    @classmethod
+    def question(
+        cls,
+        parent,
+        title: str,
+        message: str,
+        _buttons=None,
+        default_button=QMessageBox.StandardButton.No,
+    ):
+        destructive = title.startswith("删除")
+        result = cls._exec(
+            FluentMessageDialog(
+                title,
+                message,
+                parent,
+                kind="question",
+                accept_text="删除" if destructive else "确定",
+                cancel_text="取消",
+                destructive=destructive,
+                default_accept=default_button == QMessageBox.StandardButton.Yes,
+            )
+        )
+        return (
+            QMessageBox.StandardButton.Yes
+            if result == QDialog.DialogCode.Accepted
+            else QMessageBox.StandardButton.No
+        )
+
+    @classmethod
+    def information(cls, parent, title: str, message: str, *_args, **_kwargs):
+        cls._exec(FluentMessageDialog(title, message, parent, kind="information"))
+        return QMessageBox.StandardButton.Ok
+
+    @classmethod
+    def warning(cls, parent, title: str, message: str, *_args, **_kwargs):
+        cls._exec(FluentMessageDialog(title, message, parent, kind="warning"))
+        return QMessageBox.StandardButton.Ok
+
+    @classmethod
+    def critical(cls, parent, title: str, message: str, *_args, **_kwargs):
+        cls._exec(FluentMessageDialog(title, message, parent, kind="critical"))
+        return QMessageBox.StandardButton.Ok
 
 
 class NavButton(QPushButton):
@@ -750,44 +1057,69 @@ class NavButton(QPushButton):
         self.collapsed = False
         self.custom_icon: QIcon | None = None
         self.prominent_icon = prominent_icon
+        self._rendered_icon_key: tuple | None = None
         self.setObjectName("NavButton")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName(label)
+        self.setIconSize(QSize(20, 20))
         self.clicked.connect(lambda: self.triggered.emit(self.key))
         self.refresh_text()
 
     def refresh_text(self) -> None:
         if self.collapsed:
-            self.setText("")
-            self.setToolTip(self.label)
-            self.setStyleSheet("text-align:left;")
+            text = ""
+            tooltip = self.label
         else:
             gap = "    "
             suffix = f"{gap}{self.count:,}" if self.count is not None else ""
-            self.setText(f"{gap}{self.label}{suffix}")
-            self.setToolTip("")
-            self.setStyleSheet("text-align:left;")
-        inactive = (
-            theme_icon_color()
-            if self.prominent_icon
-            else "#c6ccd5" if dark_theme_active() else "#4d596b"
-        )
-        self.setIcon(self.custom_icon or lucide_icon(self.glyph, "#64b5f6" if self.property("active") else inactive))
-        self.setIconSize(QSize(20, 20))
+            text = f"{gap}{self.label}{suffix}"
+            tooltip = ""
+        if self.text() != text:
+            self.setText(text)
+        if self.toolTip() != tooltip:
+            self.setToolTip(tooltip)
+        self._refresh_icon()
+
+    def _refresh_icon(self) -> None:
+        if self.custom_icon is not None:
+            icon_key = ("custom", self.custom_icon.cacheKey())
+            icon = self.custom_icon
+        else:
+            inactive = (
+                theme_icon_color()
+                if self.prominent_icon
+                else "#c6ccd5" if dark_theme_active() else "#4d596b"
+            )
+            color = "#64b5f6" if self.property("active") else inactive
+            icon_key = ("lucide", self.glyph, color)
+            icon = None
+        if icon_key == self._rendered_icon_key:
+            return
+        self._rendered_icon_key = icon_key
+        if icon is None:
+            icon = lucide_icon(self.glyph, color)
+        self.setIcon(icon)
 
     def set_custom_icon(self, icon: QIcon) -> None:
         self.custom_icon = icon
+        self._rendered_icon_key = None
         self.refresh_text()
 
     def set_collapsed(self, value: bool) -> None:
+        if self.collapsed == value:
+            self._refresh_icon()
+            return
         self.collapsed = value
         self.refresh_text()
 
     def set_active(self, value: bool) -> None:
-        self.setProperty("active", value)
+        changed = bool(self.property("active")) != value
+        if changed:
+            self.setProperty("active", value)
         self.refresh_text()
-        self.style().unpolish(self)
-        self.style().polish(self)
+        if changed:
+            self.style().unpolish(self)
+            self.style().polish(self)
 
 
 class Sidebar(QWidget):
@@ -795,6 +1127,8 @@ class Sidebar(QWidget):
     navigation_requested = Signal(str, object)
     add_collection_requested = Signal()
     add_tag_requested = Signal()
+    delete_collection_requested = Signal(int, str)
+    delete_tag_requested = Signal(int, str)
     settings_requested = Signal()
     collapsed_changed = Signal(bool)
     width_animation_started = Signal()
@@ -810,6 +1144,13 @@ class Sidebar(QWidget):
         self.nav_buttons: dict[str, NavButton] = {}
         self.collection_buttons: list[NavButton] = []
         self.tag_buttons: list[NavButton] = []
+        self.collection_delete_buttons: dict[int, IconButton] = {}
+        self.tag_delete_buttons: dict[int, IconButton] = {}
+        self.collection_rows: dict[int, QWidget] = {}
+        self.tag_rows: dict[int, QWidget] = {}
+        self._all_tags = []
+        self._tags_expanded = False
+        self.tags_more_button: NavButton | None = None
         self.footer_buttons: list[NavButton] = []
         self.animation = QPropertyAnimation(self, b"maximumWidth", self)
         self.animation.setDuration(190)
@@ -837,18 +1178,35 @@ class Sidebar(QWidget):
         self.primary_box.setSpacing(3)
         self.layout_root.addLayout(self.primary_box)
 
+        self.classification_scroll = QScrollArea()
+        self.classification_scroll.setObjectName("SidebarClassificationScroll")
+        self.classification_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.classification_scroll.setWidgetResizable(True)
+        self.classification_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.classification_scroll.setVerticalScrollBar(AutoHideScrollBar())
+        classification_content = QWidget()
+        classification_content.setObjectName("SidebarClassificationContent")
+        classification_content.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.classification_layout = QVBoxLayout(classification_content)
+        self.classification_layout.setContentsMargins(0, 0, 0, 0)
+        self.classification_layout.setSpacing(4)
+
         self.collection_heading = self._section_heading("集合", self.add_collection_requested)
-        self.layout_root.addWidget(self.collection_heading)
+        self.classification_layout.addWidget(self.collection_heading)
         self.collection_box = QVBoxLayout()
         self.collection_box.setSpacing(2)
-        self.layout_root.addLayout(self.collection_box)
+        self.classification_layout.addLayout(self.collection_box)
 
         self.tag_heading = self._section_heading("标签", self.add_tag_requested)
-        self.layout_root.addWidget(self.tag_heading)
+        self.classification_layout.addWidget(self.tag_heading)
         self.tag_box = QVBoxLayout()
         self.tag_box.setSpacing(2)
-        self.layout_root.addLayout(self.tag_box)
-        self.layout_root.addStretch(1)
+        self.classification_layout.addLayout(self.tag_box)
+        self.classification_layout.addStretch(1)
+        self.classification_scroll.setWidget(classification_content)
+        self.layout_root.addWidget(self.classification_scroll, 1)
 
         settings = NavButton("settings", "settings", "设置")
         settings.triggered.connect(lambda _key: self.settings_requested.emit())
@@ -903,25 +1261,90 @@ class Sidebar(QWidget):
     def set_collections(self, collections) -> None:
         self._clear_layout(self.collection_box)
         self.collection_buttons = []
+        self.collection_delete_buttons = {}
+        self.collection_rows = {}
         for row in collections:
             button = NavButton(f"collection:{row['id']}", "folder", row["name"], row["amount"])
             button.set_collapsed(self.collapsed)
             button.triggered.connect(lambda _key, ident=row["id"]: self.navigation_requested.emit("collection", ident))
-            self.collection_box.addWidget(button)
+            delete_button = IconButton("delete", f"删除集合 {row['name']}")
+            delete_button.setVisible(not self.collapsed)
+            delete_button.clicked.connect(
+                lambda _checked=False, ident=row["id"], name=row["name"]: self.delete_collection_requested.emit(
+                    ident, name
+                )
+            )
+            item_row = self._classification_row(button, delete_button)
+            self.collection_box.addWidget(item_row)
             self.collection_buttons.append(button)
+            self.collection_delete_buttons[row["id"]] = delete_button
+            self.collection_rows[row["id"]] = item_row
         self.set_active(getattr(self, "active_key", ""))
 
     def set_tags(self, tags) -> None:
+        self._all_tags = list(tags)
+        if len(self._all_tags) <= 8:
+            self._tags_expanded = False
+        active_key = getattr(self, "active_key", "")
+        if active_key.startswith("tag:"):
+            active_id = active_key.partition(":")[2]
+            if any(str(row["id"]) == active_id for row in self._all_tags[8:]):
+                self._tags_expanded = True
+        self._render_tags()
+
+    def _render_tags(self) -> None:
         self._clear_layout(self.tag_box)
         self.tag_buttons = []
-        for row in tags[:8]:
+        self.tag_delete_buttons = {}
+        self.tag_rows = {}
+        visible_tags = self._all_tags if self._tags_expanded else self._all_tags[:8]
+        for row in visible_tags:
             button = NavButton(f"tag:{row['id']}", "tag", row["name"], row["amount"])
             button.set_custom_icon(QIcon(color_dot(row["color"])))
             button.set_collapsed(self.collapsed)
             button.triggered.connect(lambda _key, ident=row["id"]: self.navigation_requested.emit("tag", ident))
-            self.tag_box.addWidget(button)
+            delete_button = IconButton("delete", f"删除标签 {row['name']}")
+            delete_button.setVisible(not self.collapsed)
+            delete_button.clicked.connect(
+                lambda _checked=False, ident=row["id"], name=row["name"]: self.delete_tag_requested.emit(
+                    ident, name
+                )
+            )
+            item_row = self._classification_row(button, delete_button)
+            self.tag_box.addWidget(item_row)
             self.tag_buttons.append(button)
+            self.tag_delete_buttons[row["id"]] = delete_button
+            self.tag_rows[row["id"]] = item_row
+        self.tags_more_button = None
+        if len(self._all_tags) > 8:
+            if self._tags_expanded:
+                label = "收起标签"
+                count = None
+                glyph = "chevron-up"
+            else:
+                label = "更多标签"
+                count = len(self._all_tags) - 8
+                glyph = "ellipsis"
+            more = NavButton("tags:more", glyph, label, count)
+            more.set_collapsed(self.collapsed)
+            more.triggered.connect(lambda _key: self._toggle_tags_expanded())
+            self.tag_box.addWidget(more)
+            self.tag_buttons.append(more)
+            self.tags_more_button = more
         self.set_active(getattr(self, "active_key", ""))
+
+    def _toggle_tags_expanded(self) -> None:
+        self._tags_expanded = not self._tags_expanded
+        self._render_tags()
+
+    def _classification_row(self, button: NavButton, delete_button: IconButton) -> QWidget:
+        widget = QWidget()
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(0, 0, 0 if self.collapsed else 4, 0)
+        row.setSpacing(0)
+        row.addWidget(button, 1)
+        row.addWidget(delete_button)
+        return widget
 
     def set_active(self, key: str) -> None:
         self.active_key = key
@@ -943,6 +1366,10 @@ class Sidebar(QWidget):
         self.tag_heading.setVisible(not value)
         for button in [*self.nav_buttons.values(), *self.collection_buttons, *self.tag_buttons, *self.footer_buttons]:
             button.set_collapsed(value)
+        for button in [*self.collection_delete_buttons.values(), *self.tag_delete_buttons.values()]:
+            button.setVisible(not value)
+        for row in [*self.collection_rows.values(), *self.tag_rows.values()]:
+            row.layout().setContentsMargins(0, 0, 0 if value else 4, 0)
         start = self.width()
         end = 72 if value else 242
         self.animation.stop()
@@ -1023,7 +1450,7 @@ class AssetGridDelegate(QStyledItemDelegate):
         kind = TYPE_LABELS.get(record["kind"], record["kind"])
         painter.setPen(muted)
         painter.drawText(QRect(left, card.top() + 10, 90, 24), Qt.AlignmentFlag.AlignVCenter, kind)
-        created_at = str(record["created_at"])
+        created_at = format_local_timestamp(record["created_at"])
         time_text = created_at[11:16] if len(created_at) >= 16 else ""
         painter.drawText(
             QRect(right - 92, card.top() + 10, 54, 24),
@@ -1176,7 +1603,8 @@ class AssetGrid(QListView):
         available = max(210, self.viewport().width())
         columns = max(1, available // 245)
         gap = 12
-        card_width = max(210, (available - columns * gap) // columns)
+        layout_width = max(210, available - 1)
+        card_width = max(210, (layout_width - columns * gap) // columns)
         self.columns = columns
         self.setGridSize(QSize(card_width + gap, AssetGridDelegate.card_height + gap))
 
@@ -1349,6 +1777,20 @@ class AssetGrid(QListView):
 
     def mouseDoubleClickEvent(self, event) -> None:
         index = self.indexAt(event.position().toPoint())
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and index.isValid()
+            and index.column() == 0
+            and self._favorite_delegate.favorite_rect(self.visualRect(index)).contains(
+                event.position().toPoint()
+            )
+        ):
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        index = self.indexAt(event.position().toPoint())
         if index.isValid() and self.delegate.favorite_rect(self.visualRect(index)).contains(event.position().toPoint()):
             event.accept()
             return
@@ -1365,28 +1807,36 @@ class _AssetTableFavoriteDelegate(QStyledItemDelegate):
             super().paint(painter, option, index)
             return
         base_option = QStyleOptionViewItem(option)
-        title = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        self.initStyleOption(base_option, index)
+        title = base_option.text
         base_option.text = ""
-        super().paint(painter, base_option, index)
-        painter.save()
-        selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        painter.setPen(
-            option.palette.highlightedText().color()
-            if selected
-            else option.palette.text().color()
+        widget = base_option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem,
+            base_option,
+            painter,
+            widget,
         )
-        text_rect = option.rect.adjusted(8, 0, -38, 0)
-        title = option.fontMetrics.elidedText(
+        painter.save()
+        selected = bool(base_option.state & QStyle.StateFlag.State_Selected)
+        painter.setPen(
+            base_option.palette.highlightedText().color()
+            if selected
+            else base_option.palette.text().color()
+        )
+        text_rect = base_option.rect.adjusted(8, 0, -38, 0)
+        title = base_option.fontMetrics.elidedText(
             title, Qt.TextElideMode.ElideRight, max(0, text_rect.width())
         )
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter, title)
         favorite = bool(index.data(AssetItemModel.FavoriteRole))
         painter.setPen(QColor("#21a8fb") if favorite else QColor("#8a8a8a"))
-        font = QFont(option.font)
+        font = QFont(base_option.font)
         font.setPointSizeF(max(10.0, font.pointSizeF() + 1.0))
         painter.setFont(font)
         painter.drawText(
-            self.favorite_rect(option.rect),
+            self.favorite_rect(base_option.rect),
             Qt.AlignmentFlag.AlignCenter,
             "★" if favorite else "☆",
         )
@@ -1554,16 +2004,7 @@ def _startfile_or_warn(parent: QWidget, path: Path | str) -> None:
 
 
 def _wrap_detail_text(value: object, interval: int = 24) -> str:
-    text = str(value)
-    output: list[str] = []
-    run_length = 0
-    for character in text:
-        output.append(character)
-        run_length += 1
-        if character in "\\/_-." or run_length >= interval:
-            output.append("\u200b")
-            run_length = 0
-    return "".join(output)
+    return str(value)
 
 
 class DetailPanel(QScrollArea):
@@ -1594,6 +2035,10 @@ class DetailPanel(QScrollArea):
         self._thumbnail_loader = _ThumbnailDecodeQueue(self)
         self._thumbnail_loader.decoded.connect(self._thumbnail_decoded)
         self._image_source_pixmap = QPixmap()
+        self._tag_names: list[str] = []
+        self._tag_colors: list[str] = []
+        self._tags_expanded = False
+        self.tags_more_button: QPushButton | None = None
         self.content_widget = QWidget()
         self.content_widget.setObjectName("DetailPanelContent")
         self.content_widget.setMinimumWidth(0)
@@ -1611,6 +2056,7 @@ class DetailPanel(QScrollArea):
         layout.addLayout(top)
         self.title = QLabel("选择一项查看详情")
         self.title.setObjectName("Title")
+        self.title.setTextFormat(Qt.TextFormat.PlainText)
         self.title.setWordWrap(True)
         self.title.setMinimumWidth(0)
         self.title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -1629,6 +2075,7 @@ class DetailPanel(QScrollArea):
         self.preview_stack.addWidget(self.text_preview)
         layout.addWidget(self.preview_stack, 1)
         self.meta = QLabel()
+        self.meta.setTextFormat(Qt.TextFormat.PlainText)
         self.meta.setWordWrap(True)
         self.meta.setMinimumWidth(0)
         self.meta.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -1637,7 +2084,7 @@ class DetailPanel(QScrollArea):
 
         collection_row = QHBoxLayout()
         collection_row.addWidget(QLabel("集合"))
-        self.collection_combo = QComboBox()
+        self.collection_combo = FluentComboBox()
         self.collection_combo.currentIndexChanged.connect(self._collection_changed)
         collection_row.addWidget(self.collection_combo, 1)
         layout.addLayout(collection_row)
@@ -1646,6 +2093,7 @@ class DetailPanel(QScrollArea):
         tag_title.addWidget(QLabel("标签"))
         tag_title.addStretch()
         add_tag = IconButton("add", "添加标签")
+        self.add_tag_button = add_tag
         add_tag.clicked.connect(lambda: self.current_item and self.add_tag_requested.emit(self.current_item["id"]))
         tag_title.addWidget(add_tag)
         layout.addLayout(tag_title)
@@ -1666,6 +2114,7 @@ class DetailPanel(QScrollArea):
         layout.addLayout(ocr_row)
         self.ocr_text = QLabel("尚未识别")
         self.ocr_text.setObjectName("Muted")
+        self.ocr_text.setTextFormat(Qt.TextFormat.PlainText)
         self.ocr_text.setWordWrap(True)
         self.ocr_text.setMinimumWidth(0)
         self.ocr_text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -1682,6 +2131,7 @@ class DetailPanel(QScrollArea):
         layout.addLayout(ai_row)
         self.ai_description = QLabel("尚未生成")
         self.ai_description.setObjectName("Muted")
+        self.ai_description.setTextFormat(Qt.TextFormat.PlainText)
         self.ai_description.setWordWrap(True)
         self.ai_description.setMinimumWidth(0)
         self.ai_description.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -1740,6 +2190,8 @@ class DetailPanel(QScrollArea):
             return False
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
+        if previous_item_id != item["id"]:
+            self._tags_expanded = False
         self.current_item = item
         self._image_source_pixmap = QPixmap()
         self.image_preview.clear()
@@ -1766,12 +2218,14 @@ class DetailPanel(QScrollArea):
             self.preview_stack.setCurrentWidget(self.text_preview)
         dimensions = f"{item['width']} × {item['height']}\n" if item["width"] else ""
         path_text = f"\n路径  {_wrap_detail_text(item['path'])}" if item["path"] else ""
-        self.meta.setText(f"类型  {TYPE_LABELS.get(item['kind'], item['kind'])}\n{dimensions}大小  {human_size(item['file_size'])}\n时间  {item['created_at'].replace('T',' ')}\n来源  {item['source']}{path_text}")
+        self.meta.setText(f"类型  {TYPE_LABELS.get(item['kind'], item['kind'])}\n{dimensions}大小  {human_size(item['file_size'])}\n时间  {format_local_timestamp(item['created_at'])}\n来源  {item['source']}{path_text}")
         self.meta.setToolTip(item["path"] or "")
         self.collection_combo.blockSignals(True)
         index = self.collection_combo.findData(item["collection_id"])
         self.collection_combo.setCurrentIndex(max(0, index))
         self.collection_combo.blockSignals(False)
+        self.collection_combo.setEnabled(True)
+        self.add_tag_button.setEnabled(True)
         self._set_tags(item["tag_names"] or "", item["tag_colors"] or "")
         self.ai_description.setText(
             _wrap_detail_text(item["ai_description"]) if item["ai_description"] else "尚未生成"
@@ -1790,6 +2244,7 @@ class DetailPanel(QScrollArea):
         loaded_notes = item["notes"] or ""
         self.notes.setPlainText(self._note_drafts.get(item["id"], loaded_notes))
         self.notes.blockSignals(False)
+        self.notes.setEnabled(True)
         self._loaded_notes = loaded_notes
         return True
 
@@ -1808,6 +2263,7 @@ class DetailPanel(QScrollArea):
         self.meta.clear()
         self.meta.setToolTip("")
         self._set_tags("", "")
+        self._tags_expanded = False
         self.ai_description.setText("尚未生成")
         self.ocr_text.setText("尚未识别")
         self.ai_button.setEnabled(False)
@@ -1817,9 +2273,12 @@ class DetailPanel(QScrollArea):
         self.collection_combo.blockSignals(True)
         self.collection_combo.setCurrentIndex(0)
         self.collection_combo.blockSignals(False)
+        self.collection_combo.setEnabled(False)
+        self.add_tag_button.setEnabled(False)
         self.notes.blockSignals(True)
         self.notes.clear()
         self.notes.blockSignals(False)
+        self.notes.setEnabled(False)
         self._loaded_notes = ""
         for button in self.item_action_buttons:
             button.setEnabled(False)
@@ -1905,20 +2364,38 @@ class DetailPanel(QScrollArea):
             item = self.tags_box.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        name_list = names.split("\x1f") if names else []
-        color_list = colors.split("\x1f") if colors else []
-        for index, name in enumerate(name_list[:4]):
+        self._tag_names = names.split("\x1f") if names else []
+        self._tag_colors = colors.split("\x1f") if colors else []
+        self.tags_more_button = None
+        visible_names = self._tag_names if self._tags_expanded else self._tag_names[:4]
+        for index, name in enumerate(visible_names):
             button = QPushButton()
             button.setObjectName("TagChip")
             button.setText(button.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, 108))
             button.setMinimumWidth(0)
             button.setMaximumWidth(130)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            color = color_list[index] if index < len(color_list) else "#64748b"
+            color = self._tag_colors[index] if index < len(self._tag_colors) else "#64748b"
             button.setIcon(QIcon(color_dot(color)))
             button.setToolTip(f"{name}\n点击移除标签")
             button.clicked.connect(lambda _checked=False, tag=name: self.current_item and self.remove_tag_requested.emit(self.current_item["id"], tag))
             self.tags_box.addWidget(button, index // 2, index % 2)
+        if len(self._tag_names) > 4:
+            more = QPushButton()
+            more.setObjectName("TagMoreButton")
+            if self._tags_expanded:
+                more.setText("收起标签")
+                more.setToolTip("仅显示前四个标签")
+            else:
+                more.setText(f"更多标签  +{len(self._tag_names) - 4}")
+                more.setToolTip("显示全部标签")
+            more.clicked.connect(self._toggle_tags_expanded)
+            self.tags_box.addWidget(more, (len(visible_names) + 1) // 2, 0, 1, 2)
+            self.tags_more_button = more
+
+    def _toggle_tags_expanded(self) -> None:
+        self._tags_expanded = not self._tags_expanded
+        self._set_tags("\x1f".join(self._tag_names), "\x1f".join(self._tag_colors))
 
     def _collection_changed(self, _index: int) -> None:
         if self.current_item:
@@ -1965,7 +2442,7 @@ class MarkdownDialog(QDialog):
     def __init__(self, title: str, content: str, path: str | None = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(920, 700)
+        self.resize(_fit_dialog_size(self, QSize(920, 700)))
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
         heading = QLabel(title)
@@ -1997,7 +2474,7 @@ class DateDialog(QDialog):
         self.setObjectName("FluentDialog")
         self.setProperty("dateDialog", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.resize(420, 560)
+        self.setFixedSize(_fit_dialog_size(self, QSize(420, 560)))
         root = QVBoxLayout(self)
         root.setContentsMargins(1, 1, 1, 1)
         root.setSpacing(0)
@@ -2043,7 +2520,9 @@ class SettingsDialog(QDialog):
         self.setObjectName("FluentDialog")
         self.setProperty("settingsDialog", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setFixedSize(620, 560)
+        preferred_size = QSize(620, 560)
+        dialog_size = _fit_dialog_size(self, preferred_size)
+        self.setFixedSize(dialog_size)
         root = QVBoxLayout(self)
         root.setContentsMargins(1, 1, 1, 1)
         root.setSpacing(0)
@@ -2059,7 +2538,7 @@ class SettingsDialog(QDialog):
         heading = QLabel("常规")
         heading.setObjectName("SectionTitle")
         layout.addWidget(heading)
-        self.close_to_tray = QComboBox()
+        self.close_to_tray = FluentComboBox()
         self.close_to_tray.addItem("关闭窗口时最小化到托盘", True)
         self.close_to_tray.addItem("关闭窗口时退出", False)
         self.close_to_tray.setCurrentIndex(0 if settings.get("close_to_tray", True) else 1)
@@ -2130,7 +2609,17 @@ class SettingsDialog(QDialog):
         privacy.setWordWrap(True)
         layout.addWidget(privacy)
         layout.addStretch()
-        root.addWidget(content, 1)
+        if dialog_size != preferred_size:
+            scroll = QScrollArea()
+            scroll.setObjectName("DialogScroll")
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setVerticalScrollBar(AutoHideScrollBar())
+            scroll.setWidget(content)
+            root.addWidget(scroll, 1)
+        else:
+            root.addWidget(content, 1)
 
         footer = QFrame()
         footer.setObjectName("DialogFooter")

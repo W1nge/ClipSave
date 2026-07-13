@@ -4,7 +4,6 @@ import datetime as dt
 import hashlib
 import json
 import mimetypes
-import ntpath
 import os
 import re
 import secrets
@@ -102,6 +101,7 @@ class _SQLiteLeafLock:
             if replaceable:
                 share_mode = storage._FILE_SHARE_READ | storage._FILE_SHARE_DELETE
             creator = None
+            created_candidate = False
             handle = None
             try:
                 if create:
@@ -111,6 +111,7 @@ class _SQLiteLeafLock:
                         storage._CREATE_NEW,
                         share_mode=share_mode,
                     )
+                    created_candidate = True
                 handle = storage._verified_windows_handle(
                     candidate,
                     root,
@@ -124,7 +125,7 @@ class _SQLiteLeafLock:
                 if creator is not None:
                     storage._close_handle(creator)
                     creator = None
-                if create:
+                if created_candidate:
                     try:
                         candidate.unlink()
                     except OSError:
@@ -273,7 +274,7 @@ class _SQLiteLeafLock:
 
 
 class LibraryDatabase:
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 5
     BUSY_TIMEOUT_MS = 30_000
     BACKUP_LIMIT = 3
     MAX_BACKUP_BYTES = 8 * 1024 * 1024 * 1024
@@ -301,6 +302,10 @@ class LibraryDatabase:
             "ocr_text",
             "ai_description",
             "embedding",
+            "embedding_provider",
+            "embedding_model",
+            "embedding_dimensions",
+            "embedding_revision",
             "collection_id",
             "external",
             "missing",
@@ -315,6 +320,17 @@ class LibraryDatabase:
         "idx_items_resolved_path": (False, ("resolved_path",), False),
         "idx_items_live_text_hash": (True, ("content_hash",), True),
         "idx_items_live_file_hash": (True, ("content_hash",), True),
+        "idx_items_embedding_profile": (
+            False,
+            (
+                "embedding_provider",
+                "embedding_model",
+                "embedding_revision",
+                "embedding_dimensions",
+                "id",
+            ),
+            True,
+        ),
     }
 
     def __init__(self, path: Path = DATABASE_PATH):
@@ -337,6 +353,12 @@ class LibraryDatabase:
             "backup_error": None,
         }
         self.needs_library_rescan = False
+        self.last_scan_report = {
+            "scanned": 0,
+            "added": 0,
+            "failed": 0,
+            "errors": [],
+        }
         storage.validate_managed_directory(self.backup_dir, self.path.parent)
         storage.validate_managed_write_path(self.path, self.path.parent)
         primary_exists = self.path.exists()
@@ -345,8 +367,18 @@ class LibraryDatabase:
             self._recover_corrupt_database()
         elif primary_exists and not self._startup_quick_check():
             self._recover_corrupt_database()
-        elif not primary_exists and any(self.backup_dir.glob("backup-*.db")):
+        elif not primary_exists and (
+            any(self.backup_dir.glob("backup-*.db"))
+            or Path(f"{self.path}-wal").exists()
+            or Path(f"{self.path}-shm").exists()
+        ):
             self._recover_missing_database()
+        if self.path.exists():
+            schema_version = self._read_schema_version_read_only(self.path)
+            if schema_version > self.SCHEMA_VERSION:
+                raise UnsupportedSchemaVersion(
+                    f"Database schema version {schema_version} is newer than supported version {self.SCHEMA_VERSION}"
+                )
         self.connection = self._open_connection()
         try:
             self.create_schema()
@@ -644,6 +676,31 @@ class LibraryDatabase:
         return state is BackupValidation.VALID
 
     @classmethod
+    def _read_schema_version_read_only(cls, path: Path) -> int:
+        connection = None
+        leaf_lock = _SQLiteLeafLock.acquire(
+            path,
+            path.parent,
+            create=False,
+            writable=False,
+        )
+        try:
+            leaf_lock.verify()
+            try:
+                connection = sqlite3.connect(
+                    f"{path.resolve().as_uri()}?mode=ro",
+                    uri=True,
+                    timeout=cls.BUSY_TIMEOUT_MS / 1000,
+                )
+                leaf_lock.verify()
+                return int(connection.execute("PRAGMA user_version").fetchone()[0])
+            finally:
+                if connection is not None:
+                    connection.close()
+        finally:
+            leaf_lock.close()
+
+    @classmethod
     def _backup_schema_version(cls, path: Path) -> int | None:
         connection = None
         try:
@@ -878,17 +935,21 @@ class LibraryDatabase:
                     writable=True,
                 )
                 destination = None
+                source = None
                 backup_completed = False
                 try:
                     destination = sqlite3.connect(temporary)
                     destination_lock.verify()
                     with self._lock:
                         self._assert_database_leaf()
-                        self.connection.backup(destination)
                         backed_up_generation = self._mutation_generation
+                    source = self._open_backup_source()
+                    source.backup(destination)
                     destination_lock.verify()
                     backup_completed = True
                 finally:
+                    if source is not None:
+                        source.close()
                     if destination is not None:
                         destination.close()
                     destination_lock.close()
@@ -957,6 +1018,15 @@ class LibraryDatabase:
             self._last_backup_at = timestamp
             self._last_backup_error = None
         return result
+
+    def _open_backup_source(self) -> sqlite3.Connection:
+        source = sqlite3.connect(
+            f"{self.path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=self.BUSY_TIMEOUT_MS / 1000,
+        )
+        source.execute(f"PRAGMA busy_timeout = {self.BUSY_TIMEOUT_MS}")
+        return source
 
     @classmethod
     def _managed_backup_hash(cls, path: Path) -> str:
@@ -1072,6 +1142,12 @@ class LibraryDatabase:
                     if version == 2:
                         self._migrate_v2_to_v3_locked()
                         version = 3
+                    if version == 3:
+                        self._migrate_v3_to_v4_locked()
+                        version = 4
+                    if version == 4:
+                        self._migrate_v4_to_v5_locked()
+                        version = 5
                     self.connection.execute(f"PRAGMA user_version = {version}")
             self.repair_report = self._repair_resolved_paths_locked()
             self._validate_schema()
@@ -1100,6 +1176,13 @@ class LibraryDatabase:
         for table, required in cls.REQUIRED_COLUMNS.items():
             columns = {row[1] for row in table_info[table]}
             compatible = required - ({"resolved_path"} if version == 1 and table == "items" else set())
+            if version < 4 and table == "items":
+                compatible -= {
+                    "embedding_provider",
+                    "embedding_model",
+                    "embedding_dimensions",
+                    "embedding_revision",
+                }
             missing_columns = compatible - columns
             if missing_columns:
                 raise InvalidDatabaseSchema(
@@ -1181,11 +1264,22 @@ class LibraryDatabase:
 
         if version >= 2:
             ordinary = {
-                name: spec for name, spec in cls.REQUIRED_INDEXES.items() if not spec[2]
+                name: spec
+                for name, spec in cls.REQUIRED_INDEXES.items()
+                if not spec[2] and (version >= 4 or name != "idx_items_embedding_profile")
             }
             cls._validate_required_indexes(connection, ordinary)
         if version >= 3:
-            cls._validate_required_indexes(connection, cls.REQUIRED_INDEXES)
+            current_indexes = (
+                cls.REQUIRED_INDEXES
+                if version >= 4
+                else {
+                    name: spec
+                    for name, spec in cls.REQUIRED_INDEXES.items()
+                    if name != "idx_items_embedding_profile"
+                }
+            )
+            cls._validate_required_indexes(connection, current_indexes)
             for row in connection.execute('PRAGMA index_list("items")').fetchall():
                 if not int(row[2]) or int(row[4]):
                     continue
@@ -1216,6 +1310,20 @@ class LibraryDatabase:
                 or "missing=0" not in file_index
             ):
                 raise InvalidDatabaseSchema("Database schema has an invalid live file hash index")
+
+        if version >= 4:
+            item_types = {row[1]: str(row[2]).upper() for row in table_info["items"]}
+            expected_embedding_types = {
+                "embedding_provider": "TEXT",
+                "embedding_model": "TEXT",
+                "embedding_dimensions": "INTEGER",
+                "embedding_revision": "INTEGER",
+            }
+            if any(
+                item_types.get(name) != expected
+                for name, expected in expected_embedding_types.items()
+            ):
+                raise InvalidDatabaseSchema("Database schema has invalid embedding metadata types")
 
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
@@ -1290,6 +1398,10 @@ class LibraryDatabase:
                 ocr_text TEXT NOT NULL DEFAULT '',
                 ai_description TEXT NOT NULL DEFAULT '',
                 embedding TEXT,
+                embedding_provider TEXT,
+                embedding_model TEXT,
+                embedding_dimensions INTEGER,
+                embedding_revision INTEGER,
                 collection_id INTEGER REFERENCES collections(id) ON DELETE SET NULL,
                 external INTEGER NOT NULL DEFAULT 0,
                 missing INTEGER NOT NULL DEFAULT 0
@@ -1302,6 +1414,10 @@ class LibraryDatabase:
                WHERE kind='text' AND content_hash IS NOT NULL AND missing=0""",
             """CREATE UNIQUE INDEX idx_items_live_file_hash ON items(content_hash)
                WHERE kind IN ('image','markdown') AND content_hash IS NOT NULL AND missing=0""",
+            """CREATE INDEX idx_items_embedding_profile
+               ON items(embedding_provider, embedding_model, embedding_revision,
+                        embedding_dimensions, id)
+               WHERE embedding IS NOT NULL AND missing=0""",
             """CREATE TABLE tags (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
@@ -1385,10 +1501,79 @@ class LibraryDatabase:
         )
         self.connection.execute("PRAGMA user_version = 3")
 
+    def _migrate_v3_to_v4_locked(self) -> None:
+        columns = {
+            row[1]
+            for row in self.connection.execute('PRAGMA table_info("items")').fetchall()
+        }
+        additions = (
+            ("embedding_provider", "TEXT"),
+            ("embedding_model", "TEXT"),
+            ("embedding_dimensions", "INTEGER"),
+            ("embedding_revision", "INTEGER"),
+        )
+        for name, definition in additions:
+            if name not in columns:
+                self.connection.execute(f"ALTER TABLE items ADD COLUMN {name} {definition}")
+        self.connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_items_embedding_profile
+               ON items(embedding_provider, embedding_model, embedding_revision,
+                        embedding_dimensions, id)
+               WHERE embedding IS NOT NULL AND missing=0"""
+        )
+
+    @staticmethod
+    def _utc_timestamp(value: dt.datetime | str | None) -> str:
+        if isinstance(value, dt.datetime):
+            parsed = value
+        else:
+            text = str(value or "")
+            try:
+                parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return text
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return parsed.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
+
+    def _migrate_v4_to_v5_locked(self) -> None:
+        for table, key in (("collections", "id"), ("items", "id")):
+            columns = ("created_at", "updated_at") if table == "items" else ("created_at",)
+            rows = self.connection.execute(
+                f"SELECT {key},{','.join(columns)} FROM {table}"
+            ).fetchall()
+            for row in rows:
+                values = [self._utc_timestamp(row[index + 1]) for index in range(len(columns))]
+                assignments = ",".join(f"{column}=?" for column in columns)
+                self.connection.execute(
+                    f"UPDATE {table} SET {assignments} WHERE {key}=?",
+                    (*values, row[0]),
+                )
+
     @staticmethod
     def _path_key(path: Path | str) -> str:
         value = Path(path).expanduser().resolve(strict=False)
         return os.path.normcase(os.path.normpath(str(value)))
+
+    @staticmethod
+    def _embedding_values(
+        embedding: Iterable[float] | None,
+        provider: str | None = None,
+        model: str | None = None,
+        revision: int | None = None,
+    ) -> tuple[str | None, str | None, str | None, int | None, int | None]:
+        if embedding is None:
+            return None, None, None, None, None
+        values = list(embedding)
+        if not values:
+            raise ValueError("Embedding must contain at least one value")
+        if provider is None and model is None and revision is None:
+            return json.dumps(values), None, None, None, None
+        if not provider or not model or type(revision) is not int or revision < 1:
+            raise ValueError("Embedding metadata must include provider, model and a positive revision")
+        return json.dumps(values), str(provider), str(model), len(values), revision
 
     def _repair_resolved_paths_locked(self, refresh_all: bool = False) -> dict[str, int]:
         where = "path IS NOT NULL" if refresh_all else "path IS NOT NULL AND resolved_path IS NULL"
@@ -1565,20 +1750,32 @@ class LibraryDatabase:
 
     def scan_legacy_files(self, cancel_event: threading.Event | None = None) -> int:
         added = 0
+        scanned = 0
+        failures = 0
+        errors: list[str] = []
         for path in self._iter_safe_files(PICTURE_DIR, self.IMAGE_SUFFIXES):
             if cancel_event is not None and cancel_event.is_set():
+                self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
                 return added
+            scanned += 1
             try:
                 added += int(self.import_file(path, "image"))
-            except Exception:
-                continue
+            except Exception as exc:
+                failures += 1
+                if len(errors) < 8:
+                    errors.append(f"{path.name}: {exc}")
         for path in self._iter_safe_files(MARKDOWN_DIR, (".md",)):
             if cancel_event is not None and cancel_event.is_set():
+                self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
                 return added
+            scanned += 1
             try:
                 added += int(self.import_file(path, "markdown"))
-            except Exception:
-                continue
+            except Exception as exc:
+                failures += 1
+                if len(errors) < 8:
+                    errors.append(f"{path.name}: {exc}")
+        self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
         return added
 
     def scan_unindexed_files(self, cancel_event: threading.Event | None = None) -> int:
@@ -1615,10 +1812,15 @@ class LibraryDatabase:
                 ).fetchall()
             }
         added = 0
+        scanned = 0
+        failures = 0
+        errors: list[str] = []
         for root, suffixes, kind in roots:
             for path in self._iter_safe_files(root, suffixes):
                 if cancel_event is not None and cancel_event.is_set():
+                    self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
                     return added
+                scanned += 1
                 try:
                     path_key = self._path_key(path)
                     if path_key in indexed_paths:
@@ -1626,8 +1828,11 @@ class LibraryDatabase:
                     if self.import_file(path, kind):
                         added += 1
                         indexed_paths.add(path_key)
-                except Exception:
-                    continue
+                except Exception as exc:
+                    failures += 1
+                    if len(errors) < 8:
+                        errors.append(f"{path.name}: {exc}")
+        self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
         return added
 
     def import_file(
@@ -1771,7 +1976,7 @@ class LibraryDatabase:
                 identity_handle.seek(0)
                 content = identity_handle.read().decode("utf-8", errors="replace")
             managed_local = is_under_local_store(path)
-            created = dt.datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+            created = self._utc_timestamp(dt.datetime.fromtimestamp(stat.st_mtime))
             resolved_path = self._path_key(path)
             mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             source = "导入文件" if copy_to_library else "现有文件"
@@ -1881,10 +2086,10 @@ class LibraryDatabase:
                 identity_handle.close()
 
     def add_text(self, text: str, created_at: dt.datetime | None = None) -> int | None:
-        created_at = created_at or dt.datetime.now()
+        created_at = created_at or dt.datetime.now(dt.timezone.utc)
         digest = self.text_hash(text)
         title = next((line.strip() for line in text.splitlines() if line.strip()), "剪贴板文字")[:80]
-        timestamp = created_at.isoformat(timespec="seconds")
+        timestamp = self._utc_timestamp(created_at)
         with self._transaction():
             cursor = self.connection.execute(
                 """
@@ -1897,7 +2102,7 @@ class LibraryDatabase:
             return int(cursor.lastrowid) if cursor.rowcount == 1 else None
 
     def add_image(self, path: Path, created_at: dt.datetime | None = None) -> int | None:
-        created_at = created_at or dt.datetime.now()
+        created_at = created_at or dt.datetime.now(dt.timezone.utc)
         try:
             if is_under_local_store(path):
                 source = storage.open_managed_binary(
@@ -1923,7 +2128,7 @@ class LibraryDatabase:
                     return None
         except (OSError, ValueError):
             return None
-        timestamp = created_at.isoformat(timespec="seconds")
+        timestamp = self._utc_timestamp(created_at)
         resolved_path = self._path_key(path)
         with self._transaction():
             cursor = self.connection.execute(
@@ -2001,10 +2206,12 @@ class LibraryDatabase:
         if favorite:
             clauses.append("i.favorite = 1")
         if day:
-            clauses.append("substr(i.created_at,1,10) = ?")
+            clauses.append("date(i.created_at, 'localtime') = ?")
             parameters.append(day)
         if recent_days:
-            cutoff = (dt.datetime.now() - dt.timedelta(days=recent_days)).isoformat(timespec="seconds")
+            cutoff = self._utc_timestamp(
+                dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=recent_days)
+            )
             clauses.append("i.created_at >= ?")
             parameters.append(cutoff)
         if collection_id is not None:
@@ -2027,7 +2234,9 @@ class LibraryDatabase:
                 i.id, i.kind, i.title, substr(i.content,1,{self.SUMMARY_CONTENT_LIMIT}) AS content,
                 i.path, i.resolved_path, i.mime, i.content_hash, i.created_at, i.updated_at,
                 i.file_size, i.width, i.height, i.source, i.favorite, '' AS notes,
-                '' AS ocr_text, '' AS ai_description, NULL AS embedding, i.collection_id,
+                '' AS ocr_text, '' AS ai_description, NULL AS embedding,
+                i.embedding_provider, i.embedding_model, i.embedding_dimensions,
+                i.embedding_revision, i.collection_id,
                 i.external, i.missing
             """
         pagination = ""
@@ -2101,7 +2310,7 @@ class LibraryDatabase:
     def days(self) -> list[tuple[str, int]]:
         with self._lock:
             return [(row["day"], row["amount"]) for row in self.connection.execute(
-                "SELECT substr(created_at,1,10) day, COUNT(*) amount FROM items WHERE missing=0 GROUP BY day ORDER BY day DESC"
+                "SELECT date(created_at, 'localtime') day, COUNT(*) amount FROM items WHERE missing=0 GROUP BY day ORDER BY day DESC"
             ).fetchall()]
 
     def set_favorite(self, item_id: int, value: bool) -> None:
@@ -2112,7 +2321,7 @@ class LibraryDatabase:
         with self._transaction():
             self.connection.execute(
                 "UPDATE items SET notes=?, updated_at=? WHERE id=?",
-                (notes, dt.datetime.now().isoformat(timespec="seconds"), item_id),
+                (notes, self._utc_timestamp(dt.datetime.now(dt.timezone.utc)), item_id),
             )
 
     def set_notes_if_unchanged(
@@ -2127,7 +2336,7 @@ class LibraryDatabase:
                 """,
                 (
                     new_notes,
-                    dt.datetime.now().isoformat(timespec="seconds"),
+                    self._utc_timestamp(dt.datetime.now(dt.timezone.utc)),
                     item_id,
                     expected_notes,
                 ),
@@ -2155,13 +2364,17 @@ class LibraryDatabase:
         with self._transaction():
             self.connection.execute(
                 "INSERT OR IGNORE INTO collections(name,created_at) VALUES(?,?)",
-                (name, dt.datetime.now().isoformat(timespec="seconds")),
+                (name, self._utc_timestamp(dt.datetime.now(dt.timezone.utc))),
             )
             return int(self.connection.execute("SELECT id FROM collections WHERE name=?", (name,)).fetchone()[0])
 
     def set_collection(self, item_id: int, collection_id: int | None) -> None:
         with self._transaction():
             self.connection.execute("UPDATE items SET collection_id=? WHERE id=?", (collection_id, item_id))
+
+    def delete_collection(self, collection_id: int) -> None:
+        with self._transaction():
+            self.connection.execute("DELETE FROM collections WHERE id=?", (collection_id,))
 
     def tags(self) -> list[sqlite3.Row]:
         with self._lock:
@@ -2200,6 +2413,10 @@ class LibraryDatabase:
                 (item_id, tag_name),
             )
 
+    def delete_tag(self, tag_id: int) -> None:
+        with self._transaction():
+            self.connection.execute("DELETE FROM tags WHERE id=?", (tag_id,))
+
     def remove_item(self, item_id: int) -> None:
         with self._transaction():
             self.connection.execute("DELETE FROM items WHERE id=?", (item_id,))
@@ -2208,22 +2425,165 @@ class LibraryDatabase:
         with self._transaction():
             self.connection.execute("UPDATE items SET missing=1 WHERE id=?", (item_id,))
 
-    def update_ai(self, item_id: int, description: str, embedding: Iterable[float] | None = None) -> None:
+    def update_ai(
+        self,
+        item_id: int,
+        description: str,
+        embedding: Iterable[float] | None = None,
+        *,
+        embedding_provider: str | None = None,
+        embedding_model: str | None = None,
+        embedding_revision: int | None = None,
+    ) -> None:
+        embedding_json, provider, model, dimensions, revision = self._embedding_values(
+            embedding, embedding_provider, embedding_model, embedding_revision
+        )
         with self._transaction():
             self.connection.execute(
-                "UPDATE items SET ai_description=?, embedding=? WHERE id=?",
-                (description, json.dumps(list(embedding)) if embedding is not None else None, item_id),
+                """UPDATE items
+                   SET ai_description=?, embedding=?, embedding_provider=?, embedding_model=?,
+                       embedding_dimensions=?, embedding_revision=?
+                   WHERE id=?""",
+                (description, embedding_json, provider, model, dimensions, revision, item_id),
             )
+
+    def update_ai_if_current(
+        self,
+        item_id: int,
+        expected_content_hash: str,
+        description: str,
+        embedding: Iterable[float] | None = None,
+        *,
+        embedding_provider: str | None = None,
+        embedding_model: str | None = None,
+        embedding_revision: int | None = None,
+    ) -> bool:
+        embedding_json, provider, model, dimensions, revision = self._embedding_values(
+            embedding, embedding_provider, embedding_model, embedding_revision
+        )
+        with self._transaction():
+            cursor = self.connection.execute(
+                """
+                UPDATE items
+                SET ai_description=?, embedding=?, embedding_provider=?, embedding_model=?,
+                    embedding_dimensions=?, embedding_revision=?
+                WHERE id=? AND content_hash=? AND missing=0
+                """,
+                (
+                    description,
+                    embedding_json,
+                    provider,
+                    model,
+                    dimensions,
+                    revision,
+                    item_id,
+                    expected_content_hash,
+                ),
+            )
+            return cursor.rowcount == 1
 
     def update_ocr(self, item_id: int, text: str) -> None:
         with self._transaction():
             self.connection.execute("UPDATE items SET ocr_text=? WHERE id=?", (text, item_id))
 
-    def embedded_items(self) -> list[sqlite3.Row]:
+    def update_ocr_if_current(
+        self, item_id: int, expected_content_hash: str, text: str
+    ) -> bool:
+        with self._transaction():
+            cursor = self.connection.execute(
+                """
+                UPDATE items
+                SET ocr_text=?
+                WHERE id=? AND content_hash=? AND missing=0
+                """,
+                (text, item_id, expected_content_hash),
+            )
+            return cursor.rowcount == 1
+
+    def embedded_items(
+        self,
+        *,
+        embedding_provider: str | None = None,
+        embedding_model: str | None = None,
+        embedding_dimensions: int | None = None,
+        embedding_revision: int | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses, parameters = self._embedding_filter(
+            embedding_provider, embedding_model, embedding_dimensions, embedding_revision
+        )
         with self._lock:
             return list(self.connection.execute(
-                "SELECT id,embedding FROM items WHERE embedding IS NOT NULL AND missing=0"
+                f"SELECT id,embedding FROM items WHERE {' AND '.join(clauses)}",
+                parameters,
             ).fetchall())
+
+    @staticmethod
+    def _embedding_filter(
+        embedding_provider: str | None,
+        embedding_model: str | None,
+        embedding_dimensions: int | None,
+        embedding_revision: int | None,
+    ) -> tuple[list[str], list[object]]:
+        clauses = ["embedding IS NOT NULL", "missing=0"]
+        parameters: list[object] = []
+        for column, value in (
+            ("embedding_provider", embedding_provider),
+            ("embedding_model", embedding_model),
+            ("embedding_dimensions", embedding_dimensions),
+            ("embedding_revision", embedding_revision),
+        ):
+            if value is not None:
+                clauses.append(f"{column}=?")
+                parameters.append(value)
+        return clauses, parameters
+
+    def embedded_item_count(
+        self,
+        *,
+        embedding_provider: str | None = None,
+        embedding_model: str | None = None,
+        embedding_dimensions: int | None = None,
+        embedding_revision: int | None = None,
+    ) -> int:
+        clauses, parameters = self._embedding_filter(
+            embedding_provider, embedding_model, embedding_dimensions, embedding_revision
+        )
+        with self._lock:
+            return int(
+                self.connection.execute(
+                    f"SELECT COUNT(*) FROM items WHERE {' AND '.join(clauses)}", parameters
+                ).fetchone()[0]
+            )
+
+    def embedded_items_batch(
+        self,
+        after_id: int = 0,
+        limit: int = 256,
+        *,
+        embedding_provider: str | None = None,
+        embedding_model: str | None = None,
+        embedding_dimensions: int | None = None,
+        embedding_revision: int | None = None,
+    ) -> list[sqlite3.Row]:
+        bounded_limit = max(1, min(int(limit), 1024))
+        clauses, parameters = self._embedding_filter(
+            embedding_provider, embedding_model, embedding_dimensions, embedding_revision
+        )
+        clauses.append("id>?")
+        parameters.extend((int(after_id), bounded_limit))
+        with self._lock:
+            return list(
+                self.connection.execute(
+                    f"""
+                    SELECT id,embedding
+                    FROM items
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY id
+                    LIMIT ?
+                    """,
+                    parameters,
+                ).fetchall()
+            )
 
     def indexed_files(self) -> list[sqlite3.Row]:
         with self._lock:

@@ -623,6 +623,142 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(active.exists())
         self.assertTrue(legacy.exists())
 
+    def test_hot_wal_legacy_database_is_snapshotted_before_migration(self):
+        legacy_data = self.root / "legacy-data"
+        data = self.root / "data"
+        library = self.root / "library"
+        legacy_data.mkdir()
+        seed = self.root / "seed.db"
+        writer = sqlite3.connect(seed)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE items(value TEXT)")
+        writer.execute("INSERT INTO items VALUES('committed in wal')")
+        writer.commit()
+        legacy = legacy_data / "clipsave.db"
+        shutil.copy2(seed, legacy)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{seed}{suffix}")
+            if sidecar.exists():
+                shutil.copy2(sidecar, Path(f"{legacy}{suffix}"))
+        writer.close()
+
+        with patch.multiple(
+            storage,
+            BASE_DIR=self.root / "base",
+            LEGACY_DATA_DIR=legacy_data,
+            LEGACY_PICTURE_DIR=self.root / "legacy-pictures",
+            LEGACY_MARKDOWN_DIR=self.root / "legacy-markdown",
+            DATA_DIR=data,
+            LIBRARY_DIR=library,
+            PICTURE_DIR=library / "Pictures",
+            MARKDOWN_DIR=library / "Markdown",
+        ):
+            storage.migrate_legacy_layout()
+
+        active = data / "clipsave.db"
+        connection = sqlite3.connect(active)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT value FROM items").fetchone()[0],
+                "committed in wal",
+            )
+        finally:
+            connection.close()
+
+    def test_library_migration_rebinds_existing_row_without_losing_metadata(self):
+        legacy_data = self.root / "legacy-data"
+        legacy_pictures = self.root / "legacy-pictures"
+        data = self.root / "data"
+        library = self.root / "library"
+        pictures = library / "Pictures"
+        legacy_data.mkdir()
+        legacy_pictures.mkdir()
+        source = legacy_pictures / "preserved.png"
+        source.write_bytes(b"image payload")
+        legacy = legacy_data / "clipsave.db"
+        connection = sqlite3.connect(legacy)
+        connection.execute(
+            """
+            CREATE TABLE items(
+                id INTEGER PRIMARY KEY,
+                path TEXT,
+                resolved_path TEXT,
+                favorite INTEGER,
+                notes TEXT,
+                missing INTEGER
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO items VALUES(?,?,?,?,?,?)",
+            (7, str(source), storage._path_key(source), 1, "keep metadata", 0),
+        )
+        connection.commit()
+        connection.close()
+
+        with patch.multiple(
+            storage,
+            BASE_DIR=self.root / "base",
+            LEGACY_DATA_DIR=legacy_data,
+            LEGACY_PICTURE_DIR=legacy_pictures,
+            LEGACY_MARKDOWN_DIR=self.root / "legacy-markdown",
+            DATA_DIR=data,
+            LIBRARY_DIR=library,
+            PICTURE_DIR=pictures,
+            MARKDOWN_DIR=library / "Markdown",
+        ):
+            storage.migrate_legacy_layout()
+
+        destination = pictures / source.name
+        active = sqlite3.connect(data / "clipsave.db")
+        try:
+            row = active.execute(
+                "SELECT id,path,resolved_path,favorite,notes,missing FROM items"
+            ).fetchone()
+        finally:
+            active.close()
+        self.assertEqual(row[0], 7)
+        self.assertEqual(row[1], str(destination))
+        self.assertEqual(row[2], storage._path_key(destination))
+        self.assertEqual(row[3:], (1, "keep metadata", 0))
+        self.assertTrue(destination.exists())
+        self.assertFalse(source.exists())
+
+    def test_database_snapshot_failure_leaves_legacy_library_untouched(self):
+        legacy_data = self.root / "legacy-data"
+        legacy_pictures = self.root / "legacy-pictures"
+        data = self.root / "data"
+        library = self.root / "library"
+        legacy_data.mkdir()
+        legacy_pictures.mkdir()
+        legacy = legacy_data / "clipsave.db"
+        sqlite3.connect(legacy).close()
+        source = legacy_pictures / "must-stay.png"
+        source.write_bytes(b"unchanged")
+
+        with patch.multiple(
+            storage,
+            BASE_DIR=self.root / "base",
+            LEGACY_DATA_DIR=legacy_data,
+            LEGACY_PICTURE_DIR=legacy_pictures,
+            LEGACY_MARKDOWN_DIR=self.root / "legacy-markdown",
+            DATA_DIR=data,
+            LIBRARY_DIR=library,
+            PICTURE_DIR=library / "Pictures",
+            MARKDOWN_DIR=library / "Markdown",
+        ), patch.object(
+            storage,
+            "_copy_legacy_database_snapshot",
+            side_effect=OSError("disk full"),
+        ):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                storage.migrate_legacy_layout()
+
+        self.assertEqual(source.read_bytes(), b"unchanged")
+        self.assertFalse((library / "Pictures" / source.name).exists())
+        self.assertFalse((data / "clipsave.db").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

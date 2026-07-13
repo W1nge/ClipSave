@@ -1,8 +1,10 @@
+import ctypes
 import os
 import tempfile
 import threading
 import time
 import unittest
+from ctypes import wintypes
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -17,6 +19,7 @@ from clipsave_app.database import ImportFileResult, LibraryDatabase
 from clipsave_app.main_window import AsyncSignals, MainWindow
 from clipsave_app.settings import Settings
 from clipsave_app.widgets import DateDialog, DraggableBar, MarkdownDialog, SettingsDialog, Sidebar
+from clipsave_app.windows_frame import WM_NCACTIVATE
 
 
 class MainWindowTests(unittest.TestCase):
@@ -41,6 +44,14 @@ class MainWindowTests(unittest.TestCase):
         self.database.close()
         self.temp.cleanup()
 
+    def wait_for_delete(self, item_id: int, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while item_id in self.window._delete_requests and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.app.processEvents()
+        self.assertNotIn(item_id, self.window._delete_requests)
+
     def test_panels_and_navigation(self):
         self.assertEqual(self.window.windowTitle(), "ClipSave")
         self.assertTrue(self.window.windowFlags() & Qt.WindowType.FramelessWindowHint)
@@ -58,6 +69,8 @@ class MainWindowTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(self.window.isMaximized())
         self.assertFalse(hasattr(self.window, "capture_state"))
+        self.assertIs(self.window.copy_toast.parentWidget(), self.window.centralWidget())
+        self.assertFalse(self.window.copy_toast.isVisible())
         self.assertFalse(hasattr(self.window.sidebar, "brand_icon"))
         self.assertFalse(hasattr(self.window.sidebar, "brand"))
         self.assertEqual(
@@ -149,6 +162,33 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertEqual([call.args for call in suspended.call_args_list], [(True,), (False,)])
 
+    def test_windows_native_event_handles_ncactivate_without_affecting_other_messages(self):
+        message = wintypes.MSG()
+        message.hWnd = int(self.window.winId())
+        message.message = WM_NCACTIVATE
+        message.wParam = 0
+
+        with patch("clipsave_app.main_window.handle_ncactivate", return_value=(True, 7)) as handler:
+            result = self.window.nativeEvent(
+                b"windows_generic_MSG", ctypes.addressof(message)
+            )
+
+        self.assertEqual(result, (True, 7))
+        handler.assert_called_once_with(message.hWnd, 0)
+
+    def test_native_acrylic_retries_once_when_hidden_window_application_fails(self):
+        with patch("clipsave_app.main_window.is_windows_qt_platform", return_value=True), patch.object(
+            self.window, "winId", return_value=123
+        ), patch(
+            "clipsave_app.main_window.apply_windows_acrylic", side_effect=[False, True]
+        ) as acrylic:
+            self.window._native_acrylic_hwnd = None
+            self.window._apply_native_acrylic()
+            self.window._apply_native_acrylic()
+
+        self.assertEqual(acrylic.call_count, 2)
+        self.assertEqual(self.window._native_acrylic_hwnd, 123)
+
     def test_move_resize_and_detail_toggle_do_not_force_window_back_on_screen(self):
         with patch.object(self.window, "_constrain_to_available_screen") as constrain:
             self.window._begin_interactive_resize()
@@ -233,6 +273,10 @@ class MainWindowTests(unittest.TestCase):
             "QScrollBar#AutoHideScrollBar::sub-page:vertical { background: #202020; }",
             self.window.styleSheet(),
         )
+        self.assertIn(
+            "QFrame#CopyToast { background: rgba(40,40,40,230);",
+            self.window.styleSheet(),
+        )
         self.assertNotIn("rgba(0,0,0,204)", self.window.styleSheet())
         acrylic.assert_called_with(self.window, True)
 
@@ -252,6 +296,10 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertIn(
             "QWidget#DialogContent { background: #f6f6f6; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "QFrame#CopyToast { background: rgba(255,255,255,230);",
             self.window.styleSheet(),
         )
         self.assertIn(
@@ -296,6 +344,63 @@ class MainWindowTests(unittest.TestCase):
         for left, right in zip(geometries, geometries[1:]):
             self.assertLessEqual(left.right(), right.left())
 
+    def test_library_pagination_loads_every_item_once_and_preserves_selection(self):
+        for index in range(4):
+            self.database.add_text(f"paged item {index}")
+        self.window.ITEM_PAGE_SIZE = 2
+        self.window.current_sort = "oldest"
+        self.window.refresh_items()
+
+        self.assertEqual(len(self.window.current_items), 2)
+        self.assertTrue(self.window._items_has_more)
+        self.assertEqual(self.window._items_offset, 2)
+        self.assertEqual(self.window.result_count.text(), "2+ 项")
+        selected_id = self.window.current_items[0]["id"]
+        self.window.select_item(selected_id)
+
+        self.window.load_more_items()
+        self.assertEqual(len(self.window.current_items), 4)
+        self.assertEqual(self.window.current_item_id, selected_id)
+        self.assertEqual(self.window._items_offset, 4)
+        self.assertTrue(self.window._items_has_more)
+
+        self.window.load_more_items()
+        self.assertEqual(len(self.window.current_items), 5)
+        self.assertEqual(self.window.current_item_id, selected_id)
+        self.assertEqual(self.window._items_offset, 5)
+        self.assertFalse(self.window._items_has_more)
+        self.assertEqual(self.window.result_count.text(), "5 项")
+        ids = [item["id"] for item in self.window.current_items]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_library_pagination_only_loads_inside_scroll_threshold(self):
+        view = Mock()
+        scroll_bar = Mock()
+        scroll_bar.maximum.return_value = 500
+        view.verticalScrollBar.return_value = scroll_bar
+
+        with patch.object(self.window, "load_more_items") as load_more:
+            self.window._load_more_items_if_needed(view, 379)
+            load_more.assert_not_called()
+            self.window._load_more_items_if_needed(view, 380)
+            load_more.assert_called_once_with()
+
+    def test_new_filter_resets_pagination_offset_and_results(self):
+        for index in range(4):
+            self.database.add_text(f"needle page {index}")
+        self.window.ITEM_PAGE_SIZE = 2
+        self.window.refresh_items()
+        self.window.load_more_items()
+        self.assertEqual(self.window._items_offset, 4)
+
+        self.window.search.setText("needle")
+        self.window.refresh_items()
+
+        self.assertEqual(self.window._items_offset, 2)
+        self.assertEqual(len(self.window.current_items), 2)
+        self.assertTrue(self.window._items_has_more)
+        self.assertTrue(all("needle" in item["content"] for item in self.window.current_items))
+
     def test_text_copy_invalidates_an_older_image_copy_completion(self):
         text_id = self.window.current_items[0]["id"]
         token = object()
@@ -307,13 +412,16 @@ class MainWindowTests(unittest.TestCase):
 
         with patch.object(self.window, "_cancel_async_token") as cancel, patch.object(
             QApplication.clipboard(), "setText"
-        ) as set_text, patch.object(QApplication.clipboard(), "setImage") as set_image:
+        ) as set_text, patch.object(QApplication.clipboard(), "setImage") as set_image, patch.object(
+            self.window.copy_toast, "show_confirmation"
+        ) as show_confirmation:
             self.window.copy_item(text_id)
             self.window._copy_image_succeeded(token, signals, image_id, image)
 
         cancel.assert_called_once_with(token)
         set_text.assert_called_once_with("first clipboard item")
         set_image.assert_not_called()
+        show_confirmation.assert_called_once_with()
         self.assertIsNone(self.window._copy_request)
 
     def test_capture_refresh_preserves_semantic_results_and_error_tooltip(self):
@@ -344,11 +452,62 @@ class MainWindowTests(unittest.TestCase):
         set_text.assert_called_once_with("selected")
         copy_item.assert_not_called()
 
+    def test_delete_shortcut_edits_search_instead_of_deleting_item(self):
+        self.window.search.setText("abcd")
+        self.window.search.setCursorPosition(1)
+        self.window.search.setFocus()
+        with patch.object(self.window, "delete_item") as delete_item:
+            self.window._delete_focused_text_or_item()
+
+        self.assertEqual(self.window.search.text(), "acd")
+        delete_item.assert_not_called()
+
     def test_error_tooltip_schedules_restore(self):
         with patch("clipsave_app.main_window.QTimer.singleShot") as single_shot:
             self.window.show_error_status("temporary failure")
 
         self.assertEqual(single_shot.call_args.args[0], 5000)
+
+    def test_monitor_toggle_shows_transient_status_notification(self):
+        with patch.object(self.window.clipboard_service, "start"), patch.object(
+            self.window.clipboard_service.timer, "isActive", side_effect=[False, True]
+        ), patch.object(self.window, "_show_monitor_notification") as notify:
+            self.window.toggle_monitor()
+
+        notify.assert_called_once_with(True)
+
+        with patch("clipsave_app.main_window.QToolTip.showText") as show_tooltip:
+            self.window._show_monitor_notification(False)
+
+        show_tooltip.assert_called_once()
+        self.assertEqual(show_tooltip.call_args.args[1], "本地自动捕获已暂停")
+        self.assertIs(show_tooltip.call_args.args[2], self.window.capture_status)
+        self.assertTrue(show_tooltip.call_args.args[3].isNull())
+
+    def test_monitor_toggle_does_not_change_runtime_when_setting_save_fails(self):
+        with patch.object(
+            self.window.settings, "set", side_effect=OSError("disk full")
+        ), patch.object(self.window.clipboard_service, "start") as start, patch.object(
+            self.window.clipboard_service, "stop"
+        ) as stop, patch.object(self.window, "show_error_status") as show_error, patch.object(
+            self.window, "_show_monitor_notification"
+        ) as notify:
+            self.window.toggle_monitor()
+
+        start.assert_not_called()
+        stop.assert_not_called()
+        notify.assert_not_called()
+        show_error.assert_called_once()
+
+    def test_empty_semantic_search_uses_fluent_information_dialog(self):
+        with patch("clipsave_app.main_window.QMessageBox.information") as information:
+            self.window.semantic_search()
+
+        information.assert_called_once_with(
+            self.window,
+            "语义搜索",
+            "先输入要查找的画面或含义。",
+        )
 
     def test_favorite_mutation_preserves_semantic_result_order(self):
         item_id = self.window.current_items[0]["id"]
@@ -439,6 +598,33 @@ class MainWindowTests(unittest.TestCase):
         self.window._async_signals.update((old_signals, new_signals))
         self.window._semantic_succeeded(old_token, old_signals, "", -1, "", [])
         self.assertEqual([item["id"] for item in self.window.current_items], previous_ids)
+
+    def test_ai_result_is_discarded_when_item_hash_changes(self):
+        image_path = Path(self.temp.name) / "changed-during-ai.png"
+        image = QImage(16, 16, QImage.Format.Format_RGB32)
+        image.fill(QColor("#21a8fb"))
+        self.assertTrue(image.save(str(image_path)))
+        item_id = self.database.add_image(image_path)
+        expected_hash = self.database.get_item(item_id)["content_hash"]
+        token, signals = object(), AsyncSignals()
+        self.window._ai_requests[item_id] = (token, signals)
+        with self.database._transaction():
+            self.database.connection.execute(
+                "UPDATE items SET content_hash=? WHERE id=?",
+                ("f" * 64, item_id),
+            )
+
+        self.window._ai_succeeded(
+            token,
+            signals,
+            item_id,
+            "stale description",
+            [1.0],
+            expected_hash,
+        )
+
+        self.assertEqual(self.database.get_item(item_id)["ai_description"], "")
+        self.assertNotIn(item_id, self.window._ai_requests)
 
     def test_async_task_cancellation_is_tracked_and_waited_for(self):
         token = object()
@@ -647,6 +833,72 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertTrue(bool(tag_button.property("active")))
 
+    def test_collection_delete_defaults_to_no_and_preserves_content(self):
+        item_id = self.window.current_items[0]["id"]
+        collection_id = self.database.create_collection("Keep for now")
+        self.database.set_collection(item_id, collection_id)
+        self.window._refresh_navigation_metadata()
+        delete_button = self.window.sidebar.collection_delete_buttons[collection_id]
+
+        with patch(
+            "clipsave_app.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ) as question:
+            delete_button.click()
+
+        self.assertEqual(question.call_args.args[4], QMessageBox.StandardButton.No)
+        self.assertIn(collection_id, {row["id"] for row in self.database.collections()})
+        self.assertEqual(self.database.get_item(item_id)["collection_id"], collection_id)
+
+    def test_deleting_active_collection_returns_to_all_and_keeps_item(self):
+        item_id = self.window.current_items[0]["id"]
+        collection_id = self.database.create_collection("Delete collection")
+        self.database.set_collection(item_id, collection_id)
+        self.window._refresh_navigation_metadata()
+        self.window.navigate("collection", collection_id)
+        self.window.select_item(item_id)
+        self.window.toggle_detail()
+        delete_button = self.window.sidebar.collection_delete_buttons[collection_id]
+
+        with patch(
+            "clipsave_app.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch.object(self.window, "show_status") as show_status:
+            delete_button.click()
+
+        item = self.database.get_item(item_id)
+        self.assertIsNotNone(item)
+        self.assertIsNone(item["collection_id"])
+        self.assertIsNone(self.window.current_collection)
+        self.assertEqual(self.window.sidebar.active_key, "all")
+        self.assertNotIn(collection_id, self.window.sidebar.collection_delete_buttons)
+        self.assertEqual(self.window.detail.current_item["collection_id"], None)
+        show_status.assert_called_with("集合已删除")
+
+    def test_deleting_active_tag_returns_to_all_and_keeps_item(self):
+        item_id = self.window.current_items[0]["id"]
+        tag_id = self.database.add_tag(item_id, "Delete tag")
+        self.window._refresh_navigation_metadata()
+        self.window.navigate("tag", tag_id)
+        self.window.select_item(item_id)
+        self.window.toggle_detail()
+        delete_button = self.window.sidebar.tag_delete_buttons[tag_id]
+
+        with patch(
+            "clipsave_app.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch.object(self.window, "show_status") as show_status:
+            delete_button.click()
+
+        item = self.database.get_item(item_id)
+        self.assertIsNotNone(item)
+        self.assertFalse(item["tag_names"])
+        self.assertIsNone(self.window.current_tag)
+        self.assertEqual(self.window.sidebar.active_key, "all")
+        self.assertNotIn(tag_id, self.window.sidebar.tag_delete_buttons)
+        self.assertFalse(self.window.detail.current_item["tag_names"])
+        show_status.assert_called_with("标签已删除")
+
     def test_failed_final_backup_restores_ai_controls(self):
         image_path = Path(self.temp.name) / "busy.png"
         image = QImage(16, 16, QImage.Format.Format_RGB32)
@@ -746,16 +998,73 @@ class MainWindowTests(unittest.TestCase):
             "clipsave_app.main_window.QMessageBox.warning"
         ) as warning, patch.object(self.window, "show_status") as show_status:
             self.window.delete_item(image_id)
+            self.wait_for_delete(image_id)
         self.assertIsNotNone(self.database.get_item(image_id))
         warning.assert_called_once()
-        show_status.assert_called_once_with("删除失败：文件未能移入回收站")
+        show_status.assert_any_call("删除失败：文件未能移入回收站")
 
         with patch("clipsave_app.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes), patch.object(
             self.window, "show_status"
         ) as show_status:
             self.window.delete_item(text_id)
+            self.wait_for_delete(text_id)
         self.assertIsNone(self.database.get_item(text_id))
         show_status.assert_called_with("内容已删除")
+
+    def test_delete_recycle_runs_in_background_and_hides_item_while_pending(self):
+        image_path = Path(self.temp.name) / "slow-delete.png"
+        image = QImage(32, 32, QImage.Format.Format_RGB32)
+        image.fill(QColor("#21a8fb"))
+        self.assertTrue(image.save(str(image_path)))
+        image_id = self.database.add_image(image_path)
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_recycle(*_args, **_kwargs):
+            started.set()
+            release.wait(2)
+
+        try:
+            with patch("clipsave_app.main_window.is_under_local_store", return_value=True), patch(
+                "clipsave_app.main_window.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ), patch("clipsave_app.main_window.recycle_managed_file", side_effect=slow_recycle):
+                started_at = time.monotonic()
+                self.window.delete_item(image_id)
+                elapsed = time.monotonic() - started_at
+                self.assertLess(elapsed, 0.2)
+                self.assertTrue(started.wait(1))
+                self.assertIn(image_id, self.window._delete_requests)
+                self.assertNotIn(image_id, {item["id"] for item in self.window.current_items})
+                release.set()
+                self.wait_for_delete(image_id)
+        finally:
+            release.set()
+
+        self.assertIsNone(self.database.get_item(image_id))
+
+    def test_delete_failure_restores_selected_item(self):
+        image_path = Path(self.temp.name) / "restore-delete.png"
+        image = QImage(16, 16, QImage.Format.Format_RGB32)
+        image.fill(QColor("#21a8fb"))
+        self.assertTrue(image.save(str(image_path)))
+        image_id = self.database.add_image(image_path)
+        self.window.refresh_library()
+        self.window.select_item(image_id)
+
+        with patch("clipsave_app.main_window.is_under_local_store", return_value=True), patch(
+            "clipsave_app.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch(
+            "clipsave_app.main_window.recycle_managed_file",
+            side_effect=RuntimeError("file is locked"),
+        ), patch("clipsave_app.main_window.QMessageBox.warning"):
+            self.window.delete_item(image_id)
+            self.wait_for_delete(image_id)
+
+        self.assertEqual(self.window.current_item_id, image_id)
+        self.assertIn(image_id, {item["id"] for item in self.window.current_items})
+        self.assertIsNotNone(self.database.get_item(image_id))
 
     def test_delete_marks_item_missing_when_index_removal_fails_after_recycle(self):
         image_path = Path(self.temp.name) / "managed-delete.png"
@@ -775,6 +1084,7 @@ class MainWindowTests(unittest.TestCase):
             self.database, "remove_item", side_effect=OSError("database busy")
         ), patch("clipsave_app.main_window.QMessageBox.warning"):
             self.window.delete_item(image_id)
+            self.wait_for_delete(image_id)
 
         row = self.database.connection.execute(
             "SELECT * FROM items WHERE id=?", (image_id,)
@@ -802,6 +1112,7 @@ class MainWindowTests(unittest.TestCase):
             self.database, "mark_item_missing", side_effect=OSError("still busy")
         ), patch("clipsave_app.main_window.QMessageBox.warning"):
             self.window.delete_item(image_id)
+            self.wait_for_delete(image_id)
 
         self.assertIn(image_id, self.window._session_hidden_item_ids)
         self.assertNotIn(image_id, {item["id"] for item in self.window.current_items})
@@ -864,10 +1175,13 @@ class MainWindowTests(unittest.TestCase):
 
         with patch("clipsave_app.main_window.QMessageBox.warning") as warning, patch.object(
             self.window, "show_status"
-        ) as show_status:
+        ) as show_status, patch.object(
+            self.window.copy_toast, "show_confirmation"
+        ) as show_confirmation:
             self.window.copy_item(image_id)
             warning.assert_called_once()
             show_status.assert_called_once_with("复制失败：图片文件不存在")
+            show_confirmation.assert_not_called()
 
     def test_image_copy_decodes_in_background_and_database_errors_are_reported(self):
         image_path = Path(self.temp.name) / "copy.png"
@@ -959,10 +1273,11 @@ class MainWindowTests(unittest.TestCase):
             self.window, "show_status"
         ) as show_status:
             self.window.delete_item(item_id)
+            self.wait_for_delete(item_id)
 
         self.assertIsNotNone(self.database.get_item(item_id))
         warning.assert_called_once()
-        show_status.assert_called_once_with("删除失败：内容索引未能移除")
+        show_status.assert_any_call("删除失败：内容索引未能移除")
 
     def test_transient_dialogs_are_destroyed_after_exec(self):
         dialogs = [
@@ -1057,9 +1372,15 @@ class MainWindowTests(unittest.TestCase):
         ) as exit_app:
             self.assertTrue(self.window.quit_application_for_session_end(1.0))
 
-        create_backup.assert_called_once_with()
+        create_backup.assert_not_called()
         database_close.assert_called_once_with()
         exit_app.assert_called_once_with(0)
+
+    def test_import_is_rejected_once_session_shutdown_begins(self):
+        self.window._quit_in_progress = True
+        with patch("clipsave_app.main_window.QFileDialog.getOpenFileNames") as choose_files:
+            self.window.import_files()
+        choose_files.assert_not_called()
 
     def test_startup_scan_failure_is_preserved_for_smoke_readiness(self):
         token = object()

@@ -9,6 +9,7 @@ from PySide6.QtGui import QGuiApplication
 
 
 WM_NCCALCSIZE = 0x0083
+WM_NCACTIVATE = 0x0086
 WS_THICKFRAME = 0x00040000
 GWL_STYLE = -16
 
@@ -61,6 +62,13 @@ def _user32():
     library.GetWindowLongPtrW.restype = long_ptr
     library.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr]
     library.SetWindowLongPtrW.restype = long_ptr
+    library.DefWindowProcW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    library.DefWindowProcW.restype = ctypes.c_ssize_t
     library.SetWindowPos.argtypes = [
         wintypes.HWND,
         wintypes.HWND,
@@ -159,4 +167,15 @@ def handle_nccalcsize(hwnd: int, wparam: int, lparam: int) -> tuple[bool, int]:
             target.bottom = info.rcWork.bottom
         return True, 0
     except (OSError, ValueError):
+        return False, 0
+
+
+def handle_ncactivate(hwnd: int, wparam: int) -> tuple[bool, int]:
+    """Update activation state without asking DWM to repaint its native frame."""
+    if not is_windows_qt_platform() or not hwnd:
+        return False, 0
+    try:
+        result = _user32().DefWindowProcW(hwnd, WM_NCACTIVATE, wparam, -1)
+        return True, int(result)
+    except (AttributeError, OSError, TypeError, ValueError):
         return False, 0

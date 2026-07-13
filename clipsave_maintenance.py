@@ -15,7 +15,7 @@ from clipsave_app.maintenance import (
     clean_indexed_duplicates,
     scan_orphans,
 )
-from clipsave_app.storage import ensure_storage_directories
+from clipsave_app.storage import ensure_storage_directories, migrate_legacy_layout
 
 
 def main() -> int:
@@ -31,6 +31,8 @@ def main() -> int:
         print(json.dumps({"error": "Close ClipSave before running maintenance."}, ensure_ascii=False))
         return 3
 
+    ensure_storage_directories()
+    migrate_legacy_layout()
     ensure_storage_directories()
     database = LibraryDatabase()
     try:

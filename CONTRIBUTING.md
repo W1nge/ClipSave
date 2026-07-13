@@ -3,12 +3,12 @@
 ## Development setup
 
 1. Use Windows 10 or 11 with Python 3.11+.
-2. Create a virtual environment and install `requirements.txt`.
+2. Create a virtual environment and install the hash-locked Windows dependencies.
 3. Run the test suite before submitting changes.
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-windows.lock
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 

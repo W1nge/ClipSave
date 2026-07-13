@@ -40,15 +40,19 @@ from clipsave_app.services import (
 
 
 class FakeMimeData:
-    def __init__(self, *, has_image: bool = False, has_text: bool = False):
+    def __init__(self, *, has_image: bool = False, has_text: bool = False, has_urls: bool = False):
         self._has_image = has_image
         self._has_text = has_text
+        self._has_urls = has_urls
 
     def hasImage(self):
         return self._has_image
 
     def hasText(self):
         return self._has_text
+
+    def hasUrls(self):
+        return self._has_urls
 
 
 class FakeClipboard:
@@ -145,6 +149,23 @@ class ClipboardServiceTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertTrue(self.service._clipboard_retry_timer.isActive())
 
+    def test_stop_cancels_clipboard_retry_and_ignores_late_callback(self):
+        self.service._monitoring_enabled = True
+        with patch.object(
+            self.service,
+            "_read_stable_snapshot",
+            side_effect=services_module._ClipboardBusy("busy"),
+        ):
+            self.service.poll()
+
+        self.assertTrue(self.service._clipboard_retry_timer.isActive())
+        self.service.stop()
+        self.assertFalse(self.service._clipboard_retry_timer.isActive())
+
+        with patch.object(self.service, "poll") as poll:
+            self.service._poll_if_monitoring()
+        poll.assert_not_called()
+
     def test_worker_updates_image_dedupe_key_before_gui_signal_delivery(self):
         image = QImage(16, 16, QImage.Format.Format_RGBA8888)
         image.fill(QColor("#123456"))
@@ -163,6 +184,7 @@ class ClipboardServiceTests(unittest.TestCase):
         with patch.object(self.service, "_start_monitoring") as start_monitoring, patch.object(
             self.service, "poll"
         ) as poll, patch("clipsave_app.services.QTimer.singleShot", side_effect=lambda _delay, callback: callback()):
+            start_monitoring.side_effect = lambda: setattr(self.service, "_monitoring_enabled", True)
             self.service.resume_after_failed_shutdown(True)
 
         start_monitoring.assert_called_once_with()
@@ -275,6 +297,7 @@ class ClipboardServiceTests(unittest.TestCase):
 
     def test_clipboard_notification_runs_stable_snapshot_path(self):
         self.service.poll = Mock()
+        self.service._monitoring_enabled = True
 
         self.service.notifier.changed.emit()
 
@@ -296,6 +319,25 @@ class ClipboardServiceTests(unittest.TestCase):
         self.assertEqual(saved, ["  second\n"])
         self.assertEqual(self.service.last_text, "  second\n")
         self.assertEqual(self.service.last_clipboard_sequence, 11)
+
+    def test_invalid_image_candidate_falls_back_to_valid_text(self):
+        clipboard = FakeClipboard(texts=["fallback text"])
+        clipboard.mimeData = lambda: FakeMimeData(has_image=True, has_text=True)
+        sequences = iter([20, 20])
+        saved = []
+        self.service.last_clipboard_sequence = 19
+        self.service._clipboard = lambda: clipboard
+        self.service.clipboard_sequence = lambda: next(sequences)
+        self.service._snapshot_clipboard_image = Mock(
+            side_effect=ValueError("invalid image")
+        )
+        self.service._snapshot_clipboard_text = lambda source: source.text()
+        self.service.save_text = lambda text: saved.append(text) or True
+
+        self.service.poll()
+        self.assertTrue(self.service.wait_for_idle())
+
+        self.assertEqual(saved, ["fallback text"])
 
     def test_clipboard_sequence_wrap_advances_after_successful_image_save(self):
         image = QImage(8, 8, QImage.Format.Format_RGB32)
@@ -366,6 +408,114 @@ class ClipboardServiceTests(unittest.TestCase):
             ClipboardService, "_windows_clipboard_apis", return_value=(user32, kernel32)
         ), patch("clipsave_app.services.ctypes.string_at", return_value=payload):
             self.assertEqual(self.service._native_clipboard_text_snapshot(), "hello")
+
+    def test_native_file_drop_extracts_paths_without_opening_files(self):
+        paths = (r"C:\Work\report.txt", r"D:\图片\reference.png")
+        user32 = Mock()
+        user32.OpenClipboard.return_value = 1
+        user32.IsClipboardFormatAvailable.side_effect = (
+            lambda format_id: format_id == ClipboardService.CF_HDROP
+        )
+        user32.GetClipboardData.return_value = 123
+        shell32 = Mock()
+
+        def drag_query(drop_handle, index, buffer, _length):
+            self.assertEqual(drop_handle, 123)
+            if index == ClipboardService.DRAG_QUERY_FILE_COUNT:
+                return len(paths)
+            value = paths[index]
+            if buffer is None:
+                return len(value)
+            buffer.value = value
+            return len(value)
+
+        shell32.DragQueryFileW.side_effect = drag_query
+        with patch("clipsave_app.services.os.name", "nt"), patch.object(
+            ClipboardService,
+            "_windows_clipboard_apis",
+            return_value=(user32, Mock()),
+        ), patch.object(
+            ClipboardService, "_windows_shell_api", return_value=shell32
+        ):
+            self.assertEqual(
+                self.service._native_clipboard_file_paths_snapshot(), paths
+            )
+
+        user32.OpenClipboard.assert_called_once_with(None)
+        user32.GetClipboardData.assert_called_once_with(ClipboardService.CF_HDROP)
+        user32.CloseClipboard.assert_called_once_with()
+
+    def test_native_file_drop_rejects_excessive_path_count_before_allocation(self):
+        user32 = Mock()
+        user32.OpenClipboard.return_value = 1
+        user32.IsClipboardFormatAvailable.return_value = 1
+        user32.GetClipboardData.return_value = 123
+        shell32 = Mock()
+        shell32.DragQueryFileW.return_value = ClipboardService.MAX_FILE_PATHS + 1
+
+        with patch("clipsave_app.services.os.name", "nt"), patch.object(
+            ClipboardService,
+            "_windows_clipboard_apis",
+            return_value=(user32, Mock()),
+        ), patch.object(
+            ClipboardService, "_windows_shell_api", return_value=shell32
+        ), patch("clipsave_app.services.ctypes.create_unicode_buffer") as create_buffer:
+            with self.assertRaisesRegex(ValueError, "too many"):
+                self.service._native_clipboard_file_paths_snapshot()
+
+        create_buffer.assert_not_called()
+        user32.CloseClipboard.assert_called_once_with()
+
+    def test_file_drop_snapshot_takes_priority_over_image_and_text_formats(self):
+        clipboard = Mock()
+        clipboard.mimeData.return_value = FakeMimeData(
+            has_image=True,
+            has_text=True,
+            has_urls=True,
+        )
+        self.service._clipboard = lambda: clipboard
+        self.service.clipboard_sequence = Mock(side_effect=[10, 10])
+
+        with patch.object(
+            self.service,
+            "_snapshot_clipboard_file_paths",
+            return_value="C:\\one.txt\nD:\\two.png",
+        ), patch.object(
+            self.service,
+            "_snapshot_clipboard_image",
+            side_effect=AssertionError("file copies must not be decoded as images"),
+        ), patch.object(
+            self.service,
+            "_snapshot_clipboard_text",
+            side_effect=AssertionError("file copies must not use CF_UNICODETEXT"),
+        ):
+            self.assertEqual(
+                self.service._read_stable_snapshot(),
+                ("text", "C:\\one.txt\nD:\\two.png", 10),
+            )
+
+    def test_file_drop_paths_are_saved_as_one_text_card_without_failure(self):
+        clipboard = Mock()
+        clipboard.mimeData.return_value = FakeMimeData(has_text=True, has_urls=True)
+        self.service._clipboard = lambda: clipboard
+        self.service.clipboard_sequence = Mock(side_effect=[10, 10])
+        failures = []
+        self.service.failed.connect(failures.append)
+        markdown_dir = Path(self.temp.name) / "Markdown"
+        markdown_dir.mkdir()
+        path_text = "C:\\Work\\report.txt\nD:\\图片\\reference.png"
+
+        with patch.object(
+            self.service, "_snapshot_clipboard_file_paths", return_value=path_text
+        ), patch("clipsave_app.services.MARKDOWN_DIR", markdown_dir):
+            self.service.poll()
+            self.assertTrue(self.service.wait_for_idle())
+
+        rows = self.database.query_items(kind="text")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["content"], path_text)
+        self.assertEqual(failures, [])
+        clipboard.text.assert_not_called()
 
     def test_stable_text_snapshot_does_not_reread_qt_clipboard_text(self):
         clipboard = Mock()
@@ -518,6 +668,10 @@ class ClipboardServiceTests(unittest.TestCase):
         self.assertIs(kernel32.GlobalSize.restype, ctypes.c_size_t)
         self.assertIs(user32.EnumClipboardFormats.restype, wintypes.UINT)
         self.assertIs(kernel32.GetLastError.restype, wintypes.DWORD)
+        self.assertIs(
+            self.service._windows_shell_api().DragQueryFileW.restype,
+            wintypes.UINT,
+        )
 
     def test_prepare_for_shutdown_pauses_and_resume_reenables_tasks(self):
         self.service.timer.start()
@@ -767,6 +921,16 @@ class AIServiceTests(unittest.TestCase):
         self.assertIsNone(request.get_header("Authorization"))
         self.assertLessEqual(response.read_limit, 64 * 1024)
 
+    def test_embedding_provider_identity_excludes_url_credentials_and_query(self):
+        first = AIService(
+            "https://user:secret@example.com/v1?tenant=one", "", "vision", "embedding"
+        )
+        second = AIService("https://example.com/v1?tenant=two", "", "vision", "embedding")
+
+        self.assertEqual(first.embedding_provider, second.embedding_provider)
+        self.assertNotIn("secret", first.embedding_provider)
+        self.assertTrue(first.embedding_provider.startswith("openai-compatible:"))
+
     def test_ai_open_timeout_uses_remaining_overall_deadline(self):
         service = AIService("http://localhost/v1", "", "vision", "embedding")
         response = FakeResponse(b'{"ok": true}')
@@ -776,7 +940,7 @@ class AIServiceTests(unittest.TestCase):
         ), patch.object(service, "_open_request", return_value=response) as open_request:
             self.assertEqual(service._post("/test", {}), {"ok": True})
 
-        self.assertAlmostEqual(open_request.call_args.kwargs["timeout"], 9.75)
+        self.assertAlmostEqual(open_request.call_args.kwargs["timeout"], 89.75)
 
     def test_ai_response_size_and_shape_are_validated(self):
         service = AIService("http://localhost/v1", "", "vision", "embedding")
@@ -836,6 +1000,30 @@ class AIServiceTests(unittest.TestCase):
             with self.assertRaises(OperationCancelled):
                 service._post("/test", {}, cancel_event)
 
+    def test_cancelled_ai_body_read_closes_active_response(self):
+        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        cancel_event = threading.Event()
+        closed = threading.Event()
+
+        class BlockingResponse(FakeResponse):
+            def read1(self, _limit):
+                closed.wait(1)
+                raise OSError("response closed")
+
+            def close(self):
+                closed.set()
+
+        response = BlockingResponse(b"")
+        with patch.object(service, "_open_request", return_value=response):
+            def cancel():
+                time.sleep(0.05)
+                cancel_event.set()
+
+            threading.Thread(target=cancel, daemon=True).start()
+            with self.assertRaises(OperationCancelled):
+                service._post("/test", {}, cancel_event)
+        self.assertTrue(closed.is_set())
+
     def test_cross_origin_ai_redirect_is_refused_before_forwarding_headers(self):
         service = AIService("https://api.example/v1", "secret", "vision", "")
         request = urllib.request.Request(
@@ -868,6 +1056,23 @@ class AIServiceTests(unittest.TestCase):
             ) as post:
                 with self.assertRaisesRegex(RuntimeError, "changed"):
                     service.describe_image(snapshot)
+            post.assert_not_called()
+
+    def test_describe_image_rejects_index_hash_mismatch_before_network(self):
+        service = AIService("http://localhost/v1", "", "vision", "")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "image.png"
+            PILImage.new("RGB", (8, 8), "red").save(path)
+            snapshot = preflight_image_file(path)
+            with patch("clipsave_app.services.PICTURE_DIR", root), patch.object(
+                service, "_post"
+            ) as post:
+                with self.assertRaisesRegex(RuntimeError, "indexed item"):
+                    service.describe_image(
+                        snapshot,
+                        expected_sha256="0" * 64,
+                    )
             post.assert_not_called()
 
     def test_describe_image_preflights_pixels_before_posting(self):
