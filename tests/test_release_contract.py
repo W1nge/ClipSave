@@ -124,7 +124,7 @@ class ReleaseContractTests(unittest.TestCase):
             ".venv\\Scripts\\python.exe", "call fake-python.bat"
         )
         instrumented = re.sub(
-            r'call fake-python\.bat -c ".*"',
+            r'call fake-python\.bat -c "[^"\r\n]*"',
             "call fake-python.bat",
             instrumented,
         )
@@ -134,6 +134,9 @@ class ReleaseContractTests(unittest.TestCase):
         )
         instrumented = instrumented.replace("`call fake-python.bat", "`fake-python.bat")
         instrumented = instrumented.replace("powershell ", "call fake-powershell.bat ")
+        instrumented = instrumented.replace(
+            '"%installerCompiler%" /Qp', 'call "%installerCompiler%" /Qp'
+        )
 
         (root / ".venv" / "Scripts").mkdir(parents=True)
         (root / ".venv" / "Scripts" / "python.exe").touch()
@@ -158,6 +161,14 @@ class ReleaseContractTests(unittest.TestCase):
             "exit /b 0\n",
             encoding="ascii",
         )
+        (root / "fake-iscc.bat").write_text(
+            "@echo off\n"
+            "if not exist build\\release mkdir build\\release\n"
+            "type nul > build\\release\\ClipSave-1.2.3-UNOFFICIAL-windows-x64-installer.exe\n"
+            "type nul > build\\release\\ClipSave-1.2.3-windows-x64-installer.exe\n"
+            "exit /b 0\n",
+            encoding="ascii",
+        )
         (root / "fake-powershell.bat").write_text("@exit /b 0\n", encoding="ascii")
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(
@@ -178,6 +189,7 @@ class ReleaseContractTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["PATH"] = str(root) + os.pathsep + env.get("PATH", "")
+        env["INNO_SETUP_COMPILER"] = str(root / "fake-iscc.bat")
         env["SOURCE_MUTATION"] = mutation
         if official:
             env["CLIPSAVE_OFFICIAL_BUILD"] = "1"
