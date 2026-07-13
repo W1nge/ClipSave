@@ -1,39 +1,53 @@
 # ClipSave
 
-ClipSave 是一款面向 Windows 的本地剪贴板资料库，用于自动保存、浏览和整理文字、图片与 Markdown。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-## 功能
+ClipSave is a local-first Windows clipboard library for automatically saving, browsing, and organizing text, images, and Markdown.
 
-- 自动捕获剪贴板文字与图片，并将 Windows 文件复制操作提取为本地路径文字，内容按日期浏览
-- 图片网格、列表视图、搜索、排序和收藏
-- 集合、标签和备注整理
-- Markdown 只读渲染与本地文件定位
-- Windows 本地 OCR，中英文内容可参与搜索
-- 可折叠导航栏、按需展开详情栏和 Windows 亚克力效果
-- 托盘常驻、单实例和 `Ctrl+Alt+V` 全局唤醒
-- 可选的 OpenAI-compatible 图片描述与语义搜索
+## Features
 
-## 本地数据边界
+- Automatically capture clipboard text and images, and turn Windows file-copy events into local path records
+- Browse captured content by day with grid and list views
+- Search, sort, favorite, and organize items with collections, tags, and notes
+- Read-only Markdown rendering with a link back to the local source file
+- Windows-native OCR with searchable Chinese and English text
+- Collapsible navigation, an optional detail panel, and Windows acrylic surfaces
+- System-tray resident mode, single-instance protection, and the global `Ctrl+Alt+V` wake-up shortcut
+- Optional OpenAI-compatible image descriptions and semantic search
 
-自动捕获、普通搜索、Markdown 阅读和 OCR 都在本机完成：
+## Download
+
+The latest official Windows release is available on the [GitHub Releases page](https://github.com/W1nge/ClipSave/releases/latest).
+
+- `ClipSave-<version>-windows-x64-installer.exe` is the recommended per-user installer. It does not require administrator permission and installs under `%LOCALAPPDATA%\Programs\ClipSave`.
+- `ClipSave-<version>-windows-x64.zip` is the portable package. Keep `ClipSave.exe` and its adjacent `_internal` directory together.
+- Matching `.sha256` files are provided for both downloads.
+
+Uninstalling the application does not remove the separate `%LOCALAPPDATA%\ClipSave` user-data directory.
+
+## Local data boundary
+
+Clipboard capture, ordinary search, Markdown reading, and OCR run locally:
 
 ```text
-%LOCALAPPDATA%\ClipSave\Library   剪贴板文件
-%LOCALAPPDATA%\ClipSave\Data      数据库、设置和缓存
+%LOCALAPPDATA%\ClipSave\Library   Managed clipboard files
+%LOCALAPPDATA%\ClipSave\Data      Database, settings, backups, and caches
 ```
 
-程序目录不会保存用户剪贴板文件。手动导入的图片和 Markdown 会复制到本地资料库，原文件保持不变。
+The program directory does not store user clipboard files. Manually imported images and Markdown files are copied into the managed local library; the originals are left unchanged.
 
-在线 AI 是独立的主动功能，只会在用户配置服务并点击对应命令后运行。详细边界见 [SECURITY.md](SECURITY.md)。
+Copying files in Windows Explorer is outside the file-content capture scope. ClipSave records the copied path as text and does not open, resolve, or copy the referenced file automatically.
 
-新安装默认暂停自动捕获，点击右上角红色状态点可开启。已有有效设置会保持原来的捕获状态；设置文件损坏时会以暂停状态恢复。
+Online AI is a separate, explicit feature. It runs only after the user configures a provider and invokes an AI command. See [SECURITY.md](SECURITY.md) for the complete data and network boundary.
 
-## 环境要求
+New installations start with automatic capture paused. Existing valid settings preserve the previous capture state; if the settings file is damaged, ClipSave resumes in the paused state.
 
-- Windows 10 / 11
-- Python 3.11、3.12 或 3.13
+## Requirements
 
-## 从源码运行
+- Windows 10 or Windows 11
+- Python 3.11, 3.12, or 3.13 for running from source
+
+## Run from source
 
 ```powershell
 git clone https://github.com/W1nge/ClipSave.git
@@ -43,47 +57,47 @@ python -m venv .venv
 .\.venv\Scripts\python.exe clipsave.py
 ```
 
-也可以运行 `install.bat` 安装并校验依赖，然后使用 `.venv\Scripts\pythonw.exe clipsave.py` 启动源码版本。
+You can also run `install.bat` to install and verify the locked dependencies, then start the source version with `.venv\Scripts\pythonw.exe clipsave.py`.
 
-发布包用户应直接运行 `ClipSave\ClipSave.exe`，并保持相邻的 `ClipSave\_internal` 目录完整。
-
-## 构建 EXE
+## Build the executable
 
 ```powershell
 .\build.bat
 ```
 
-`build.bat` 固定使用 PyInstaller 6.21.0，并在依赖检查通过后生成 `build\release\ClipSave\` 应用目录和版本化 ZIP。只有设置 `CLIPSAVE_OFFICIAL_BUILD=1`、使用规定的官方 CPython、干净 Git 工作区且安装分发包与哈希锁完全一致时，才会生成 `ClipSave-<version>-windows-x64.zip`；其他本地构建会标记为 `UNOFFICIAL` 并使用不同文件名。Qt DLL 和插件位于 `_internal` 目录；构建失败时脚本会返回非零退出码并清理不完整发布目录。
+`build.bat` pins PyInstaller 6.21.0 and produces the `build\release\ClipSave\` application directory and a versioned ZIP after dependency checks pass. An official archive named `ClipSave-<version>-windows-x64.zip` is produced only when `CLIPSAVE_OFFICIAL_BUILD=1`, the specified official CPython runtime, a clean Git worktree, and the locked distributions are all present. Other local builds are labeled `UNOFFICIAL` and use a distinct filename.
 
-## 快捷键
+Qt DLLs and plugins live under `_internal`. A failed build returns a non-zero exit code and removes incomplete release output.
 
-| 快捷键 | 操作 |
+## Keyboard shortcuts
+
+| Shortcut | Action |
 | --- | --- |
-| `Ctrl+K` / `Ctrl+F` | 聚焦搜索框 |
-| `Ctrl+B` | 展开或收起左侧栏 |
-| `Ctrl+I` | 展开或收起详情栏 |
-| `Ctrl+Alt+V` | 从任意位置唤醒 ClipSave |
+| `Ctrl+K` / `Ctrl+F` | Focus the search box |
+| `Ctrl+B` | Expand or collapse the left navigation |
+| `Ctrl+I` | Expand or collapse the detail panel |
+| `Ctrl+Alt+V` | Wake ClipSave from anywhere |
 
-## 测试
+## Tests
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-安全边界和已知限制见 [SECURITY.md](SECURITY.md)，版本变更见 [CHANGELOG.md](CHANGELOG.md)。
+See [SECURITY.md](SECURITY.md) for security boundaries and known limitations, and [CHANGELOG.md](CHANGELOG.md) for release history.
 
-## 本地资料库维护
+## Local library maintenance
 
-默认命令只扫描并在 `%LOCALAPPDATA%\ClipSave\Data\maintenance` 生成清单，不删除文件：
+The default maintenance command only scans the library and writes a manifest under `%LOCALAPPDATA%\ClipSave\Data\maintenance`; it does not delete files:
 
 ```powershell
 .\.venv\Scripts\python.exe clipsave_maintenance.py
 ```
 
-清理命令只处理清单中与数据库有效文件哈希完全一致的副本，并在操作前重新验证文件。回收站和永久删除都要求显式确认短语；独立未索引文件不会自动删除。
+Cleanup only processes copies whose hashes exactly match valid database records and revalidates each file before acting. Recycle Bin and permanent deletion require explicit confirmation phrases. Unindexed files are never deleted automatically.
 
-## 开源许可
+## License
 
 [MIT License](LICENSE)
 
-项目所用第三方组件及其上游许可、Qt 动态库和源码获取信息见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。该清单用于提供发布信息，不构成法律意见或许可结论。
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled components, upstream licenses, Qt libraries, and source-acquisition information. That document is provided for release information and is not legal advice.
