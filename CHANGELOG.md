@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.5 - 2026-07-21
+
 - Use native Windows maximize state for the custom title-bar button so maximize and restore remain synchronized with the shell.
 
 ## 0.3.4 - 2026-07-21
