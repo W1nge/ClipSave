@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.4 - 2026-07-21
+
 - Replaced the old Windows OCR path with OpenAI-compatible vision OCR using the `ocr this` prompt.
 - Added opt-in automatic OCR and image description for newly captured or imported images.
 - Added a structured image-description prompt for visible text, scene details, layout, colors, and search keywords.

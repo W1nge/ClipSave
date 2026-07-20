@@ -1603,7 +1603,9 @@ class MainWindowTests(unittest.TestCase):
                 self.window.grid.viewport(), Qt.MouseButton.LeftButton, pos=point
             )
             self.app.processEvents()
-        startfile.assert_called_once_with(image_path)
+        startfile.assert_called_once()
+        opened_path = Path(startfile.call_args.args[0])
+        self.assertTrue(opened_path.samefile(image_path))
 
     def test_image_copy_decodes_in_background_and_database_errors_are_reported(self):
         image_path = Path(self.temp.name) / "copy.png"
