@@ -26,7 +26,7 @@ The SQLite database, settings, backups, and caches are stored under:
 %LOCALAPPDATA%\ClipSave\Data
 ```
 
-Online AI is optional and runs only after a provider is configured and the user invokes an AI command.
+Online AI is optional and runs only after a provider is configured and the user invokes an AI command or enables automatic OCR/description. Automatic processing applies to new images only. In Settings, provide the provider Base URL and vision model, then enable either switch as needed; OCR uses the fixed prompt `ocr this`, while image descriptions use ClipSave's built-in retrieval-oriented prompt.
 
 ## Integrity
 

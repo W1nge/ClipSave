@@ -10,6 +10,7 @@ from PySide6.QtGui import QGuiApplication
 
 WM_NCCALCSIZE = 0x0083
 WM_NCACTIVATE = 0x0086
+WM_GETMINMAXINFO = 0x0024
 WS_THICKFRAME = 0x00040000
 GWL_STYLE = -16
 
@@ -18,6 +19,7 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+SW_RESTORE = 9
 
 MONITOR_DEFAULTTONEAREST = 0x00000002
 
@@ -31,6 +33,23 @@ class WINDOWPOS(ctypes.Structure):
         ("cx", ctypes.c_int),
         ("cy", ctypes.c_int),
         ("flags", wintypes.UINT),
+    ]
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_long),
+        ("y", ctypes.c_long),
+    ]
+
+
+class MINMAXINFO(ctypes.Structure):
+    _fields_ = [
+        ("ptReserved", POINT),
+        ("ptMaxSize", POINT),
+        ("ptMaxPosition", POINT),
+        ("ptMinTrackSize", POINT),
+        ("ptMaxTrackSize", POINT),
     ]
 
 
@@ -85,6 +104,8 @@ def _user32():
     library.GetDpiForWindow.restype = wintypes.UINT
     library.IsZoomed.argtypes = [wintypes.HWND]
     library.IsZoomed.restype = wintypes.BOOL
+    library.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    library.ShowWindow.restype = wintypes.BOOL
     library.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
     library.MonitorFromWindow.restype = wintypes.HMONITOR
     library.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
@@ -142,8 +163,65 @@ def window_dpi_scale(hwnd: int) -> float:
     return dpi / 96.0 if dpi > 0 else 1.0
 
 
+def native_window_is_maximized(hwnd: int) -> bool | None:
+    if not is_windows_qt_platform() or not hwnd:
+        return None
+    try:
+        return bool(_user32().IsZoomed(hwnd))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def restore_native_window(hwnd: int) -> bool:
+    """Restore a Win32-maximized window without queuing a conflicting Qt state change."""
+    if not is_windows_qt_platform() or not hwnd:
+        return False
+    try:
+        _user32().ShowWindow(hwnd, SW_RESTORE)
+        return True
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def handle_getminmaxinfo(
+    hwnd: int,
+    wparam: int,
+    lparam: int,
+    minimum_track_size: tuple[int, int] | None = None,
+) -> tuple[bool, int]:
+    """Keep native maximize/snap bounds inside the monitor work area."""
+    if not is_windows_qt_platform() or not hwnd or not lparam:
+        return False, 0
+    try:
+        user32 = _user32()
+        monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return False, 0
+        work_width = info.rcWork.right - info.rcWork.left
+        work_height = info.rcWork.bottom - info.rcWork.top
+        if work_width <= 0 or work_height <= 0:
+            return False, 0
+
+        # Preserve native tracking defaults, then replace only the maximize bounds.
+        user32.DefWindowProcW(hwnd, WM_GETMINMAXINFO, wparam, lparam)
+        target = MINMAXINFO.from_address(lparam)
+        target.ptMaxPosition.x = info.rcWork.left - info.rcMonitor.left
+        target.ptMaxPosition.y = info.rcWork.top - info.rcMonitor.top
+        target.ptMaxSize.x = work_width
+        target.ptMaxSize.y = work_height
+        if minimum_track_size is not None:
+            minimum_width, minimum_height = minimum_track_size
+            target.ptMinTrackSize.x = max(target.ptMinTrackSize.x, minimum_width)
+            target.ptMinTrackSize.y = max(target.ptMinTrackSize.y, minimum_height)
+        return True, 0
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False, 0
+
+
 def handle_nccalcsize(hwnd: int, wparam: int, lparam: int) -> tuple[bool, int]:
-    """Remove the visual native frame and keep maximized content inside the work area."""
+    """Remove the visual frame and keep maximized content inside its outer work-area bounds."""
     if not is_windows_qt_platform() or not hwnd or not lparam:
         return False, 0
     try:
@@ -161,10 +239,21 @@ def handle_nccalcsize(hwnd: int, wparam: int, lparam: int) -> tuple[bool, int]:
             info.cbSize = ctypes.sizeof(info)
             if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
                 return False, 0
-            target.left = info.rcWork.left
-            target.top = info.rcWork.top
-            target.right = info.rcWork.right
-            target.bottom = info.rcWork.bottom
+            # IsZoomed can remain true while Windows is calculating the first
+            # normal-sized frame during restore. Only replace a candidate that
+            # still covers the monitor work area; otherwise the smaller outer
+            # window would retain a maximized client area and clip its content.
+            covers_work_area = (
+                target.left <= info.rcWork.left
+                and target.top <= info.rcWork.top
+                and target.right >= info.rcWork.right
+                and target.bottom >= info.rcWork.bottom
+            )
+            if covers_work_area:
+                target.left = info.rcWork.left
+                target.top = info.rcWork.top
+                target.right = info.rcWork.right
+                target.bottom = info.rcWork.bottom
         return True, 0
     except (OSError, ValueError):
         return False, 0

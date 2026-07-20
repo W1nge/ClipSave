@@ -31,6 +31,10 @@ WM_MOUSEMOVE = 0x0200
 WM_ENTERSIZEMOVE = 0x0231
 WM_EXITSIZEMOVE = 0x0232
 WM_SIZING = 0x0214
+WM_SYSCOMMAND = 0x0112
+SC_MAXIMIZE = 0xF030
+SC_RESTORE = 0xF120
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
 HTCLIENT = 1
 SIZING_HITS = {10, 11, 12, 13, 14, 15, 16, 17}
 MONITOR_DEFAULTTONEAREST = 2
@@ -106,6 +110,18 @@ def _configure_user32():
     return user32
 
 
+def _configure_dwmapi():
+    dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+    dwmapi.DwmGetWindowAttribute.argtypes = [
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+    return dwmapi
+
+
 def _wait(app: QApplication, milliseconds: int = 180) -> None:
     deadline = time.monotonic() + milliseconds / 1000
     while time.monotonic() < deadline:
@@ -131,6 +147,30 @@ def _client_screen_rect(user32, hwnd: int) -> tuple[int, int, int, int]:
     ):
         raise ctypes.WinError(ctypes.get_last_error())
     return top_left.x, top_left.y, bottom_right.x, bottom_right.y
+
+
+def _extended_frame_rect(dwmapi, hwnd: int) -> tuple[int, int, int, int]:
+    rect = wintypes.RECT()
+    result = int(
+        dwmapi.DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(rect),
+            ctypes.sizeof(rect),
+        )
+    )
+    if result < 0:
+        raise RuntimeError(f"DwmGetWindowAttribute failed with HRESULT 0x{result & 0xFFFFFFFF:08X}")
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
+def _rect_within(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> bool:
+    return (
+        inner[0] >= outer[0]
+        and inner[1] >= outer[1]
+        and inner[2] <= outer[2]
+        and inner[3] <= outer[3]
+    )
 
 
 def _point_lparam(x: int, y: int) -> int:
@@ -189,6 +229,7 @@ def run_probe() -> dict:
         raise RuntimeError(f"Expected the Windows Qt platform, got {app.platformName()!r}")
 
     user32 = _configure_user32()
+    dwmapi = _configure_dwmapi()
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         database = LibraryDatabase(root / "probe.db")
@@ -236,6 +277,7 @@ def run_probe() -> dict:
         is_zoomed = bool(user32.IsZoomed(hwnd))
         maximized_window_rect = _window_rect(user32, hwnd)
         maximized_client_rect = _client_screen_rect(user32, hwnd)
+        maximized_extended_frame_rect = _extended_frame_rect(dwmapi, hwnd)
         monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
         info = MONITORINFO()
         info.cbSize = ctypes.sizeof(info)
@@ -251,9 +293,35 @@ def run_probe() -> dict:
             )
         )
 
-        window.showNormal()
+        window.toggle_maximized()
+        _wait(app, 220)
+        qt_restored_rect = _window_rect(user32, hwnd)
+        qt_restored_client_rect = _client_screen_rect(user32, hwnd)
+
+        user32.SendMessageW(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0)
+        _wait(app, 260)
+        native_qt_maximized = window.isMaximized()
+        native_is_zoomed = bool(user32.IsZoomed(hwnd))
+        native_maximized_window_rect = _window_rect(user32, hwnd)
+        native_maximized_client_rect = _client_screen_rect(user32, hwnd)
+        native_maximized_extended_frame_rect = _extended_frame_rect(dwmapi, hwnd)
+        native_monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        native_info = MONITORINFO()
+        native_info.cbSize = ctypes.sizeof(native_info)
+        if not native_monitor or not user32.GetMonitorInfoW(
+            native_monitor, ctypes.byref(native_info)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        native_work_rect = (
+            native_info.rcWork.left,
+            native_info.rcWork.top,
+            native_info.rcWork.right,
+            native_info.rcWork.bottom,
+        )
+        user32.SendMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0)
         _wait(app, 220)
         restored_rect = _window_rect(user32, hwnd)
+        restored_client_rect = _client_screen_rect(user32, hwnd)
         result = {
             "hwnd": hwnd,
             "style": hex(style),
@@ -281,12 +349,36 @@ def run_probe() -> dict:
             "win32_is_zoomed": is_zoomed,
             "maximized_window_rect": maximized_window_rect,
             "maximized_client_rect": maximized_client_rect,
+            "maximized_extended_frame_rect": maximized_extended_frame_rect,
             "monitor_work_rect": work_rect,
+            "maximized_window_matches_work_area": maximized_window_rect == work_rect,
             "maximized_client_matches_work_area": maximized_client_rect == work_rect,
+            "maximized_extended_frame_within_work_area": _rect_within(
+                maximized_extended_frame_rect, work_rect
+            ),
             "maximized_edge_hit": max_hit,
             "maximized_edge_is_not_resizable": max_hit not in SIZING_HITS,
+            "qt_restored_rect": qt_restored_rect,
+            "qt_restored_client_rect": qt_restored_client_rect,
+            "qt_restore_preserved_geometry": qt_restored_rect == normal_window_rect,
+            "qt_restore_client_fills_window": qt_restored_client_rect == qt_restored_rect,
+            "native_qt_maximized": native_qt_maximized,
+            "native_win32_is_zoomed": native_is_zoomed,
+            "native_maximized_window_rect": native_maximized_window_rect,
+            "native_maximized_client_rect": native_maximized_client_rect,
+            "native_maximized_extended_frame_rect": native_maximized_extended_frame_rect,
+            "native_monitor_work_rect": native_work_rect,
+            "native_window_matches_work_area": native_maximized_window_rect
+            == native_work_rect,
+            "native_client_matches_work_area": native_maximized_client_rect
+            == native_work_rect,
+            "native_extended_frame_within_work_area": _rect_within(
+                native_maximized_extended_frame_rect, native_work_rect
+            ),
             "restored_rect": restored_rect,
+            "restored_client_rect": restored_client_rect,
             "restore_preserved_geometry": restored_rect == normal_window_rect,
+            "restore_client_fills_window": restored_client_rect == restored_rect,
         }
         window.force_quit = True
         window.close()
@@ -311,9 +403,19 @@ def main() -> int:
         result["all_cursors_correct"],
         result["native_drag_succeeded"],
         result["qt_maximized"],
+        result["maximized_window_matches_work_area"],
         result["maximized_client_matches_work_area"],
+        result["maximized_extended_frame_within_work_area"],
         result["maximized_edge_is_not_resizable"],
+        result["qt_restore_preserved_geometry"],
+        result["qt_restore_client_fills_window"],
+        result["native_qt_maximized"],
+        result["native_win32_is_zoomed"],
+        result["native_window_matches_work_area"],
+        result["native_client_matches_work_area"],
+        result["native_extended_frame_within_work_area"],
         result["restore_preserved_geometry"],
+        result["restore_client_fills_window"],
     )
     return 0 if all(required) else 1
 

@@ -91,6 +91,8 @@ QMenu::item { padding: 7px 26px 7px 12px; border-radius: 4px; }
 QMenu::item:selected { background: #e9f2ff; }
 QToolTip { background: #1f2937; color: white; border: 0; padding: 5px; }
 QSplitter::handle { background: transparent; width: 1px; }
+QSplitter#ContentSplitter::handle { background: #f6f6f6; width: 8px; }
+QSplitter#ContentSplitter::handle:hover { background: rgba(47,125,246,80); }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: rgba(87,101,122,80); border-radius: 4px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -191,6 +193,8 @@ QMenu::item { padding: 7px 26px 7px 12px; border-radius: 4px; }
 QMenu::item:selected { background: #365a80; }
 QToolTip { background: #f2f2f2; color: #202020; border: 0; padding: 5px; }
 QSplitter::handle { background: transparent; width: 1px; }
+QSplitter#ContentSplitter::handle { background: #202020; width: 8px; }
+QSplitter#ContentSplitter::handle:hover { background: rgba(77,163,255,90); }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #666666; border-radius: 4px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }

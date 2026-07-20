@@ -40,12 +40,6 @@ ALLOWED_MISSING_MODULES = {
     "win32com",
     "win32com.server",
     "win32com.shell",
-    "winrt.windows.applicationmodel",
-    "winrt.windows.data",
-    "winrt.windows.devices",
-    "winrt.windows.system.diagnostics",
-    "winrt.windows.system.remotesystems",
-    "winrt.windows.ui",
 }
 
 

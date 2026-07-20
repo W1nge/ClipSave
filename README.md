@@ -10,7 +10,7 @@ ClipSave is a local-first Windows clipboard library for automatically saving, br
 - Browse captured content by day with grid and list views
 - Search, sort, favorite, and organize items with collections, tags, and notes
 - Read-only Markdown rendering with a link back to the local source file
-- Windows-native OCR with searchable Chinese and English text
+- OpenAI-compatible vision OCR with searchable recognized text
 - Collapsible navigation, an optional detail panel, and Windows acrylic surfaces
 - System-tray resident mode, single-instance protection, and the global `Ctrl+Alt+V` wake-up shortcut
 - Optional OpenAI-compatible image descriptions and semantic search
@@ -27,7 +27,7 @@ Uninstalling the application does not remove the separate `%LOCALAPPDATA%\ClipSa
 
 ## Local data boundary
 
-Clipboard capture, ordinary search, Markdown reading, and OCR run locally:
+Clipboard capture, ordinary search, and Markdown reading run locally. OCR and image descriptions use the configured vision provider only when the user invokes them or enables the corresponding automatic setting:
 
 ```text
 %LOCALAPPDATA%\ClipSave\Library   Managed clipboard files
@@ -38,7 +38,11 @@ The program directory does not store user clipboard files. Manually imported ima
 
 Copying files in Windows Explorer is outside the file-content capture scope. ClipSave records the copied path as text and does not open, resolve, or copy the referenced file automatically.
 
-Online AI is a separate, explicit feature. It runs only after the user configures a provider and invokes an AI command. See [SECURITY.md](SECURITY.md) for the complete data and network boundary.
+Online AI is a separate, explicit feature. It runs only after the user configures a provider and invokes an AI command or enables automatic OCR/description. Automatic processing applies to new captured or imported images and does not retroactively process the existing library. See [SECURITY.md](SECURITY.md) for the complete data and network boundary.
+
+### Configure Image AI
+
+In **Settings**, enter the provider Base URL and vision model name; enter an API key only when the provider requires authentication. The **automatic OCR** and **automatic image description** switches are independent and disabled by default. When enabled, each newly captured or imported image is processed in the background. OCR sends the fixed prompt `ocr this`; image descriptions use ClipSave's built-in retrieval-oriented prompt and can optionally be embedded for semantic search.
 
 New installations start with automatic capture paused. Existing valid settings preserve the previous capture state; if the settings file is damaged, ClipSave resumes in the paused state.
 

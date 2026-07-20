@@ -406,29 +406,6 @@ class SingleInstance:
 
 
 def main() -> int:
-    if "--smoke-ocr-import" in sys.argv:
-        from .ocr_service import WindowsOCRService
-
-        WindowsOCRService._winrt_types()
-        return 0
-    if "--smoke-ocr-runtime" in sys.argv:
-        import tempfile
-
-        from PIL import Image, ImageDraw
-
-        from .ocr_service import WindowsOCRService
-
-        with tempfile.TemporaryDirectory(prefix="clipsave-ocr-smoke-") as temporary:
-            path = Path(temporary) / "ocr-smoke.png"
-            image = Image.new("RGB", (360, 100), "white")
-            ImageDraw.Draw(image).text((16, 32), "ClipSave OCR 123", fill="black")
-            image.save(path)
-            try:
-                WindowsOCRService.recognize(path)
-            except RuntimeError as exc:
-                if str(exc) != "Windows 没有安装可用的 OCR 语言包。":
-                    raise
-        return 0
     smoke_profile_path = None
     if "--smoke-profile" in sys.argv:
         index = sys.argv.index("--smoke-profile")

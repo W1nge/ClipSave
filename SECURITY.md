@@ -13,9 +13,10 @@
 
 ## Network behavior
 
-- Clipboard monitoring, local search, Markdown reading and Windows OCR do not use the network.
+- Clipboard monitoring, ordinary local search and Markdown reading do not use the network.
+- OCR and image descriptions use the configured OpenAI-compatible vision endpoint when the user invokes them or enables automatic processing. The selected image is encoded and sent to that endpoint; it is not sent when both automatic settings are disabled and no AI command is invoked.
 - Single-instance coordination uses a local Qt IPC endpoint and only accepts a request to show the existing window.
-- Online AI is an independent, explicit action. It runs only after the user configures a provider and invokes an AI command.
+- Online AI is an independent, explicit action. Automatic OCR and description are opt-in settings and apply only to newly captured or imported images.
 
 ## Data protection limits
 

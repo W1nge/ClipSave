@@ -7,7 +7,6 @@ class PyInstallerWarningTests(unittest.TestCase):
     def test_known_optional_modules_are_allowed(self):
         text = (
             "missing module named pwd - imported by pathlib (optional)\n"
-            "missing module named 'winrt.windows.devices' - imported by projection (top-level)\n"
         )
         self.assertEqual(unexpected_missing_modules(text), [])
 

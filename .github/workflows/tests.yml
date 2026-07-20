@@ -49,8 +49,6 @@ jobs:
         run: |
           python -m venv .venv
           .\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-windows.lock
-      - name: Verify real OCR projections
-        run: .\.venv\Scripts\python.exe -c "from clipsave_app.ocr_service import WindowsOCRService; WindowsOCRService._winrt_types()"
       - name: Locate Inno Setup
         shell: pwsh
         run: |
@@ -130,7 +128,7 @@ jobs:
           .\.venv\Scripts\python.exe -c "import pefile,sys; p=pefile.PE(sys.argv[1], fast_load=True); raise SystemExit(0 if p.FILE_HEADER.Machine == 0x8664 else 1)" $archivedExe
           if ($LASTEXITCODE -ne 0) { throw 'Archived executable is not AMD64' }
           $licenseRoot = Join-Path $extract 'THIRD_PARTY_LICENSES'
-          foreach ($name in @('CPython-PSF-2.0.txt','OpenSSL-Apache-2.0.txt','SQLite-Public-Domain.txt','Qt-LGPL-3.0-only.txt','Qt-GPL-3.0-only.txt','pywinrt-MIT.txt')) {
+          foreach ($name in @('CPython-PSF-2.0.txt','OpenSSL-Apache-2.0.txt','SQLite-Public-Domain.txt','Qt-LGPL-3.0-only.txt','Qt-GPL-3.0-only.txt')) {
             $path = Join-Path $licenseRoot "UPSTREAM_LICENSES\$name"
             if (-not (Test-Path $path) -or (Get-Item $path).Length -eq 0) { throw "Missing archived license $name" }
           }
@@ -170,26 +168,11 @@ jobs:
           $installedExe = Join-Path $installDir 'ClipSave.exe'
           if (-not (Test-Path -LiteralPath $installedExe)) { throw 'Installer did not install ClipSave.exe' }
           if ((Get-Item $installedExe).VersionInfo.ProductVersion -ne $version) { throw 'Installed ClipSave version is incorrect' }
-          $smoke = Start-Process $installedExe -ArgumentList '--smoke-ocr-import' -PassThru
-          if (-not $smoke.WaitForExit(20000)) { $smoke | Stop-Process -Force; throw 'Installed ClipSave smoke test timed out' }
-          if ($smoke.ExitCode -ne 0) { throw "Installed ClipSave smoke test failed with exit code $($smoke.ExitCode)" }
           $uninstaller = Join-Path $installDir 'unins000.exe'
           if (-not (Test-Path -LiteralPath $uninstaller)) { throw 'Installer did not create an uninstaller' }
           $uninstall = Start-Process $uninstaller -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') -PassThru -Wait
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)" }
           if (Test-Path -LiteralPath $installedExe) { throw 'Uninstaller left ClipSave.exe behind' }
-      - name: Frozen OCR import smoke test
-        shell: powershell
-        run: |
-          $process = Start-Process .\build\archive-check\ClipSave\ClipSave.exe -ArgumentList '--smoke-ocr-import' -PassThru
-          if (-not $process.WaitForExit(20000)) { $process | Stop-Process -Force; throw 'Frozen OCR import timed out' }
-          if ($process.ExitCode -ne 0) { throw "Frozen OCR import failed with exit code $($process.ExitCode)" }
-      - name: Frozen OCR runtime smoke test
-        shell: powershell
-        run: |
-          $process = Start-Process .\build\archive-check\ClipSave\ClipSave.exe -ArgumentList '--smoke-ocr-runtime' -PassThru
-          if (-not $process.WaitForExit(30000)) { $process | Stop-Process -Force; throw 'Frozen OCR runtime timed out' }
-          if ($process.ExitCode -ne 0) { throw "Frozen OCR runtime failed with exit code $($process.ExitCode)" }
       - name: Frozen application smoke test
         shell: powershell
         run: |

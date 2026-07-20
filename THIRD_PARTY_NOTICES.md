@@ -14,10 +14,9 @@ ClipSave uses and distributes third-party software. This document records the ve
 | lucide Python package | 1.1.4 | MIT | [lucide-python](https://github.com/fmacedo/lucide-python) |
 | Pillow | 12.3.0 | HPND/Pillow license family; the 12.3.0 wheel's included license text describes it as MIT-CMU | [Pillow](https://github.com/python-pillow/Pillow) |
 | Send2Trash | 2.1.0 | BSD-3-Clause | [Send2Trash](https://github.com/arsenetar/send2trash) |
-| winrt-runtime and requested winrt-Windows projections | 3.2.1 | MIT | [pywinrt](https://github.com/pywinrt/pywinrt) |
 | typing_extensions | 4.16.0 | PSF-2.0 | [typing_extensions](https://github.com/python/typing_extensions) |
 
-Release archives include `THIRD_PARTY_LICENSES/`, containing the license and metadata files supplied by installed wheels. The bundled CPython, OpenSSL and SQLite notices and fixed-version upstream texts needed by PySide6 and pywinrt are included under `THIRD_PARTY_LICENSES/UPSTREAM_LICENSES/`.
+Release archives include `THIRD_PARTY_LICENSES/`, containing the license and metadata files supplied by installed wheels. The bundled CPython, OpenSSL and SQLite notices and fixed-version upstream texts needed by PySide6 are included under `THIRD_PARTY_LICENSES/UPSTREAM_LICENSES/`.
 
 ## Qt and the application directory
 

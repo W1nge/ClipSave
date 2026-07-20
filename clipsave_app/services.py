@@ -22,7 +22,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
-from PIL import Image
+from PIL import Image, ImageOps
 from PySide6.QtCore import (
     QAbstractNativeEventFilter,
     QByteArray,
@@ -38,6 +38,8 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
 from .constants import (
+    APP_NAME,
+    APP_VERSION,
     MARKDOWN_DIR,
     MAX_AI_RESPONSE_BYTES,
     MAX_CLIPBOARD_IMAGE_BYTES,
@@ -1359,6 +1361,31 @@ class ClipboardService(QObject):
 class AIService:
     REQUEST_DEADLINE_SECONDS = 90.0
     EMBEDDING_REVISION = 1
+    OCR_PROMPT = "ocr this"
+    OCR_MAX_IMAGE_DIMENSION = 2048
+    OCR_JPEG_QUALITY = 92
+    DESCRIPTION_MAX_IMAGE_DIMENSION = 1280
+    DESCRIPTION_JPEG_QUALITY = 86
+    IMAGE_DESCRIPTION_PROMPT = """你是 ClipSave 的视觉资料整理与检索标注专家。你的任务是把输入图片转换成一份忠实、清晰、可复用、容易搜索的中文记录。请先观察完整图片，再按照要求输出最终结果。
+
+核心原则：
+1. 只写图片中实际可见、可读或可以从画面直接确认的事实。严禁猜测；不要猜测人物身份、年龄、职业、地点、品牌归属、拍摄时间、动机、情绪或图片外的信息；不确定时明确说明“不确定”或“无法确认”。
+2. 区分“看见的内容”和“推断”。除非推断是非常直接且对检索有帮助的类别概括，否则不要加入推断。不要把相似物体、模糊文字或被裁切的内容擅自补全。
+3. 先判断图片类型（照片、截图、网页、应用界面、文档、表格、代码、图表、海报等），再描述最有辨识度的信息。优先记录能帮助用户以后定位原图的内容，而不是堆砌空泛形容词。
+4. 记录主体、数量、动作或状态、场景、前后景、相互位置和重要空间关系。使用“左/右/上/下/中央/前景/背景”等可验证的相对位置，避免臆测真实距离。
+5. 逐字抄录所有清晰可读的可见文字，尽量保留原语言、大小写、数字、标点、符号和合理换行。文字模糊、遮挡或裁切时，用“[无法辨认]”标记对应部分，绝不凭上下文猜字。截图、网页、应用界面、文档、表格和代码中，优先记录标题、菜单、按钮、错误信息、路径、网址、代码片段、字段名、数值和表头。
+6. 描述明显的布局、颜色、对比度、风格、材质、光线和视觉状态，但只保留有助于识别或搜索的细节。对于图表或表格，说明类型、主要轴/列/行、显著趋势和可读数值；不要虚构不可读的数据。
+7. 关键词必须来自图片中的可见文字、明确对象、场景或直接概括。可加入少量常用同义词帮助搜索，但不要加入图片中没有依据的实体、品牌或主题。关键词用逗号分隔，避免整句重复描述。
+8. 如果没有明显文字，明确写“无明显可见文字”；如果某一类细节不存在，明确写“无明显可识别的其他细节”。不要输出分析过程、免责声明、置信度评分或 Markdown 代码块。
+
+请使用简体中文输出，但可见文字必须保留原文。严格使用下面的固定结构，每个标题只出现一次：
+
+概览：用一句话概括图片最重要的可见内容和类型。
+主体与场景：说明主要对象、数量、动作/状态、场景和空间关系。
+可见文字：逐字记录重要且清晰的文字；没有明显文字时写“无明显可见文字”。
+布局与细节：说明界面/文档结构、位置关系、图表或其他有助于定位的细节；没有时写“无明显可识别的其他细节”。
+颜色与风格：说明主要颜色、对比、光线和视觉风格，只写明显事实。
+关键词：给出一行逗号分隔的检索关键词。"""
 
     def __init__(self, base_url: str, api_key: str, vision_model: str, embedding_model: str):
         self.base_url = base_url.rstrip("/")
@@ -1413,7 +1440,11 @@ class AIService:
     def _post(self, path: str, payload: dict, cancel_event: threading.Event | None = None) -> dict:
         _raise_if_cancelled(cancel_event)
         deadline = time.monotonic() + self.REQUEST_DEADLINE_SECONDS
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION} (+https://github.com/W1nge/ClipSave)",
+        }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(
@@ -1470,6 +1501,11 @@ class AIService:
                         watcher.join(0.2)
         except urllib.error.HTTPError as exc:
             detail = exc.read(301).decode("utf-8", errors="replace")
+            if exc.code == 403 and ("error-1010" in detail.lower() or "error 1010" in detail.lower()):
+                raise RuntimeError(
+                    "AI 服务返回 403（Cloudflare Error 1010：服务端拒绝了当前客户端请求特征）。"
+                    "请确认 Base URL 正确，并联系服务提供方检查访问策略。"
+                ) from exc
             raise RuntimeError(f"AI 服务返回 {exc.code}: {detail[:300]}") from exc
         except OperationCancelled:
             raise
@@ -1486,17 +1522,34 @@ class AIService:
         return result
 
     @staticmethod
-    def _description_from_response(result: dict) -> str:
+    def _completion_text_from_response(result: dict, *, allow_empty: bool = False) -> str:
         choices = result.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise RuntimeError("AI 服务响应缺少 choices。")
         message = choices[0].get("message")
-        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        if not isinstance(message, dict):
             raise RuntimeError("AI 服务响应缺少文字内容。")
-        content = message["content"].strip()
-        if not content:
+        raw_content = message.get("content")
+        if isinstance(raw_content, str):
+            content = raw_content
+        elif isinstance(raw_content, list):
+            parts = []
+            for part in raw_content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+            content = "".join(parts)
+        else:
+            raise RuntimeError("AI 服务响应缺少文字内容。")
+        content = content.strip()
+        if not content and not allow_empty:
             raise RuntimeError("AI 服务返回了空描述。")
         return content
+
+    @staticmethod
+    def _description_from_response(result: dict) -> str:
+        return AIService._completion_text_from_response(result)
 
     @staticmethod
     def _embedding_from_response(result: dict) -> list[float]:
@@ -1518,12 +1571,14 @@ class AIService:
             values.append(number)
         return values
 
-    def describe_image(
+    def _encode_image(
         self,
         source: Path | ImageFileSnapshot,
         cancel_event: threading.Event | None = None,
         *,
         expected_sha256: str | None = None,
+        max_dimension: int = DESCRIPTION_MAX_IMAGE_DIMENSION,
+        quality: int = DESCRIPTION_JPEG_QUALITY,
     ) -> str:
         _raise_if_cancelled(cancel_event)
         snapshot = source if isinstance(source, ImageFileSnapshot) else preflight_image_file(source)
@@ -1549,12 +1604,41 @@ class AIService:
                 image.load()
                 if image.size != (snapshot.width, snapshot.height):
                     raise RuntimeError("Image dimensions changed before AI processing")
-                image.thumbnail((1024, 1024))
+                image = ImageOps.exif_transpose(image)
+                image.thumbnail(
+                    (max_dimension, max_dimension),
+                    Image.Resampling.LANCZOS,
+                )
                 with io.BytesIO() as stream:
-                    image.convert("RGB").save(stream, "JPEG", quality=82)
+                    image.convert("RGB").save(
+                        stream,
+                        "JPEG",
+                        quality=quality,
+                        optimize=True,
+                    )
                     encoded = base64.b64encode(stream.getvalue()).decode("ascii")
             snapshot.require_current()
         _raise_if_cancelled(cancel_event)
+        return encoded
+
+    def _vision_completion(
+        self,
+        prompt: str,
+        source: Path | ImageFileSnapshot,
+        cancel_event: threading.Event | None = None,
+        *,
+        expected_sha256: str | None = None,
+        image_max_dimension: int | None = None,
+        image_quality: int | None = None,
+        allow_empty: bool = False,
+    ) -> str:
+        encoded = self._encode_image(
+            source,
+            cancel_event,
+            expected_sha256=expected_sha256,
+            max_dimension=image_max_dimension or self.DESCRIPTION_MAX_IMAGE_DIMENSION,
+            quality=image_quality or self.DESCRIPTION_JPEG_QUALITY,
+        )
         result = self._post(
             "/chat/completions",
             {
@@ -1562,7 +1646,7 @@ class AIService:
                 "messages": [{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "用简体中文简洁描述这张图片，包含主体、场景、可见文字和适合搜索的关键词。只输出描述。"},
+                        {"type": "text", "text": prompt},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
                     ],
                 }],
@@ -1571,7 +1655,42 @@ class AIService:
             cancel_event,
         )
         _raise_if_cancelled(cancel_event)
+        if allow_empty:
+            return self._completion_text_from_response(result, allow_empty=True)
         return self._description_from_response(result)
+
+    def ocr_image(
+        self,
+        source: Path | ImageFileSnapshot,
+        cancel_event: threading.Event | None = None,
+        *,
+        expected_sha256: str | None = None,
+    ) -> str:
+        return self._vision_completion(
+            self.OCR_PROMPT,
+            source,
+            cancel_event,
+            expected_sha256=expected_sha256,
+            image_max_dimension=self.OCR_MAX_IMAGE_DIMENSION,
+            image_quality=self.OCR_JPEG_QUALITY,
+            allow_empty=True,
+        )
+
+    def describe_image(
+        self,
+        source: Path | ImageFileSnapshot,
+        cancel_event: threading.Event | None = None,
+        *,
+        expected_sha256: str | None = None,
+    ) -> str:
+        return self._vision_completion(
+            self.IMAGE_DESCRIPTION_PROMPT,
+            source,
+            cancel_event,
+            expected_sha256=expected_sha256,
+            image_max_dimension=self.DESCRIPTION_MAX_IMAGE_DIMENSION,
+            image_quality=self.DESCRIPTION_JPEG_QUALITY,
+        )
 
     def embed(self, text: str, cancel_event: threading.Event | None = None) -> list[float] | None:
         if not self.embedding_model:

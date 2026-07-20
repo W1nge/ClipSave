@@ -29,7 +29,6 @@ def collect(output: Path) -> None:
         "Qt-LGPL-3.0-only.txt",
         "Qt-GPL-3.0-only.txt",
         "SQLite-Public-Domain.txt",
-        "pywinrt-MIT.txt",
     }
     upstream_dir = Path("third_party_licenses")
     missing_upstream = [
@@ -66,8 +65,7 @@ def collect(output: Path) -> None:
     uncovered = [
         name
         for name in missing
-        if name not in {"PySide6-Essentials", "shiboken6", "winrt-runtime"}
-        and not name.startswith("winrt-Windows.")
+        if name not in {"PySide6-Essentials", "shiboken6"}
     ]
     if uncovered:
         raise RuntimeError("No wheel or upstream license text found for: " + ", ".join(uncovered))

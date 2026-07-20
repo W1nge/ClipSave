@@ -22,6 +22,8 @@ DEFAULTS = {
     "ai_api_key": "",
     "ai_vision_model": "",
     "ai_embedding_model": "",
+    "auto_ocr": False,
+    "auto_description": False,
 }
 MAX_SETTINGS_BYTES = 1024 * 1024
 _STRING_LIMITS = {
@@ -37,6 +39,8 @@ _BOOLEAN_KEYS = {
     "close_to_tray",
     "start_with_windows",
     "follow_system_theme",
+    "auto_ocr",
+    "auto_description",
 }
 _STRING_KEYS = {
     "ai_base_url",

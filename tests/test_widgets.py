@@ -308,6 +308,96 @@ class ThumbnailPixmapTests(unittest.TestCase):
         grid.close()
         connection.close()
 
+    def test_image_right_click_gesture_accepts_sqlite_rows(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """SELECT 1 AS id, 'image' AS kind, 'row image' AS title,
+                      'missing.png' AS path, '' AS content, 0 AS favorite,
+                      '2026-07-12T10:00:00' AS created_at, 64 AS width,
+                      40 AS height, 128 AS file_size, '' AS tag_names"""
+        ).fetchone()
+        previous_interval = QApplication.doubleClickInterval()
+        QApplication.setDoubleClickInterval(20)
+        try:
+            for view in (AssetGrid(), AssetTable()):
+                view.resize(720, 400)
+                view.show()
+                view.set_items([row])
+                self.app.processEvents()
+                index = view.model().index(0, 0)
+                point = (
+                    view.delegate.card_rect(view.visualRect(index)).center()
+                    if isinstance(view, AssetGrid)
+                    else view.visualRect(index).center()
+                )
+                detail = Mock()
+                view.detail_requested.connect(detail)
+                self.assertEqual(view._image_id_at(point), 1)
+                QTest.mouseClick(view.viewport(), Qt.MouseButton.RightButton, pos=point)
+                self.assertTrue(wait_for(lambda: detail.call_count == 1, timeout=0.5))
+                detail.assert_called_once_with(1)
+                view.close()
+        finally:
+            QApplication.setDoubleClickInterval(previous_interval)
+            connection.close()
+
+    def test_image_right_click_waits_before_changing_the_selected_item(self):
+        previous_interval = QApplication.doubleClickInterval()
+        QApplication.setDoubleClickInterval(20)
+        try:
+            for view in (AssetGrid(), AssetTable()):
+                view.resize(720, 400)
+                view.show()
+                view.set_items(asset_records(2, kind="image", path="missing.png"))
+                view.select_item(1)
+                self.app.processEvents()
+                second_index = view.model().index(1, 0)
+                point = (
+                    view.delegate.card_rect(view.visualRect(second_index)).center()
+                    if isinstance(view, AssetGrid)
+                    else view.visualRect(second_index).center()
+                )
+                detail = Mock()
+                view.detail_requested.connect(detail)
+
+                QTest.mousePress(
+                    view.viewport(), Qt.MouseButton.RightButton, pos=point
+                )
+                QTest.mouseRelease(
+                    view.viewport(), Qt.MouseButton.RightButton, pos=point
+                )
+
+                self.assertEqual(view.selected_id, 1)
+                detail.assert_called_once_with(2)
+                view.close()
+        finally:
+            QApplication.setDoubleClickInterval(previous_interval)
+
+    def test_right_click_requests_details_for_every_item_kind(self):
+        for kind in ("image", "text", "markdown"):
+            for view in (AssetGrid(), AssetTable()):
+                with self.subTest(kind=kind, view=type(view).__name__):
+                    view.resize(720, 400)
+                    view.show()
+                    view.set_items(asset_records(1, kind=kind, path="missing.png"))
+                    self.app.processEvents()
+                    index = view.model().index(0, 0)
+                    point = (
+                        view.delegate.card_rect(view.visualRect(index)).center()
+                        if isinstance(view, AssetGrid)
+                        else view.visualRect(index).center()
+                    )
+                    detail = Mock()
+                    view.detail_requested.connect(detail)
+
+                    QTest.mouseClick(
+                        view.viewport(), Qt.MouseButton.RightButton, pos=point
+                    )
+
+                    detail.assert_called_once_with(1)
+                    view.close()
+
     def test_null_thumbnail_decode_is_not_cached(self):
         path = Path(self.temp.name) / "invalid.png"
         path.write_bytes(b"not an image")
@@ -425,6 +515,28 @@ class ThumbnailPixmapTests(unittest.TestCase):
         first_row_top = grid.visualRect(grid.model().index(0, 0)).top()
         self.assertEqual(grid.visualRect(grid.model().index(3, 0)).top(), first_row_top)
         self.assertGreater(grid.visualRect(grid.model().index(4, 0)).top(), first_row_top)
+        grid.close()
+
+    def test_grid_reserves_scrollbar_width_without_relayout_feedback(self):
+        grid = AssetGrid()
+        grid.resize(1022, 600)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(7))
+        grid.show()
+
+        widths = []
+        ranges = []
+        for _ in range(20):
+            self.app.processEvents()
+            widths.append(grid.viewport().width())
+            ranges.append(grid.verticalScrollBar().maximum())
+
+        self.assertEqual(
+            grid.verticalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn,
+        )
+        self.assertEqual(len(set(widths[-10:])), 1)
+        self.assertEqual(len(set(ranges[-10:])), 1)
         grid.close()
 
     def test_table_keeps_fixed_row_height_without_full_resize(self):
@@ -603,6 +715,70 @@ class ThumbnailPixmapTests(unittest.TestCase):
         cleared.assert_called_once_with()
         self.assertIsNone(grid.selected_id)
         grid.close()
+
+    def test_image_mouse_gestures_are_consistent_in_grid_and_table(self):
+        path = Path(self.temp.name) / "gesture.png"
+        image = QImage(64, 40, QImage.Format.Format_RGB32)
+        image.fill(QColor("#21a8fb"))
+        self.assertTrue(image.save(str(path)))
+
+        previous_interval = QApplication.doubleClickInterval()
+        QApplication.setDoubleClickInterval(80)
+        try:
+            for view in (AssetGrid(), AssetTable()):
+                view.resize(720, 400)
+                view.show()
+                view.set_items(asset_records(1, kind="image", path=str(path)))
+                self.app.processEvents()
+
+                activated = Mock()
+                detail = Mock()
+                opened = Mock()
+                view.item_activated.connect(activated)
+                view.detail_requested.connect(detail)
+                view.open_requested.connect(opened)
+                index = view.model().index(0, 0)
+                point = (
+                    view.delegate.card_rect(view.visualRect(index)).center()
+                    if isinstance(view, AssetGrid)
+                    else view.visualRect(index).center()
+                )
+
+                QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+                QTest.mouseDClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+                self.app.processEvents()
+                activated.assert_called_once_with(1)
+                detail.assert_not_called()
+                opened.assert_not_called()
+
+                activated.reset_mock()
+                QTest.mouseClick(view.viewport(), Qt.MouseButton.RightButton, pos=point)
+                self.assertTrue(wait_for(lambda: detail.call_count == 1, timeout=0.7))
+                detail.assert_called_once_with(1)
+                opened.assert_not_called()
+
+                detail.reset_mock()
+                QTest.mouseClick(view.viewport(), Qt.MouseButton.RightButton, pos=point)
+                QTest.mouseClick(view.viewport(), Qt.MouseButton.RightButton, pos=point)
+                self.app.processEvents()
+                opened.assert_not_called()
+                self.assertEqual(detail.call_count, 2)
+                detail.assert_called_with(1)
+
+                activated.reset_mock()
+                detail.reset_mock()
+                QTest.qWait(100)
+                QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+                QTest.mouseDClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+                QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+                self.app.processEvents()
+                opened.assert_called_once_with(1)
+                activated.assert_called_once_with(1)
+                QTest.qWait(100)
+                activated.assert_called_once_with(1)
+                view.close()
+        finally:
+            QApplication.setDoubleClickInterval(previous_interval)
 
     def test_table_favorite_control_emits_requested_change(self):
         table = AssetTable()
@@ -1173,11 +1349,49 @@ class WidgetSafetyTests(unittest.TestCase):
 
         dialog = MarkdownDialog("Example", "![private](relative.png)", r"C:\notes\example.md")
         panel = DetailPanel()
+        self.assertTrue(dialog.windowFlags() & Qt.WindowType.FramelessWindowHint)
+        self.assertEqual(dialog.objectName(), "FluentDialog")
+        self.assertTrue(dialog.property("markdownDialog"))
+        self.assertEqual(dialog.layout().contentsMargins().left(), 1)
         self.assertEqual(dialog.browser.searchPaths(), [])
         self.assertIsInstance(panel.text_preview, _SafeMarkdownBrowser)
+        for markdown_browser in (browser, dialog.browser, panel.text_preview):
+            self.assertEqual(
+                markdown_browser.horizontalScrollBarPolicy(),
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+            )
+            self.assertEqual(
+                markdown_browser.verticalScrollBarPolicy(),
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+            )
         dialog.close()
         panel.close()
         browser.close()
+
+    def test_text_context_menu_uses_theme_aware_icons(self):
+        previous_dark_theme = self.app.property("darkTheme")
+        self.app.setProperty("darkTheme", True)
+        browser = _SafeMarkdownBrowser()
+        browser.setPlainText("selected text")
+        browser.selectAll()
+        menu = browser._create_themed_context_menu()
+        try:
+            actions = {action.objectName(): action for action in menu.actions()}
+            self.assertFalse(actions["edit-copy"].icon().isNull())
+            self.assertFalse(actions["select-all"].icon().isNull())
+            copy_icon = actions["edit-copy"].icon().pixmap(16, 16).toImage()
+            visible_colors = [
+                copy_icon.pixelColor(x, y)
+                for x in range(copy_icon.width())
+                for y in range(copy_icon.height())
+                if copy_icon.pixelColor(x, y).alpha() > 0
+            ]
+            self.assertTrue(visible_colors)
+            self.assertGreater(max(color.red() for color in visible_colors), 180)
+        finally:
+            menu.close()
+            browser.close()
+            self.app.setProperty("darkTheme", previous_dark_theme)
 
     def test_failed_settings_save_restores_previous_data(self):
         settings = Mock()

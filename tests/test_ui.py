@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent, QRect, Qt
 from PySide6.QtGui import QColor, QImage
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from clipsave_app.app import create_app_icon
@@ -19,7 +20,7 @@ from clipsave_app.database import ImportFileResult, LibraryDatabase
 from clipsave_app.main_window import AsyncSignals, MainWindow
 from clipsave_app.settings import Settings
 from clipsave_app.widgets import DateDialog, DraggableBar, MarkdownDialog, SettingsDialog, Sidebar
-from clipsave_app.windows_frame import WM_NCACTIVATE
+from clipsave_app.windows_frame import MINMAXINFO, WM_GETMINMAXINFO, WM_NCACTIVATE
 
 
 class MainWindowTests(unittest.TestCase):
@@ -130,6 +131,11 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(dialog.start_with_windows.isChecked())
         self.assertTrue(dialog.follow_system_theme.isChecked())
         self.assertFalse(dialog.dark_theme_switch.isEnabled())
+        self.assertFalse(dialog.auto_ocr.isChecked())
+        self.assertFalse(dialog.auto_description.isChecked())
+        self.assertEqual(dialog.auto_ocr.text(), "图片自动 OCR")
+        self.assertEqual(dialog.auto_description.text(), "图片自动生成描述")
+        self.assertEqual(dialog.bulk_image_button.text(), "一键 OCR 并生成全部图片描述")
         import_requests = []
         dialog.import_requested.connect(lambda: import_requests.append(True))
         dialog.import_button.click()
@@ -144,6 +150,326 @@ class MainWindowTests(unittest.TestCase):
         date_dialog.close()
         self.assertFalse(self.window.table.showGrid())
         self.assertTrue(self.window.table.alternatingRowColors())
+
+    def test_new_image_schedules_enabled_automatic_ai_tasks(self):
+        image_path = Path(self.temp.name) / "automatic.png"
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(QColor("white"))
+        self.assertTrue(image.save(str(image_path), "PNG"))
+        item_id = self.database.add_image(image_path)
+        self.assertIsNotNone(item_id)
+        self.settings.data.update(
+            {
+                "ai_base_url": "http://localhost/v1",
+                "ai_vision_model": "vision",
+                "auto_ocr": True,
+                "auto_description": True,
+            }
+        )
+        with patch.object(self.window, "generate_ocr") as generate_ocr, patch.object(
+            self.window, "generate_ai_description"
+        ) as generate_description:
+            self.window._schedule_auto_image_tasks(item_id)
+
+        generate_ocr.assert_called_once_with(item_id, automatic=True)
+        generate_description.assert_called_once_with(item_id, automatic=True)
+
+    def test_settings_persist_automatic_image_options(self):
+        dialog = SettingsDialog(self.settings, self.window)
+        dialog.base_url.setText("http://localhost/v1")
+        dialog.vision_model.setText("vision")
+        dialog.auto_ocr.setChecked(True)
+        dialog.auto_description.setChecked(True)
+
+        dialog.accept()
+
+        self.assertTrue(self.settings.get("auto_ocr"))
+        self.assertTrue(self.settings.get("auto_description"))
+        self.assertEqual(self.settings.get("ai_base_url"), "http://localhost/v1")
+        self.assertEqual(self.settings.get("ai_vision_model"), "vision")
+
+    def test_settings_reject_automatic_image_options_without_vision_config(self):
+        dialog = SettingsDialog(self.settings, self.window)
+        dialog.auto_ocr.setChecked(True)
+
+        with patch("clipsave_app.widgets.QMessageBox.warning") as warning:
+            dialog.accept()
+
+        warning.assert_called_once()
+        self.assertFalse(self.settings.get("auto_ocr"))
+        self.assertEqual(dialog.result(), 0)
+
+    def test_bulk_image_confirmation_saves_settings_only_after_yes(self):
+        image_path = Path(self.temp.name) / "confirm-bulk.png"
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(QColor("white"))
+        self.assertTrue(image.save(str(image_path), "PNG"))
+        self.database.add_image(image_path)
+        dialog = SettingsDialog(self.settings, self.window)
+        dialog.base_url.setText("http://localhost/v1")
+        dialog.vision_model.setText("vision")
+
+        with patch(
+            "clipsave_app.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ):
+            self.window._confirm_bulk_image_processing(dialog)
+        self.assertFalse(dialog.bulk_processing_confirmed)
+        self.assertEqual(dialog.result(), 0)
+
+        with patch(
+            "clipsave_app.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window._confirm_bulk_image_processing(dialog)
+        self.assertTrue(dialog.bulk_processing_confirmed)
+        self.assertEqual(dialog.result(), 1)
+        self.assertEqual(self.settings.get("ai_base_url"), "http://localhost/v1")
+        dialog.close()
+
+    def test_bulk_image_processing_runs_ocr_then_description_serially(self):
+        image_ids = []
+        for index, color in enumerate(("red", "blue"), 1):
+            path = Path(self.temp.name) / f"bulk-{index}.png"
+            image = QImage(8, 8, QImage.Format.Format_RGB32)
+            image.fill(QColor(color))
+            self.assertTrue(image.save(str(path), "PNG"))
+            image_ids.append(self.database.add_image(path))
+        self.settings.data.update(
+            {
+                "ai_base_url": "http://localhost/v1",
+                "ai_vision_model": "vision",
+                "ai_embedding_model": "",
+            }
+        )
+
+        with patch.object(self.window, "_start_async_task") as start_task, patch(
+            "clipsave_app.main_window.AIService.ocr_image",
+            side_effect=["first OCR", "second OCR"],
+        ) as ocr, patch(
+            "clipsave_app.main_window.AIService.describe_image",
+            side_effect=["first description", "second description"],
+        ) as describe, patch(
+            "clipsave_app.main_window.AIService.embed",
+            return_value=None,
+        ) as embed:
+            self.window.start_bulk_image_processing()
+            worker = start_task.call_args.args[1]
+            worker(threading.Event())
+            self.app.processEvents()
+
+        self.assertEqual(ocr.call_count, 2)
+        self.assertEqual(describe.call_count, 2)
+        embed.assert_not_called()
+        self.assertIsNone(self.window._bulk_image_request)
+        for item_id, expected_ocr, expected_description in zip(
+            image_ids,
+            ("first OCR", "second OCR"),
+            ("first description", "second description"),
+        ):
+            item = self.database.get_item(item_id)
+            self.assertEqual(item["ocr_text"], expected_ocr)
+            self.assertEqual(item["ai_description"], expected_description)
+
+    def test_bulk_image_processing_continues_after_embedding_endpoint_failure(self):
+        image_ids = []
+        for index, color in enumerate(("red", "blue"), 1):
+            path = Path(self.temp.name) / f"bulk-embedding-{index}.png"
+            image = QImage(8, 8, QImage.Format.Format_RGB32)
+            image.fill(QColor(color))
+            self.assertTrue(image.save(str(path), "PNG"))
+            image_ids.append(self.database.add_image(path))
+        self.settings.data.update(
+            {
+                "ai_base_url": "http://localhost/v1",
+                "ai_vision_model": "vision",
+                "ai_embedding_model": "unsupported-embedding",
+            }
+        )
+
+        with patch.object(self.window, "_start_async_task") as start_task, patch(
+            "clipsave_app.main_window.AIService.ocr_image",
+            side_effect=["first OCR", "second OCR"],
+        ) as ocr, patch(
+            "clipsave_app.main_window.AIService.describe_image",
+            side_effect=["first description", "second description"],
+        ) as describe, patch(
+            "clipsave_app.main_window.AIService.embed",
+            side_effect=RuntimeError("embedding endpoint returned 404"),
+        ) as embed, patch(
+            "clipsave_app.main_window.QMessageBox.warning"
+        ) as warning:
+            self.window.start_bulk_image_processing()
+            worker = start_task.call_args.args[1]
+            worker(threading.Event())
+            self.app.processEvents()
+
+        self.assertEqual(ocr.call_count, 2)
+        self.assertEqual(describe.call_count, 2)
+        embed.assert_called_once()
+        self.assertIsNone(self.window._bulk_image_request)
+        self.assertEqual(warning.call_count, 1)
+        self.assertEqual(warning.call_args.args[1], "向量生成已跳过")
+        for item_id, expected_description in zip(
+            image_ids,
+            ("first description", "second description"),
+        ):
+            item = self.database.get_item(item_id)
+            self.assertEqual(item["ai_description"], expected_description)
+            self.assertIsNone(item["embedding"])
+
+    def test_manual_description_is_saved_when_embedding_endpoint_fails(self):
+        path = Path(self.temp.name) / "manual-embedding-failure.png"
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(QColor("white"))
+        self.assertTrue(image.save(str(path), "PNG"))
+        item_id = self.database.add_image(path)
+        self.settings.data.update(
+            {
+                "ai_base_url": "http://localhost/v1",
+                "ai_vision_model": "vision",
+                "ai_embedding_model": "unsupported-embedding",
+            }
+        )
+
+        with patch.object(self.window, "_start_bounded_task") as start_task, patch(
+            "clipsave_app.main_window.AIService.describe_image",
+            return_value="saved description",
+        ), patch(
+            "clipsave_app.main_window.AIService.embed",
+            side_effect=RuntimeError("embedding endpoint returned 404"),
+        ), patch.object(self.window, "show_error_status") as status:
+            self.assertTrue(self.window.generate_ai_description(item_id))
+            worker = start_task.call_args.args[1]
+            worker(threading.Event())
+            self.app.processEvents()
+
+        item = self.database.get_item(item_id)
+        self.assertEqual(item["ai_description"], "saved description")
+        self.assertIsNone(item["embedding"])
+        self.assertNotIn(item_id, self.window._ai_requests)
+        status.assert_called_once()
+        self.assertIn("向量生成失败", status.call_args.args[0])
+
+    def test_detail_splitter_resizes_the_visible_panel(self):
+        item_id = self.window.current_items[0]["id"]
+        self.window.select_item(item_id)
+        self.window.toggle_detail()
+        self.app.processEvents()
+
+        self.assertEqual(self.window.content_splitter.handleWidth(), 8)
+        self.assertEqual(
+            self.window.content_splitter.handle(1).cursor().shape(),
+            Qt.CursorShape.SizeHorCursor,
+        )
+        initial_width = self.window.detail.width()
+        target_width = 460
+        total = self.window.content_splitter.width()
+        self.window.content_splitter.setSizes([max(1, total - target_width), target_width])
+        self.app.processEvents()
+
+        self.assertGreater(self.window.detail.width(), initial_width)
+        self.assertLessEqual(self.window.detail.width(), self.window.detail.maximumWidth())
+
+    def test_localized_image_import_is_scheduled_for_automatic_processing(self):
+        path = Path(self.temp.name) / "localized.png"
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(QColor("white"))
+        self.assertTrue(image.save(str(path), "PNG"))
+        item_id = self.database.add_image(path)
+        self.assertIsNotNone(item_id)
+
+        with patch(
+            "clipsave_app.main_window.QFileDialog.getOpenFileNames",
+            return_value=([str(path)], ""),
+        ), patch.object(
+            self.database, "import_file", return_value=ImportFileResult.LOCALIZED
+        ), patch.object(
+            self.database,
+            "indexed_file_for_hash",
+            return_value={"id": item_id},
+        ), patch.object(
+            self.window, "_schedule_auto_image_tasks"
+        ) as schedule:
+            self.window.settings.data.update(
+                {
+                    "ai_base_url": "http://localhost/v1",
+                    "ai_vision_model": "vision",
+                    "auto_ocr": True,
+                }
+            )
+            self.window.import_files()
+            deadline = time.monotonic() + 2
+            while self.window._import_request is not None and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+
+        schedule.assert_called_once_with(item_id)
+
+    def test_automatic_ai_failure_cleans_request_without_modal(self):
+        item_id = self.window.current_items[0]["id"]
+        token, signals = object(), AsyncSignals()
+        self.window._ai_requests[item_id] = (token, signals)
+        self.window._automatic_ai_items.add(item_id)
+
+        with patch.object(self.window, "show_error_status") as status, patch(
+            "clipsave_app.main_window.QMessageBox.warning"
+        ) as warning:
+            self.window._ai_failed(token, signals, item_id, "provider failed")
+
+        self.assertNotIn(item_id, self.window._ai_requests)
+        self.assertNotIn(item_id, self.window._automatic_ai_items)
+        status.assert_called_once_with("自动生成描述失败：provider failed")
+        warning.assert_not_called()
+
+    def test_stale_ai_or_ocr_failure_does_not_touch_a_new_request(self):
+        item_id = self.window.current_items[0]["id"]
+        old_ai = (object(), AsyncSignals())
+        new_ai = (object(), AsyncSignals())
+        old_ocr = (object(), AsyncSignals())
+        new_ocr = (object(), AsyncSignals())
+        self.window._ai_requests[item_id] = new_ai
+        self.window._ocr_requests[item_id] = new_ocr
+        self.window._automatic_ai_items.add(item_id)
+        self.window._automatic_ocr_items.add(item_id)
+
+        with patch.object(self.window, "show_error_status") as status, patch(
+            "clipsave_app.main_window.QMessageBox.warning"
+        ) as warning:
+            self.window._ai_failed(old_ai[0], old_ai[1], item_id, "old ai failure")
+            self.window._ocr_failed(old_ocr[0], old_ocr[1], item_id, "old ocr failure")
+
+        self.assertIs(self.window._ai_requests[item_id], new_ai)
+        self.assertIs(self.window._ocr_requests[item_id], new_ocr)
+        self.assertIn(item_id, self.window._automatic_ai_items)
+        self.assertIn(item_id, self.window._automatic_ocr_items)
+        status.assert_not_called()
+        warning.assert_not_called()
+
+    def test_manual_ocr_uses_the_configured_vision_service(self):
+        image_path = Path(self.temp.name) / "manual-ocr.png"
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(QColor("white"))
+        self.assertTrue(image.save(str(image_path), "PNG"))
+        item_id = self.database.add_image(image_path)
+        self.settings.data.update(
+            {
+                "ai_base_url": "http://localhost/v1",
+                "ai_vision_model": "vision",
+            }
+        )
+
+        with patch(
+            "clipsave_app.main_window.AIService.ocr_image",
+            return_value="visible text",
+        ) as ocr, patch.object(self.window, "_start_bounded_task") as start:
+            self.assertTrue(self.window.generate_ocr(item_id))
+            work = start.call_args.args[1]
+            work(threading.Event())
+            self.app.processEvents()
+
+        ocr.assert_called_once()
+        self.assertEqual(self.database.get_item(item_id)["ocr_text"], "visible text")
 
     def test_window_geometry_is_kept_inside_the_available_screen(self):
         screen = Mock()
@@ -175,6 +501,44 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertEqual(result, (True, 7))
         handler.assert_called_once_with(message.hWnd, 0)
+
+    def test_windows_native_event_constrains_native_maximize_to_work_area(self):
+        message = wintypes.MSG()
+        message.hWnd = int(self.window.winId())
+        message.message = WM_GETMINMAXINFO
+        message.wParam = 0
+        minimum = MINMAXINFO()
+        message.lParam = ctypes.addressof(minimum)
+
+        with patch(
+            "clipsave_app.main_window.window_dpi_scale", return_value=1.5
+        ), patch(
+            "clipsave_app.main_window.handle_getminmaxinfo", return_value=(True, 0)
+        ) as handler:
+            result = self.window.nativeEvent(
+                b"windows_generic_MSG", ctypes.addressof(message)
+            )
+
+        self.assertEqual(result, (True, 0))
+        handler.assert_called_once_with(
+            message.hWnd,
+            0,
+            message.lParam,
+            (1200, 660),
+        )
+
+    def test_toggle_maximized_uses_native_restore_for_aero_snap(self):
+        with patch(
+            "clipsave_app.main_window.is_windows_qt_platform", return_value=True
+        ), patch(
+            "clipsave_app.main_window.native_window_is_maximized", return_value=True
+        ), patch(
+            "clipsave_app.main_window.restore_native_window", return_value=True
+        ) as restore, patch.object(self.window, "showNormal") as show_normal:
+            self.window.toggle_maximized()
+
+        restore.assert_called_once_with(int(self.window.winId()))
+        show_normal.assert_not_called()
 
     def test_native_acrylic_retries_once_when_hidden_window_application_fails(self):
         with patch("clipsave_app.main_window.is_windows_qt_platform", return_value=True), patch.object(
@@ -1168,10 +1532,17 @@ class MainWindowTests(unittest.TestCase):
         with patch("clipsave_app.main_window.QMessageBox.warning") as warning, patch.object(
             self.window, "show_status"
         ) as show_status, patch("clipsave_app.main_window.os.startfile") as startfile:
-            self.window.activate_item(image_id)
+            self.window.open_item(image_id)
             startfile.assert_not_called()
             warning.assert_called_once()
             show_status.assert_called_once_with("打开失败：图片文件不存在")
+
+        with patch.object(self.window, "copy_item") as copy_item, patch(
+            "clipsave_app.main_window.os.startfile"
+        ) as startfile:
+            self.window.activate_item(image_id)
+            copy_item.assert_called_once_with(image_id)
+            startfile.assert_not_called()
 
         with patch("clipsave_app.main_window.QMessageBox.warning") as warning, patch.object(
             self.window, "show_status"
@@ -1182,6 +1553,57 @@ class MainWindowTests(unittest.TestCase):
             warning.assert_called_once()
             show_status.assert_called_once_with("复制失败：图片文件不存在")
             show_confirmation.assert_not_called()
+
+    def test_image_actions_copy_show_details_and_open_in_default_app(self):
+        image_path = Path(self.temp.name) / "actions.png"
+        image = QImage(32, 32, QImage.Format.Format_RGB32)
+        image.fill(QColor("#21a8fb"))
+        self.assertTrue(image.save(str(image_path)))
+        image_id = self.database.add_image(image_path)
+        self.window.refresh_library()
+
+        with patch.object(self.window, "copy_item") as copy_item:
+            self.window.activate_item(image_id)
+        copy_item.assert_called_once_with(image_id)
+
+        previous_interval = QApplication.doubleClickInterval()
+        QApplication.setDoubleClickInterval(20)
+        try:
+            row = self.window.grid._asset_model.row_for_id(image_id)
+            index = self.window.grid.model().index(row, 0)
+            point = self.window.grid.delegate.card_rect(
+                self.window.grid.visualRect(index)
+            ).center()
+            self.assertFalse(self.window.detail.isVisible())
+            QTest.mouseClick(
+                self.window.grid.viewport(), Qt.MouseButton.RightButton, pos=point
+            )
+            self.app.processEvents()
+            self.assertTrue(self.window.detail.isVisible())
+            self.assertEqual(self.window.current_item_id, image_id)
+            self.assertEqual(self.window.detail.current_item["id"], image_id)
+            QTest.qWait(25)
+            QTest.mouseClick(
+                self.window.grid.viewport(), Qt.MouseButton.RightButton, pos=point
+            )
+            self.app.processEvents()
+            self.assertFalse(self.window.detail.isVisible())
+        finally:
+            QApplication.setDoubleClickInterval(previous_interval)
+
+        with patch("clipsave_app.main_window.os.startfile") as startfile:
+            QTest.qWait(25)
+            QTest.mouseClick(
+                self.window.grid.viewport(), Qt.MouseButton.LeftButton, pos=point
+            )
+            QTest.mouseDClick(
+                self.window.grid.viewport(), Qt.MouseButton.LeftButton, pos=point
+            )
+            QTest.mouseClick(
+                self.window.grid.viewport(), Qt.MouseButton.LeftButton, pos=point
+            )
+            self.app.processEvents()
+        startfile.assert_called_once_with(image_path)
 
     def test_image_copy_decodes_in_background_and_database_errors_are_reported(self):
         image_path = Path(self.temp.name) / "copy.png"

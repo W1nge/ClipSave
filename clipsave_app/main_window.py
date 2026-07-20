@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QStackedLayout,
     QStackedWidget,
+    QSplitter,
     QSystemTrayIcon,
     QTextEdit,
     QToolTip,
@@ -43,18 +44,21 @@ from .services import (
     preflight_image_file,
     shutdown_ai_ocr_task_executor,
 )
-from .ocr_service import WindowsOCRService
 from .settings import Settings
 from .startup import set_start_with_windows
 from .storage import is_under_local_store, recycle_managed_file
 from .styles import DARK_STYLESHEET, LIGHT_STYLESHEET
 from .windows_frame import (
+    WM_GETMINMAXINFO,
     WM_NCACTIVATE,
     WM_NCCALCSIZE,
     enable_native_resize_frame,
+    handle_getminmaxinfo,
     handle_nccalcsize,
     handle_ncactivate,
     is_windows_qt_platform,
+    native_window_is_maximized,
+    restore_native_window,
     window_dpi_scale,
     window_rect,
 )
@@ -73,6 +77,7 @@ from .widgets import (
     SettingsDialog,
     ResizeHandle,
     Sidebar,
+    ThemedLineEdit,
     WindowTitleBar,
     lucide_icon,
 )
@@ -112,6 +117,11 @@ class AsyncSignals(QObject):
     failed = Signal(str)
 
 
+class BulkImageSignals(QObject):
+    progress = Signal(int, int, int)
+    finished = Signal(object)
+
+
 class MainWindow(QMainWindow):
     RESIZE_EDGE_WIDTH = 8
     RESIZE_CORNER_SIZE = 14
@@ -146,9 +156,11 @@ class MainWindow(QMainWindow):
         self.force_quit = False
         self._grid_dirty = True
         self._table_dirty = True
-        self._async_signals: set[AsyncSignals] = set()
+        self._async_signals: set[QObject] = set()
         self._ai_requests: dict[int, tuple[object, AsyncSignals]] = {}
         self._ocr_requests: dict[int, tuple[object, AsyncSignals]] = {}
+        self._automatic_ai_items: set[int] = set()
+        self._automatic_ocr_items: set[int] = set()
         self._semantic_request: tuple[object, AsyncSignals] | None = None
         self._semantic_results_active = False
         self._semantic_ordered_ids: list[int] = []
@@ -160,6 +172,7 @@ class MainWindow(QMainWindow):
         self._import_request: tuple[object, AsyncSignals] | None = None
         self._copy_request: tuple[object, AsyncSignals, int] | None = None
         self._backup_request: tuple[object, AsyncSignals] | None = None
+        self._bulk_image_request: tuple[object, BulkImageSignals] | None = None
         self._async_tasks: dict[object, tuple[threading.Event, threading.Thread]] = {}
         self._bounded_tasks: dict[object, object] = {}
         self._async_tasks_lock = threading.Lock()
@@ -228,7 +241,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(DARK_STYLESHEET if dark else LIGHT_STYLESHEET)
         for button in self.findChildren(IconButton):
             button.refresh_theme()
-        self.window_title_bar.update_maximize_state(self.isMaximized())
+        self.window_title_bar.update_maximize_state(self._window_is_maximized())
         self.sidebar.set_active(getattr(self.sidebar, "active_key", ""))
         self.semantic_button.setIcon(lucide_icon("sparkles"))
         self.detail.ai_button.setIcon(lucide_icon("sparkles"))
@@ -294,7 +307,7 @@ class MainWindow(QMainWindow):
         top_layout.setContentsMargins(16, 10, 16, 10)
         top_layout.setSpacing(8)
         top_layout.addStretch(1)
-        self.search = __import__("PySide6.QtWidgets", fromlist=["QLineEdit"]).QLineEdit()
+        self.search = ThemedLineEdit()
         self.search.setPlaceholderText("搜索剪贴板内容、文件名、标签、OCR 或 AI 描述  (Ctrl+K)")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(560)
@@ -341,9 +354,6 @@ class MainWindow(QMainWindow):
         self.filter_hint = QLabel()
         self.filter_hint.setObjectName("Muted")
         title_layout.addWidget(self.filter_hint)
-        content_row = QHBoxLayout()
-        content_row.setContentsMargins(0, 0, 0, 0)
-        content_row.setSpacing(0)
         self.view_stack = QStackedWidget()
         self.view_stack.setObjectName("ViewStack")
         self.grid = AssetGrid()
@@ -353,6 +363,8 @@ class MainWindow(QMainWindow):
         self.grid.item_selected.connect(self.select_item)
         self.grid.selection_cleared.connect(self.clear_item_selection)
         self.grid.item_activated.connect(self.activate_item)
+        self.grid.detail_requested.connect(self.show_item_detail)
+        self.grid.open_requested.connect(self.open_item)
         self.grid.favorite_requested.connect(self.set_favorite)
         self.table = AssetTable()
         self.table.verticalScrollBar().valueChanged.connect(
@@ -361,6 +373,8 @@ class MainWindow(QMainWindow):
         self.table.item_selected.connect(self.select_item)
         self.table.selection_cleared.connect(self.clear_item_selection)
         self.table.item_activated.connect(self.activate_item)
+        self.table.detail_requested.connect(self.show_item_detail)
+        self.table.open_requested.connect(self.open_item)
         self.table.favorite_requested.connect(self.set_favorite)
         self.table_page = QWidget()
         table_page_layout = QVBoxLayout(self.table_page)
@@ -385,12 +399,11 @@ class MainWindow(QMainWindow):
         library_layers.addWidget(header_overlay)
         library_layers.setCurrentWidget(header_overlay)
         self.library_header = title_bar
-        content_row.addWidget(self.library_surface, 1)
         self.detail = DetailPanel()
-        self.detail.setVisible(False)
+        self.detail.setMaximumWidth(520)
         self.detail.close_requested.connect(self.hide_detail)
         self.detail.copy_requested.connect(self.copy_item)
-        self.detail.open_requested.connect(self.activate_item)
+        self.detail.open_requested.connect(self.open_item)
         self.detail.delete_requested.connect(self.delete_item)
         self.detail.favorite_requested.connect(self.set_favorite)
         self.detail.notes_changed.connect(self.save_notes)
@@ -399,8 +412,21 @@ class MainWindow(QMainWindow):
         self.detail.collection_changed.connect(self.set_item_collection)
         self.detail.ai_requested.connect(self.generate_ai_description)
         self.detail.ocr_requested.connect(self.generate_ocr)
-        content_row.addWidget(self.detail)
-        middle_layout.addLayout(content_row, 1)
+        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.content_splitter.setObjectName("ContentSplitter")
+        self.content_splitter.setHandleWidth(8)
+        self.content_splitter.setChildrenCollapsible(False)
+        self.content_splitter.addWidget(self.library_surface)
+        self.content_splitter.addWidget(self.detail)
+        self.content_splitter.setStretchFactor(0, 1)
+        self.content_splitter.setStretchFactor(1, 0)
+        self.content_splitter.splitterMoved.connect(self._detail_splitter_moved)
+        self.detail.setVisible(False)
+        handle = self.content_splitter.handle(1)
+        if handle is not None:
+            handle.setCursor(Qt.CursorShape.SizeHorCursor)
+            handle.setToolTip("调整详情宽度")
+        middle_layout.addWidget(self.content_splitter, 1)
 
         self.set_view_mode(self.settings.get("view_mode", "grid"))
         self.sidebar.set_collapsed(bool(self.settings.get("sidebar_collapsed", False)), animate=False)
@@ -484,18 +510,50 @@ class MainWindow(QMainWindow):
             self.copy_toast.reposition()
 
     def toggle_maximized(self) -> None:
-        self.showNormal() if self.isMaximized() else self.showMaximized()
-        self.window_title_bar.update_maximize_state(self.isMaximized())
+        if self._window_is_maximized():
+            hwnd = int(self.winId()) if is_windows_qt_platform() else 0
+            if not restore_native_window(hwnd):
+                self.showNormal()
+        else:
+            self.showMaximized()
+        self.window_title_bar.update_maximize_state(self._window_is_maximized())
+        QTimer.singleShot(
+            0,
+            lambda: self.window_title_bar.update_maximize_state(
+                self._window_is_maximized()
+            ),
+        )
+
+    def _window_is_maximized(self) -> bool:
+        if is_windows_qt_platform():
+            native_state = native_window_is_maximized(int(self.winId()))
+            if native_state is not None:
+                return native_state
+        return self.isMaximized()
 
     def changeEvent(self, event) -> None:
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "window_title_bar"):
-            self.window_title_bar.update_maximize_state(self.isMaximized())
+            self.window_title_bar.update_maximize_state(self._window_is_maximized())
             self._update_resize_handles()
         super().changeEvent(event)
 
     def nativeEvent(self, event_type, message):
         if os.name == "nt" and event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
             msg = wintypes.MSG.from_address(int(message))
+            if msg.message == WM_GETMINMAXINFO:
+                hwnd = int(msg.hWnd) or int(self.winId())
+                scale = window_dpi_scale(hwnd)
+                handled, result = handle_getminmaxinfo(
+                    hwnd,
+                    int(msg.wParam),
+                    int(msg.lParam),
+                    (
+                        max(1, round(self.minimumWidth() * scale)),
+                        max(1, round(self.minimumHeight() * scale)),
+                    ),
+                )
+                if handled:
+                    return True, result
             if msg.message == WM_NCACTIVATE:
                 handled, result = handle_ncactivate(int(msg.hWnd), int(msg.wParam))
                 if handled:
@@ -834,13 +892,45 @@ class MainWindow(QMainWindow):
             self.hide_detail()
         else:
             self.detail.setVisible(True)
+            self._restore_detail_splitter_size()
             self.detail_button.setToolTip("收起详情")
             if self.current_item_id:
                 self.update_detail(self.current_item_id)
 
+    def show_item_detail(self, item_id: int) -> None:
+        if self.detail.isVisible() and self.current_item_id == item_id:
+            self.hide_detail()
+            return
+        self.select_item(item_id)
+        if self.current_item_id != item_id:
+            return
+        if not self.detail.isVisible():
+            self.detail.setVisible(True)
+            self._restore_detail_splitter_size()
+            self.detail_button.setToolTip("收起详情")
+            self.update_detail(item_id)
+
     def hide_detail(self) -> None:
         self.detail.setVisible(False)
         self.detail_button.setToolTip("显示详情")
+
+    def _detail_splitter_moved(self, _position: int, _index: int) -> None:
+        if self.detail.isVisible():
+            self._detail_width = max(self.detail.minimumWidth(), self.detail.width())
+
+    def _restore_detail_splitter_size(self) -> None:
+        if not hasattr(self, "content_splitter"):
+            return
+        total = self.content_splitter.width()
+        if total <= 0:
+            QTimer.singleShot(0, self._restore_detail_splitter_size)
+            return
+        desired = min(
+            self.detail.maximumWidth(),
+            max(self.detail.minimumWidth(), getattr(self, "_detail_width", 340)),
+        )
+        desired = min(desired, max(self.detail.minimumWidth(), total - 240))
+        self.content_splitter.setSizes([max(1, total - desired), desired])
 
     def set_view_mode(self, mode: str) -> None:
         mode = "list" if mode == "list" else "grid"
@@ -957,13 +1047,27 @@ class MainWindow(QMainWindow):
             self.tray.setToolTip("ClipSave - " + ("正在监听剪贴板" if active else "监听已暂停"))
 
     def on_captured(self, _item_id: int) -> None:
+        if self._closing or self._quit_in_progress:
+            return
         self.show_status("已保存一条新的剪贴板内容")
         if self._semantic_request is not None or self._semantic_results_active:
             self._refresh_navigation_metadata()
         else:
             self.refresh_library()
+        self._schedule_auto_image_tasks(_item_id)
 
     def activate_item(self, item_id: int) -> None:
+        item = self.database.get_item(item_id)
+        if not item:
+            return
+        if item["kind"] == "markdown":
+            self._exec_transient_dialog(
+                MarkdownDialog(item["title"], item["content"], item["path"], self)
+            )
+        else:
+            self.copy_item(item_id)
+
+    def open_item(self, item_id: int) -> None:
         item = self.database.get_item(item_id)
         if not item:
             return
@@ -1453,17 +1557,20 @@ class MainWindow(QMainWindow):
             duplicates = 0
             processed = 0
             failed = []
+            image_ids: list[int] = []
             for filename in paths:
                 if cancel_event.is_set():
                     break
                 try:
                     candidate = Path(filename)
+                    source_hash = None
                     if candidate.suffix.lower() == ".md":
                         if candidate.stat().st_size > MAX_MARKDOWN_BYTES:
                             raise ValueError("Markdown 文件过大，已拒绝导入。")
                         candidate.read_text(encoding="utf-8", errors="replace")
                     else:
                         preflight_image_file(candidate, max_file_bytes=MAX_IMPORT_BYTES)
+                        source_hash = LibraryDatabase.file_hash(candidate)
                     import_result = self.database.import_file(
                         candidate, copy_to_library=True, strict=True
                     )
@@ -1473,6 +1580,15 @@ class MainWindow(QMainWindow):
                         added += int(import_result)
                     else:
                         duplicates += 1
+                    # ImportFileResult.LOCALIZED deliberately evaluates false, but it is
+                    # still a newly materialized library image that may need AI processing.
+                    if source_hash and (
+                        import_result is True
+                        or import_result is ImportFileResult.LOCALIZED
+                    ):
+                        indexed = self.database.indexed_file_for_hash(source_hash)
+                        if indexed is not None:
+                            image_ids.append(int(indexed["id"]))
                 except Exception as exc:
                     failed.append((Path(filename).name, str(exc)))
                 finally:
@@ -1487,6 +1603,7 @@ class MainWindow(QMainWindow):
                     "duplicates": duplicates,
                     "processed": processed,
                     "failed": failed,
+                    "image_ids": list(dict.fromkeys(image_ids)),
                     "cancelled": cancel_event.is_set(),
                 },
             )
@@ -1499,6 +1616,8 @@ class MainWindow(QMainWindow):
             return
         self._import_request = None
         self.refresh_library()
+        for item_id in result.get("image_ids", ()):
+            self._schedule_auto_image_tasks(int(item_id))
         failed = result["failed"]
         localized = result.get("localized", 0)
         skipped = result.get(
@@ -1535,9 +1654,15 @@ class MainWindow(QMainWindow):
         previous_follow_system = self.settings.get("follow_system_theme", True)
         previous_theme_mode = self.settings.get("theme_mode", "light")
         previous_start_with_windows = self.settings.get("start_with_windows", False)
+        previous_auto_ocr = self.settings.get("auto_ocr", False)
+        previous_auto_description = self.settings.get("auto_description", False)
         dialog = SettingsDialog(self.settings, self)
         dialog.import_requested.connect(lambda: self.import_files(dialog))
+        dialog.bulk_processing_requested.connect(
+            lambda: self._confirm_bulk_image_processing(dialog)
+        )
         result = self._exec_transient_dialog(dialog)
+        bulk_requested = bool(result and dialog.bulk_processing_confirmed)
         if result:
             start_with_windows = self.settings.get("start_with_windows", False)
             if start_with_windows != previous_start_with_windows:
@@ -1554,6 +1679,255 @@ class MainWindow(QMainWindow):
             or self.settings.get("theme_mode", "light") != previous_theme_mode
         ):
             self.apply_theme(force=True)
+        if result:
+            if previous_auto_ocr and not self.settings.get("auto_ocr", False):
+                self._cancel_automatic_requests(
+                    self._automatic_ocr_items,
+                    self._ocr_requests,
+                )
+            if previous_auto_description and not self.settings.get("auto_description", False):
+                self._cancel_automatic_requests(
+                    self._automatic_ai_items,
+                    self._ai_requests,
+                )
+        if bulk_requested:
+            self.start_bulk_image_processing()
+
+    def _confirm_bulk_image_processing(self, dialog: SettingsDialog) -> None:
+        if self._bulk_image_request is not None:
+            QMessageBox.information(self, "批量处理进行中", "当前已有批量图片处理任务正在运行。")
+            return
+        base_url = dialog.base_url.text().strip()
+        vision_model = dialog.vision_model.text().strip()
+        if not base_url or not vision_model:
+            QMessageBox.warning(
+                dialog,
+                "AI 服务未配置",
+                "请先填写 Base URL 和视觉模型名称，再开始批量处理。",
+            )
+            return
+        image_count = len(self.database.query_items(kind="image", summary_only=True))
+        if not image_count:
+            QMessageBox.information(dialog, "没有图片", "本地资料库中没有可处理的图片。")
+            return
+        answer = QMessageBox.question(
+            dialog,
+            "确认批量处理图片",
+            (
+                f"将对现有 {image_count:,} 张图片重新执行 OCR 并生成描述，"
+                "已有 OCR 和描述会被覆盖。\n\n"
+                f"至少需要发送 {image_count * 2:,} 次视觉请求；如果填写了向量模型，"
+                "还会额外发送向量请求，可能产生费用。确定继续吗？"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        dialog.bulk_processing_confirmed = False
+        dialog.accept()
+        if dialog.result():
+            dialog.bulk_processing_confirmed = True
+
+    def start_bulk_image_processing(self) -> None:
+        if self._closing or self._quit_in_progress:
+            return
+        if self._bulk_image_request is not None:
+            QMessageBox.information(self, "批量处理进行中", "当前已有批量图片处理任务正在运行。")
+            return
+        service = self._ai_service()
+        if not service.configured:
+            QMessageBox.warning(
+                self,
+                "AI 服务未配置",
+                "请先在设置中填写 Base URL 和视觉模型名称。",
+            )
+            return
+        image_ids = [
+            int(row["id"])
+            for row in self.database.query_items(
+                kind="image",
+                sort="oldest",
+                summary_only=True,
+            )
+        ]
+        if not image_ids:
+            QMessageBox.information(self, "没有图片", "本地资料库中没有可处理的图片。")
+            return
+
+        token = object()
+        signals = BulkImageSignals()
+        self._async_signals.add(signals)
+        self._bulk_image_request = (token, signals)
+        signals.progress.connect(
+            lambda processed, total, item_id, request_token=token, request_signals=signals: self._bulk_image_progress(
+                request_token,
+                request_signals,
+                processed,
+                total,
+                item_id,
+            )
+        )
+        signals.finished.connect(
+            lambda result, request_token=token, request_signals=signals: self._bulk_image_finished(
+                request_token,
+                request_signals,
+                result,
+            )
+        )
+
+        def work(cancel_event: threading.Event) -> None:
+            total = len(image_ids)
+            result = {
+                "total": total,
+                "completed": 0,
+                "skipped": 0,
+                "failed": 0,
+                "cancelled": False,
+                "error": "",
+                "embedding_error": "",
+            }
+            embedding_enabled = bool(service.embedding_model)
+            for processed, item_id in enumerate(image_ids, 1):
+                if cancel_event.is_set():
+                    result["cancelled"] = True
+                    break
+                try:
+                    item = self.database.get_item(item_id)
+                except Exception as exc:
+                    result["error"] = f"读取图片索引失败：{exc}"
+                    break
+                if not item or item["kind"] != "image" or not item["path"] or not item["content_hash"]:
+                    result["skipped"] += 1
+                    signals.progress.emit(processed, total, item_id)
+                    continue
+                try:
+                    image_snapshot = preflight_image_file(Path(item["path"]))
+                except Exception:
+                    result["failed"] += 1
+                    signals.progress.emit(processed, total, item_id)
+                    continue
+                try:
+                    ocr_text = service.ocr_image(
+                        image_snapshot,
+                        cancel_event,
+                        expected_sha256=item["content_hash"],
+                    )
+                    image_snapshot.require_current()
+                    if not self.database.update_ocr_if_current(
+                        item_id,
+                        item["content_hash"],
+                        ocr_text,
+                    ):
+                        result["skipped"] += 1
+                        signals.progress.emit(processed, total, item_id)
+                        continue
+
+                    description = service.describe_image(
+                        image_snapshot,
+                        cancel_event,
+                        expected_sha256=item["content_hash"],
+                    )
+                    embedding = None
+                    if embedding_enabled:
+                        try:
+                            embedding = service.embed(description, cancel_event)
+                        except OperationCancelled:
+                            raise
+                        except Exception as exc:
+                            result["embedding_error"] = str(exc)
+                            embedding_enabled = False
+                    image_snapshot.require_current()
+                    if not self.database.update_ai_if_current(
+                        item_id,
+                        item["content_hash"],
+                        description,
+                        embedding,
+                        embedding_provider=service.embedding_provider,
+                        embedding_model=service.embedding_model,
+                        embedding_revision=service.EMBEDDING_REVISION,
+                    ):
+                        result["skipped"] += 1
+                        signals.progress.emit(processed, total, item_id)
+                        continue
+                except OperationCancelled:
+                    result["cancelled"] = True
+                    break
+                except Exception as exc:
+                    result["error"] = str(exc)
+                    break
+                result["completed"] += 1
+                signals.progress.emit(processed, total, item_id)
+            signals.finished.emit(result)
+
+        try:
+            self._start_async_task(token, work)
+        except Exception as exc:
+            self._bulk_image_request = None
+            self._async_signals.discard(signals)
+            QMessageBox.warning(self, "批量处理无法启动", str(exc))
+            return
+        self.show_status(f"批量处理已开始：共 {len(image_ids):,} 张图片")
+
+    def _bulk_image_progress(
+        self,
+        token: object,
+        signals: BulkImageSignals,
+        processed: int,
+        total: int,
+        item_id: int,
+    ) -> None:
+        if self._bulk_image_request != (token, signals) or self._closing:
+            return
+        if self.current_item_id == item_id:
+            self.update_detail(item_id)
+        self.show_status(f"批量处理图片 {processed:,}/{total:,}")
+
+    def _bulk_image_finished(
+        self,
+        token: object,
+        signals: BulkImageSignals,
+        result: object,
+    ) -> None:
+        self._async_signals.discard(signals)
+        if self._bulk_image_request != (token, signals):
+            return
+        self._bulk_image_request = None
+        if self._closing or self._quit_in_progress:
+            return
+        details = result if isinstance(result, dict) else {}
+        self.refresh_library()
+        error = str(details.get("error") or "")
+        if error:
+            QMessageBox.warning(
+                self,
+                "批量处理已停止",
+                (
+                    f"服务请求失败，批量任务已停止。\n\n{error}\n\n"
+                    f"已完成 {int(details.get('completed', 0)):,} 张，"
+                    f"跳过 {int(details.get('skipped', 0)):,} 张，"
+                    f"本地文件失败 {int(details.get('failed', 0)):,} 张。"
+                ),
+            )
+            return
+        if details.get("cancelled"):
+            self.show_status("批量图片处理已取消")
+            return
+        embedding_error = str(details.get("embedding_error") or "")
+        if embedding_error:
+            QMessageBox.warning(
+                self,
+                "向量生成已跳过",
+                (
+                    "OCR 和图片描述已继续完成，但当前向量模型或 /embeddings 接口不可用，"
+                    f"本次未生成语义搜索向量。\n\n{embedding_error}"
+                ),
+            )
+        self.show_status(
+            f"批量处理完成：成功 {int(details.get('completed', 0)):,} 张，"
+            f"跳过 {int(details.get('skipped', 0)):,} 张，"
+            f"失败 {int(details.get('failed', 0)):,} 张"
+        )
 
     def _start_async_task(self, token: object, target) -> threading.Event:
         cancel_event = threading.Event()
@@ -1582,6 +1956,56 @@ class MainWindow(QMainWindow):
         with self._async_tasks_lock:
             self._bounded_tasks[token] = handle
         return handle
+
+    def _ai_service(self) -> AIService:
+        return AIService(
+            self.settings.get("ai_base_url", ""),
+            self.settings.get("ai_api_key", ""),
+            self.settings.get("ai_vision_model", ""),
+            self.settings.get("ai_embedding_model", ""),
+        )
+
+    @staticmethod
+    def _image_task_estimate(item) -> int:
+        try:
+            width = max(0, int(item["width"] or 0))
+            height = max(0, int(item["height"] or 0))
+            return width * height * 4
+        except (KeyError, TypeError, ValueError):
+            return 0
+
+    def _cancel_automatic_requests(self, item_ids: set[int], requests: dict[int, tuple[object, AsyncSignals]]) -> None:
+        for item_id in list(item_ids):
+            item_ids.discard(item_id)
+            self._cancel_request(requests.pop(item_id, None))
+            if self.current_item_id != item_id:
+                continue
+            if requests is self._ai_requests:
+                self.detail.set_ai_busy(False)
+            else:
+                self.detail.set_ocr_busy(False)
+
+    def _schedule_auto_image_tasks(self, item_id: int) -> None:
+        if self._closing or self._quit_in_progress:
+            return
+        item = self.database.get_item(item_id)
+        if not item or item["kind"] != "image" or not item["path"]:
+            return
+        service = self._ai_service()
+        if not service.configured:
+            return
+        if (
+            self.settings.get("auto_ocr", False)
+            and not str(item["ocr_text"] or "").strip()
+            and item_id not in self._ocr_requests
+        ):
+            self.generate_ocr(item_id, automatic=True)
+        if (
+            self.settings.get("auto_description", False)
+            and not str(item["ai_description"] or "").strip()
+            and item_id not in self._ai_requests
+        ):
+            self.generate_ai_description(item_id, automatic=True)
 
     def _start_startup_scan(self, full_scan: bool, reconcile_images: bool) -> None:
         self.startup_scan_error = None
@@ -1737,6 +2161,10 @@ class MainWindow(QMainWindow):
                         pending = True
                         continue
                     requests.pop(item_id, None)
+                    if kind == "ai":
+                        self._automatic_ai_items.discard(item_id)
+                    else:
+                        self._automatic_ocr_items.discard(item_id)
                     self._async_signals.discard(signals)
                     self._finish_async_token(token)
                     if self.current_item_id == item_id:
@@ -1789,6 +2217,8 @@ class MainWindow(QMainWindow):
         self._async_signals.discard(signals)
 
     def _cancel_item_requests(self, item_id: int) -> None:
+        self._automatic_ai_items.discard(item_id)
+        self._automatic_ocr_items.discard(item_id)
         self._cancel_request(self._ai_requests.pop(item_id, None))
         self._cancel_request(self._ocr_requests.pop(item_id, None))
 
@@ -1860,37 +2290,38 @@ class MainWindow(QMainWindow):
         bounded_done = all(handle.done_event.is_set() for handle in bounded_tasks)
         return regular_done and (bounded_done or not require_bounded)
 
-    def generate_ai_description(self, item_id: int) -> None:
+    def generate_ai_description(self, item_id: int, *, automatic: bool = False) -> bool:
         item = self.database.get_item(item_id)
         if not item or item["kind"] != "image" or not item["path"]:
-            QMessageBox.information(self, "AI 描述", "当前只支持为图片生成 AI 描述。")
-            return
-        service = AIService(
-            self.settings.get("ai_base_url", ""),
-            self.settings.get("ai_api_key", ""),
-            self.settings.get("ai_vision_model", ""),
-            self.settings.get("ai_embedding_model", ""),
-        )
+            if not automatic:
+                QMessageBox.information(self, "AI 描述", "当前只支持为图片生成 AI 描述。")
+            return False
+        service = self._ai_service()
         if not service.configured:
-            QMessageBox.information(self, "AI 服务未配置", "请先在设置中填写 OpenAI-compatible 服务地址、API Key 和视觉模型。")
+            if automatic:
+                return False
+            QMessageBox.information(self, "AI 服务未配置", "请先在设置中填写 OpenAI-compatible 服务地址和视觉模型；需要鉴权的服务还应填写 API Key。")
             self.open_settings()
-            return
-        try:
-            image_snapshot = preflight_image_file(Path(item["path"]))
-        except Exception as exc:
-            QMessageBox.warning(self, "AI 描述失败", str(exc))
-            return
+            return False
         expected_content_hash = item["content_hash"]
         if not expected_content_hash:
-            QMessageBox.warning(self, "AI 描述失败", "图片索引缺少内容校验值，请重新导入后再试。")
-            return
-        self.detail.ai_button.setEnabled(False)
-        self.detail.ai_button.setText("生成中…")
+            if not automatic:
+                QMessageBox.warning(self, "AI 描述失败", "图片索引缺少内容校验值，请重新导入后再试。")
+            return False
+        if item_id in self._ai_requests:
+            if automatic:
+                return False
+            self._automatic_ai_items.discard(item_id)
+            self._cancel_request(self._ai_requests.pop(item_id, None))
+        if self.current_item_id == item_id:
+            self.detail.ai_button.setEnabled(False)
+            self.detail.ai_button.setText("生成中…")
         token = object()
         signals = AsyncSignals()
-        self._cancel_request(self._ai_requests.get(item_id))
         self._async_signals.add(signals)
         self._ai_requests[item_id] = (token, signals)
+        if automatic:
+            self._automatic_ai_items.add(item_id)
         signals.succeeded.connect(
             lambda result_item_id, description, embedding, request_token=token, request_signals=signals, request_hash=expected_content_hash, request_provider=service.embedding_provider, request_model=service.embedding_model, request_revision=service.EMBEDDING_REVISION: self._ai_succeeded(
                 request_token,
@@ -1912,15 +2343,30 @@ class MainWindow(QMainWindow):
 
         def work(cancel_event: threading.Event) -> None:
             try:
+                image_snapshot = preflight_image_file(Path(item["path"]))
                 description = service.describe_image(
                     image_snapshot,
                     cancel_event,
                     expected_sha256=expected_content_hash,
                 )
-                embedding = service.embed(description, cancel_event)
+                embedding_warning = ""
+                try:
+                    embedding = service.embed(description, cancel_event)
+                except OperationCancelled:
+                    raise
+                except Exception as exc:
+                    embedding = None
+                    embedding_warning = str(exc)
                 image_snapshot.require_current()
                 if not cancel_event.is_set():
-                    signals.succeeded.emit(item_id, description, embedding)
+                    signals.succeeded.emit(
+                        item_id,
+                        description,
+                        {
+                            "embedding": embedding,
+                            "embedding_warning": embedding_warning,
+                        },
+                    )
             except OperationCancelled:
                 return
             except Exception as exc:
@@ -1928,35 +2374,55 @@ class MainWindow(QMainWindow):
                     signals.failed.emit(str(exc))
 
         try:
-            self._start_bounded_task(token, work, estimated_bytes=image_snapshot.decoded_bytes)
-        except TaskCapacityExceeded as exc:
+            self._start_bounded_task(token, work, estimated_bytes=self._image_task_estimate(item))
+        except (TaskCapacityExceeded, RuntimeError) as exc:
             self._ai_requests.pop(item_id, None)
+            self._automatic_ai_items.discard(item_id)
             self._async_signals.discard(signals)
             if self.current_item_id == item_id:
                 self.detail.set_ai_busy(False, failed=True)
-            QMessageBox.warning(self, "AI 任务繁忙", str(exc))
+            if automatic:
+                self.show_error_status(f"自动生成描述暂时无法启动：{exc}")
+            else:
+                QMessageBox.warning(self, "AI 任务繁忙", str(exc))
+            return False
+        return True
 
-    def generate_ocr(self, item_id: int) -> None:
+    def generate_ocr(self, item_id: int, *, automatic: bool = False) -> bool:
         item = self.database.get_item(item_id)
         if not item or item["kind"] != "image" or not item["path"]:
-            QMessageBox.information(self, "OCR", "当前只支持识别图片中的文字。")
-            return
-        try:
-            image_snapshot = preflight_image_file(Path(item["path"]))
-        except Exception as exc:
-            QMessageBox.warning(self, "OCR 识别失败", str(exc))
-            return
+            if not automatic:
+                QMessageBox.information(self, "OCR", "当前只支持识别图片中的文字。")
+            return False
+        service = self._ai_service()
+        if not service.configured:
+            if not automatic:
+                QMessageBox.information(
+                    self,
+                    "AI 服务未配置",
+                    "云端 OCR 需要先在设置中填写 OpenAI-compatible 服务地址和视觉模型；需要鉴权的服务还应填写 API Key。",
+                )
+                self.open_settings()
+            return False
         expected_content_hash = item["content_hash"]
         if not expected_content_hash:
-            QMessageBox.warning(self, "OCR 识别失败", "图片索引缺少内容校验值，请重新导入后再试。")
-            return
-        self.detail.ocr_button.setEnabled(False)
-        self.detail.ocr_button.setText("识别中…")
+            if not automatic:
+                QMessageBox.warning(self, "OCR 识别失败", "图片索引缺少内容校验值，请重新导入后再试。")
+            return False
+        if item_id in self._ocr_requests:
+            if automatic:
+                return False
+            self._automatic_ocr_items.discard(item_id)
+            self._cancel_request(self._ocr_requests.pop(item_id, None))
+        if self.current_item_id == item_id:
+            self.detail.ocr_button.setEnabled(False)
+            self.detail.ocr_button.setText("识别中…")
         token = object()
         signals = AsyncSignals()
-        self._cancel_request(self._ocr_requests.get(item_id))
         self._async_signals.add(signals)
         self._ocr_requests[item_id] = (token, signals)
+        if automatic:
+            self._automatic_ocr_items.add(item_id)
         signals.succeeded.connect(
             lambda result_item_id, text, unused, request_token=token, request_signals=signals, request_hash=expected_content_hash: self._ocr_succeeded(
                 request_token, request_signals, result_item_id, text, unused, request_hash
@@ -1970,7 +2436,8 @@ class MainWindow(QMainWindow):
 
         def work(cancel_event: threading.Event) -> None:
             try:
-                text = WindowsOCRService.recognize(
+                image_snapshot = preflight_image_file(Path(item["path"]))
+                text = service.ocr_image(
                     image_snapshot,
                     cancel_event,
                     expected_sha256=expected_content_hash,
@@ -1985,13 +2452,19 @@ class MainWindow(QMainWindow):
                     signals.failed.emit(str(exc))
 
         try:
-            self._start_bounded_task(token, work, estimated_bytes=image_snapshot.decoded_bytes)
-        except TaskCapacityExceeded as exc:
+            self._start_bounded_task(token, work, estimated_bytes=self._image_task_estimate(item))
+        except (TaskCapacityExceeded, RuntimeError) as exc:
             self._ocr_requests.pop(item_id, None)
+            self._automatic_ocr_items.discard(item_id)
             self._async_signals.discard(signals)
             if self.current_item_id == item_id:
                 self.detail.set_ocr_busy(False, failed=True)
-            QMessageBox.warning(self, "OCR 任务繁忙", str(exc))
+            if automatic:
+                self.show_error_status(f"自动 OCR 暂时无法启动：{exc}")
+            else:
+                QMessageBox.warning(self, "OCR 任务繁忙", str(exc))
+            return False
+        return True
 
     def _ocr_succeeded(
         self,
@@ -2004,9 +2477,10 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._async_signals.discard(signals)
         self._finish_async_token(token)
-        if self._closing or self._quit_in_progress:
-            return
         if self._ocr_requests.get(item_id) != (token, signals):
+            return
+        if self._closing or self._quit_in_progress:
+            self._automatic_ocr_items.discard(item_id)
             return
         try:
             if expected_content_hash is None:
@@ -2022,11 +2496,13 @@ class MainWindow(QMainWindow):
             return
         if not saved:
             self._ocr_requests.pop(item_id, None)
+            self._automatic_ocr_items.discard(item_id)
             if self.current_item_id == item_id:
                 self.detail.set_ocr_busy(False)
             self.show_status("图片已变化，已丢弃过期的 OCR 结果")
             return
         self._ocr_requests.pop(item_id, None)
+        self._automatic_ocr_items.discard(item_id)
         self._refresh_after_mutation()
         if self.current_item_id == item_id:
             self.update_detail(item_id)
@@ -2035,14 +2511,19 @@ class MainWindow(QMainWindow):
     def _ocr_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
         self._async_signals.discard(signals)
         self._finish_async_token(token)
-        if self._closing or self._quit_in_progress:
-            return
         if self._ocr_requests.get(item_id) != (token, signals):
+            return
+        automatic = item_id in self._automatic_ocr_items
+        self._automatic_ocr_items.discard(item_id)
+        if self._closing or self._quit_in_progress:
             return
         self._ocr_requests.pop(item_id, None)
         if self.current_item_id == item_id:
             self.detail.set_ocr_busy(False, failed=True)
-        QMessageBox.warning(self, "OCR 识别失败", message)
+        if automatic:
+            self.show_error_status(f"自动 OCR 失败：{message}")
+        else:
+            QMessageBox.warning(self, "OCR 识别失败", message)
 
     def semantic_search(self) -> None:
         query = self.search.text().strip()
@@ -2195,9 +2676,14 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._async_signals.discard(signals)
         self._finish_async_token(token)
-        if self._closing or self._quit_in_progress:
-            return
         if self._ai_requests.get(item_id) != (token, signals):
+            return
+        embedding_warning = ""
+        if isinstance(embedding, dict) and "embedding" in embedding:
+            embedding_warning = str(embedding.get("embedding_warning") or "")
+            embedding = embedding.get("embedding")
+        if self._closing or self._quit_in_progress:
+            self._automatic_ai_items.discard(item_id)
             return
         try:
             embedding_kwargs = {}
@@ -2224,27 +2710,37 @@ class MainWindow(QMainWindow):
             return
         if not saved:
             self._ai_requests.pop(item_id, None)
+            self._automatic_ai_items.discard(item_id)
             if self.current_item_id == item_id:
                 self.detail.set_ai_busy(False)
             self.show_status("图片已变化，已丢弃过期的 AI 结果")
             return
         self._ai_requests.pop(item_id, None)
+        self._automatic_ai_items.discard(item_id)
         self._refresh_after_mutation()
         if self.current_item_id == item_id:
             self.update_detail(item_id)
-        self.show_status("AI 描述已生成")
+        if embedding_warning:
+            self.show_error_status(f"AI 描述已生成，但向量生成失败：{embedding_warning}")
+        else:
+            self.show_status("AI 描述已生成")
 
     def _ai_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
         self._async_signals.discard(signals)
         self._finish_async_token(token)
-        if self._closing or self._quit_in_progress:
-            return
         if self._ai_requests.get(item_id) != (token, signals):
+            return
+        automatic = item_id in self._automatic_ai_items
+        self._automatic_ai_items.discard(item_id)
+        if self._closing or self._quit_in_progress:
             return
         self._ai_requests.pop(item_id, None)
         if self.current_item_id == item_id:
             self.detail.set_ai_busy(False, failed=True)
-        QMessageBox.warning(self, "AI 服务失败", message)
+        if automatic:
+            self.show_error_status(f"自动生成描述失败：{message}")
+        else:
+            QMessageBox.warning(self, "AI 服务失败", message)
 
     def focus_search(self) -> None:
         self.bring_to_front()

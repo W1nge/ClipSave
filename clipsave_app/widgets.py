@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QMenu,
     QPushButton,
     QScrollArea,
     QScrollBar,
@@ -386,6 +387,78 @@ def theme_icon_color() -> str:
     return "#e6e6e6" if dark_theme_active() else "#354052"
 
 
+_TEXT_MENU_ACTION_ICONS = {
+    "edit-undo": "undo-2",
+    "edit-redo": "redo-2",
+    "edit-cut": "scissors",
+    "edit-copy": "copy",
+    "edit-paste": "clipboard",
+    "edit-delete": "trash-2",
+    "select-all": "list-checks",
+}
+
+
+class _ThemedTextContextMenuMixin:
+    def _create_themed_context_menu(self) -> QMenu:
+        menu = self.createStandardContextMenu()
+        menu.setObjectName("TextContextMenu")
+        for action in menu.actions():
+            action.setIcon(QIcon())
+            glyph = _TEXT_MENU_ACTION_ICONS.get(action.objectName())
+            if glyph:
+                action.setIcon(lucide_icon(glyph, theme_icon_color(), 16))
+        return menu
+
+    def contextMenuEvent(self, event) -> None:
+        menu = self._create_themed_context_menu()
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            menu.deleteLater()
+        event.accept()
+
+
+class ThemedLineEdit(_ThemedTextContextMenuMixin, QLineEdit):
+    pass
+
+
+class ThemedTextEdit(_ThemedTextContextMenuMixin, QTextEdit):
+    pass
+
+
+class ThemedSelectableLabel(QLabel):
+    def _create_themed_context_menu(self) -> QMenu:
+        menu = QMenu(self)
+        menu.setObjectName("TextContextMenu")
+        copy_action = menu.addAction(
+            lucide_icon("copy", theme_icon_color(), 16),
+            "复制",
+        )
+        copy_action.setObjectName("edit-copy")
+        copy_action.setEnabled(self.hasSelectedText())
+        copy_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(self.selectedText())
+        )
+        select_all = menu.addAction(
+            lucide_icon("list-checks", theme_icon_color(), 16),
+            "全选",
+        )
+        select_all.setObjectName("select-all")
+        select_all.setEnabled(bool(self.text()))
+        select_all.triggered.connect(
+            lambda: self.setSelection(0, len(self.text()))
+        )
+        return menu
+
+    def contextMenuEvent(self, event) -> None:
+        menu = self._create_themed_context_menu()
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            menu.deleteLater()
+        event.accept()
+
+
 def human_size(value: int) -> str:
     amount = float(value or 0)
     for suffix in ("B", "KB", "MB", "GB"):
@@ -478,6 +551,11 @@ class ToggleSwitch(QCheckBox):
         self.setObjectName("ToggleSwitch")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMinimumHeight(30)
+
+    def sizeHint(self) -> QSize:
+        base = super().sizeHint()
+        text_width = self.fontMetrics().horizontalAdvance(self.text())
+        return QSize(max(base.width(), text_width + 56), max(30, base.height()))
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -818,8 +896,12 @@ class WindowTitleBar(QFrame):
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             window = self.window()
-            window.showNormal() if window.isMaximized() else window.showMaximized()
-            self.update_maximize_state(window.isMaximized())
+            toggle = getattr(window, "toggle_maximized", None)
+            if callable(toggle):
+                toggle()
+            else:
+                window.showNormal() if window.isMaximized() else window.showMaximized()
+                self.update_maximize_state(window.isMaximized())
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -837,7 +919,11 @@ class DraggableBar(QFrame):
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             window = self.window()
-            window.showNormal() if window.isMaximized() else window.showMaximized()
+            toggle = getattr(window, "toggle_maximized", None)
+            if callable(toggle):
+                toggle()
+            else:
+                window.showNormal() if window.isMaximized() else window.showMaximized()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -924,7 +1010,7 @@ class FluentMessageDialog(QDialog):
         icon.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
         content_layout.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
 
-        self.message_label = QLabel(message)
+        self.message_label = ThemedSelectableLabel(message)
         self.message_label.setObjectName("MessageText")
         self.message_label.setTextFormat(Qt.TextFormat.PlainText)
         self.message_label.setWordWrap(True)
@@ -1514,10 +1600,86 @@ class AssetGridDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class _ItemRightClickGesture:
+    """Emit detail for one right click on any library item."""
+
+    def __init__(self, view) -> None:
+        self.view = view
+        self._pressed_id: int | None = None
+
+    def cancel(self) -> None:
+        self._pressed_id = None
+
+    def press(self, item_id: int | None) -> None:
+        if item_id is None:
+            self.cancel()
+            return
+        self._pressed_id = item_id
+
+    def release(self, item_id: int | None) -> None:
+        if item_id is None or item_id != self._pressed_id:
+            self.cancel()
+            return
+        self._pressed_id = None
+        self.view.detail_requested.emit(item_id)
+
+
+class _ImageTripleClickGesture:
+    """Keep image double-click immediate while recognizing a following third click."""
+
+    def __init__(self, view) -> None:
+        self.view = view
+        self._timer = QTimer(view)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._clear_pending)
+        self._pending_id: int | None = None
+        self._suppress_release = False
+
+    def cancel(self) -> None:
+        self._timer.stop()
+        self._pending_id = None
+        self._suppress_release = False
+
+    def finish_pending(self) -> None:
+        self._clear_pending()
+
+    def press(self, item_id: int | None) -> bool:
+        if self._pending_id is None:
+            return False
+        if item_id != self._pending_id:
+            self._clear_pending()
+            return False
+        self._timer.stop()
+        self._pending_id = None
+        self._suppress_release = True
+        self.view.open_requested.emit(item_id)
+        return True
+
+    def release(self) -> bool:
+        if not self._suppress_release:
+            return False
+        self._suppress_release = False
+        return True
+
+    def double_click(self, item_id: int | None) -> bool:
+        if item_id is None:
+            return False
+        self._pending_id = item_id
+        self._timer.start(max(1, QApplication.doubleClickInterval()))
+        self.view.item_activated.emit(item_id)
+        return True
+
+    def _clear_pending(self) -> None:
+        self._pending_id = None
+        self._timer.stop()
+
+
 class AssetGrid(QListView):
     item_selected = Signal(int)
     selection_cleared = Signal()
     item_activated = Signal(int)
+    detail_requested = Signal(int)
+    open_requested = Signal(int)
     favorite_requested = Signal(int, bool)
 
     def __init__(self, parent=None):
@@ -1534,6 +1696,7 @@ class AssetGrid(QListView):
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBar(AutoHideScrollBar())
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.setViewportMargins(14, 48, 14, 18)
         self.setSpacing(0)
         self.setObjectName("AssetGrid")
@@ -1559,6 +1722,8 @@ class AssetGrid(QListView):
         self._favorite_press_row = -1
         self._suppress_selection_signal = False
         self._wheel_remainder = _WheelRemainder()
+        self._right_click = _ItemRightClickGesture(self)
+        self._left_click = _ImageTripleClickGesture(self)
         self.selectionModel().currentChanged.connect(self._index_selected)
         self.selectionModel().selectionChanged.connect(self._selection_changed)
         self.doubleClicked.connect(self._index_activated)
@@ -1566,6 +1731,8 @@ class AssetGrid(QListView):
         self._update_grid_size()
 
     def set_items(self, items, selected_id: int | None = None) -> None:
+        self._right_click.cancel()
+        self._left_click.cancel()
         self._thumbnail_refresh_timer.stop()
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
@@ -1618,6 +1785,8 @@ class AssetGrid(QListView):
             self.viewport().update()
 
     def hideEvent(self, event) -> None:
+        self._right_click.cancel()
+        self._left_click.cancel()
         self._thumbnail_refresh_timer.stop()
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
@@ -1632,6 +1801,8 @@ class AssetGrid(QListView):
             self.viewport().update()
 
     def closeEvent(self, event) -> None:
+        self._right_click.cancel()
+        self._left_click.cancel()
         self._thumbnail_refresh_timer.stop()
         self._thumbnail_generation += 1
         self._thumbnail_loader.close()
@@ -1749,9 +1920,25 @@ class AssetGrid(QListView):
             self.item_activated.emit(int(record["id"]))
 
     def mousePressEvent(self, event) -> None:
+        point = event.position().toPoint()
         if event.button() == Qt.MouseButton.LeftButton:
-            index = self.indexAt(event.position().toPoint())
-            if index.isValid() and self.delegate.favorite_rect(self.visualRect(index)).contains(event.position().toPoint()):
+            image_id = self._image_id_at(point)
+            if self._left_click.press(image_id):
+                event.accept()
+                return
+        else:
+            self._left_click.finish_pending()
+        if event.button() == Qt.MouseButton.RightButton:
+            item_id = self._item_id_at(point)
+            self._right_click.press(item_id)
+            if item_id is not None:
+                event.accept()
+                return
+        else:
+            self._right_click.cancel()
+        if event.button() == Qt.MouseButton.LeftButton:
+            index = self.indexAt(point)
+            if index.isValid() and self.delegate.favorite_rect(self.visualRect(index)).contains(point):
                 self._favorite_press_row = index.row()
                 event.accept()
                 return
@@ -1759,6 +1946,15 @@ class AssetGrid(QListView):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._left_click.release():
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            item_id = self._item_id_at(event.position().toPoint())
+            self._right_click.release(item_id)
+            if item_id is not None:
+                event.accept()
+                return
         if self._favorite_press_row >= 0 and event.button() == Qt.MouseButton.LeftButton:
             index = self.indexAt(event.position().toPoint())
             pressed_row = self._favorite_press_row
@@ -1776,25 +1972,36 @@ class AssetGrid(QListView):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
-        index = self.indexAt(event.position().toPoint())
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and index.isValid()
-            and index.column() == 0
-            and self._favorite_delegate.favorite_rect(self.visualRect(index)).contains(
-                event.position().toPoint()
-            )
-        ):
+        point = event.position().toPoint()
+        if event.button() == Qt.MouseButton.RightButton:
             event.accept()
             return
+        index = self.indexAt(point)
+        if event.button() == Qt.MouseButton.LeftButton and index.isValid() and self.delegate.favorite_rect(self.visualRect(index)).contains(point):
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            image_id = self._image_id_at(point)
+            if self._left_click.double_click(image_id):
+                event.accept()
+                return
         super().mouseDoubleClickEvent(event)
 
-    def mouseDoubleClickEvent(self, event) -> None:
-        index = self.indexAt(event.position().toPoint())
-        if index.isValid() and self.delegate.favorite_rect(self.visualRect(index)).contains(event.position().toPoint()):
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
+    def _item_id_at(self, point: QPoint) -> int | None:
+        index = self.indexAt(point)
+        if not index.isValid():
+            return None
+        record = index.data(AssetItemModel.ItemRole)
+        return None if record is None else int(record["id"])
+
+    def _image_id_at(self, point: QPoint) -> int | None:
+        index = self.indexAt(point)
+        if not index.isValid():
+            return None
+        record = index.data(AssetItemModel.ItemRole)
+        if record is None or record["kind"] != "image":
+            return None
+        return int(record["id"])
 
 
 class _AssetTableFavoriteDelegate(QStyledItemDelegate):
@@ -1847,6 +2054,8 @@ class AssetTable(QTableView):
     item_selected = Signal(int)
     selection_cleared = Signal()
     item_activated = Signal(int)
+    detail_requested = Signal(int)
+    open_requested = Signal(int)
     favorite_requested = Signal(int, bool)
 
     def __init__(self, parent=None):
@@ -1880,6 +2089,8 @@ class AssetTable(QTableView):
         self._suppress_selection_signal = False
         self._wheel_remainder = _WheelRemainder()
         self._favorite_press_row = -1
+        self._right_click = _ItemRightClickGesture(self)
+        self._left_click = _ImageTripleClickGesture(self)
 
     def wheelEvent(self, event) -> None:
         scaled_event = _half_speed_wheel_event(event, self._wheel_remainder)
@@ -1887,6 +2098,8 @@ class AssetTable(QTableView):
         event.setAccepted(scaled_event.isAccepted())
 
     def set_items(self, items, selected_id: int | None = None) -> None:
+        self._right_click.cancel()
+        self._left_click.cancel()
         self.selected_id = selected_id
         self._suppress_selection_signal = True
         try:
@@ -1894,6 +2107,16 @@ class AssetTable(QTableView):
             self._apply_selected_id_to_view()
         finally:
             self._suppress_selection_signal = False
+
+    def hideEvent(self, event) -> None:
+        self._right_click.cancel()
+        self._left_click.cancel()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self._right_click.cancel()
+        self._left_click.cancel()
+        super().closeEvent(event)
 
     def sync_selection_from_selected_id(self) -> None:
         self._suppress_selection_signal = True
@@ -1941,13 +2164,29 @@ class AssetTable(QTableView):
             self.item_activated.emit(int(record["id"]))
 
     def mousePressEvent(self, event) -> None:
-        index = self.indexAt(event.position().toPoint())
+        point = event.position().toPoint()
+        if event.button() == Qt.MouseButton.LeftButton:
+            image_id = self._image_id_at(point)
+            if self._left_click.press(image_id):
+                event.accept()
+                return
+        else:
+            self._left_click.finish_pending()
+        if event.button() == Qt.MouseButton.RightButton:
+            item_id = self._item_id_at(point)
+            self._right_click.press(item_id)
+            if item_id is not None:
+                event.accept()
+                return
+        else:
+            self._right_click.cancel()
+        index = self.indexAt(point)
         if (
             event.button() == Qt.MouseButton.LeftButton
             and index.isValid()
             and index.column() == 0
             and self._favorite_delegate.favorite_rect(self.visualRect(index)).contains(
-                event.position().toPoint()
+                point
             )
         ):
             self._favorite_press_row = index.row()
@@ -1957,6 +2196,15 @@ class AssetTable(QTableView):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._left_click.release():
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            item_id = self._item_id_at(event.position().toPoint())
+            self._right_click.release(item_id)
+            if item_id is not None:
+                event.accept()
+                return
         if self._favorite_press_row >= 0 and event.button() == Qt.MouseButton.LeftButton:
             index = self.indexAt(event.position().toPoint())
             pressed_row = self._favorite_press_row
@@ -1976,9 +2224,52 @@ class AssetTable(QTableView):
             return
         super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:
+        point = event.position().toPoint()
+        if event.button() == Qt.MouseButton.RightButton:
+            event.accept()
+            return
+        index = self.indexAt(point)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and index.isValid()
+            and index.column() == 0
+            and self._favorite_delegate.favorite_rect(self.visualRect(index)).contains(point)
+        ):
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            image_id = self._image_id_at(point)
+            if self._left_click.double_click(image_id):
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
-class _SafeMarkdownBrowser(QTextBrowser):
+    def _item_id_at(self, point: QPoint) -> int | None:
+        index = self.indexAt(point)
+        if not index.isValid():
+            return None
+        record = index.data(AssetItemModel.ItemRole)
+        return None if record is None else int(record["id"])
+
+    def _image_id_at(self, point: QPoint) -> int | None:
+        index = self.indexAt(point)
+        if not index.isValid():
+            return None
+        record = index.data(AssetItemModel.ItemRole)
+        if record is None or record["kind"] != "image":
+            return None
+        return int(record["id"])
+
+
+class _SafeMarkdownBrowser(_ThemedTextContextMenuMixin, QTextBrowser):
     _ALLOWED_RESOURCE_SCHEMES = {"qrc"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
 
     def loadResource(self, resource_type: int, name: QUrl):
         if name.isRelative() or name.isLocalFile() or name.scheme().lower() not in self._ALLOWED_RESOURCE_SCHEMES:
@@ -2074,7 +2365,7 @@ class DetailPanel(QScrollArea):
         self.preview_stack.addWidget(self.image_preview)
         self.preview_stack.addWidget(self.text_preview)
         layout.addWidget(self.preview_stack, 1)
-        self.meta = QLabel()
+        self.meta = ThemedSelectableLabel()
         self.meta.setTextFormat(Qt.TextFormat.PlainText)
         self.meta.setWordWrap(True)
         self.meta.setMinimumWidth(0)
@@ -2109,10 +2400,11 @@ class DetailPanel(QScrollArea):
         ocr_row.addStretch()
         self.ocr_button = QPushButton("识别文字")
         self.ocr_button.setIcon(lucide_icon("scan-text"))
+        self.ocr_button.setToolTip("使用设置中的视觉模型识别图片文字")
         self.ocr_button.clicked.connect(lambda: self.current_item and self.ocr_requested.emit(self.current_item["id"]))
         ocr_row.addWidget(self.ocr_button)
         layout.addLayout(ocr_row)
-        self.ocr_text = QLabel("尚未识别")
+        self.ocr_text = ThemedSelectableLabel("尚未识别")
         self.ocr_text.setObjectName("Muted")
         self.ocr_text.setTextFormat(Qt.TextFormat.PlainText)
         self.ocr_text.setWordWrap(True)
@@ -2129,7 +2421,7 @@ class DetailPanel(QScrollArea):
         self.ai_button.clicked.connect(lambda: self.current_item and self.ai_requested.emit(self.current_item["id"]))
         ai_row.addWidget(self.ai_button)
         layout.addLayout(ai_row)
-        self.ai_description = QLabel("尚未生成")
+        self.ai_description = ThemedSelectableLabel("尚未生成")
         self.ai_description.setObjectName("Muted")
         self.ai_description.setTextFormat(Qt.TextFormat.PlainText)
         self.ai_description.setWordWrap(True)
@@ -2139,7 +2431,7 @@ class DetailPanel(QScrollArea):
         layout.addWidget(self.ai_description)
 
         layout.addWidget(QLabel("备注"))
-        self.notes = QTextEdit()
+        self.notes = ThemedTextEdit()
         self.notes.setPlaceholderText("添加备注…")
         self.notes.setMaximumHeight(90)
         self.notes.installEventFilter(self)
@@ -2442,26 +2734,43 @@ class MarkdownDialog(QDialog):
     def __init__(self, title: str, content: str, path: str | None = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setObjectName("FluentDialog")
+        self.setProperty("markdownDialog", True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.resize(_fit_dialog_size(self, QSize(920, 700)))
-        layout = QVBoxLayout(self)
-        top = QHBoxLayout()
-        heading = QLabel(title)
-        heading.setObjectName("Title")
-        top.addWidget(heading)
-        top.addStretch()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(1, 1, 1, 1)
+        root.setSpacing(0)
+        title_bar = DialogTitleBar(title)
+        title_bar.close_button.clicked.connect(self.reject)
+        root.addWidget(title_bar)
+
+        content_widget = QWidget()
+        content_widget.setObjectName("DialogContent")
+        layout = QVBoxLayout(content_widget)
+        layout.setContentsMargins(18, 14, 18, 18)
+        layout.setSpacing(10)
         if path:
+            top = QHBoxLayout()
+            top.addStretch(1)
             locate = QPushButton("在资源管理器中显示")
+            locate.setIcon(lucide_icon("folder"))
             locate.clicked.connect(lambda: _startfile_or_warn(self, Path(path).parent))
             top.addWidget(locate)
             external = QPushButton("外部打开")
+            external.setIcon(lucide_icon("external-link"))
             external.clicked.connect(lambda: _startfile_or_warn(self, path))
             top.addWidget(external)
-        layout.addLayout(top)
+            layout.addLayout(top)
         browser = _SafeMarkdownBrowser()
+        browser.setObjectName("MarkdownBrowser")
         browser.setOpenExternalLinks(False)
         _set_markdown_content(browser, content)
         self.browser = browser
         layout.addWidget(browser)
+        root.addWidget(content_widget, 1)
 
 
 class DateDialog(QDialog):
@@ -2511,10 +2820,12 @@ class DateDialog(QDialog):
 
 class SettingsDialog(QDialog):
     import_requested = Signal()
+    bulk_processing_requested = Signal()
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
+        self.bulk_processing_confirmed = False
         self.setWindowTitle("ClipSave 设置")
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setObjectName("FluentDialog")
@@ -2533,8 +2844,8 @@ class SettingsDialog(QDialog):
         content = QWidget()
         content.setObjectName("DialogContent")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(24, 8, 24, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(24, 0, 24, 0)
+        layout.setSpacing(2)
         heading = QLabel("常规")
         heading.setObjectName("SectionTitle")
         layout.addWidget(heading)
@@ -2566,7 +2877,7 @@ class SettingsDialog(QDialog):
             hotkey_text = "全局唤醒快捷键：Ctrl + Alt + V"
         self.hotkey_status = QLabel(hotkey_text)
         layout.addWidget(self.hotkey_status)
-        layout.addSpacing(6)
+        layout.addSpacing(3)
         from .constants import DATA_DIR, LIBRARY_DIR
 
         storage_heading = QLabel("本地存储")
@@ -2587,27 +2898,47 @@ class SettingsDialog(QDialog):
         open_storage.clicked.connect(lambda: _startfile_or_warn(self, LIBRARY_DIR))
         self.open_storage_button = open_storage
         layout.addWidget(open_storage)
-        layout.addSpacing(6)
+        layout.addSpacing(3)
         ai_heading = QLabel("OpenAI-compatible AI 服务（独立的主动功能）")
         ai_heading.setObjectName("SectionTitle")
         layout.addWidget(ai_heading)
-        self.base_url = QLineEdit(settings.get("ai_base_url", ""))
+        self.base_url = ThemedLineEdit(settings.get("ai_base_url", ""))
         self.base_url.setPlaceholderText("Base URL，例如 https://example.com/v1")
         layout.addWidget(self.base_url)
-        self.api_key = QLineEdit(settings.get("ai_api_key", ""))
+        self.api_key = ThemedLineEdit(settings.get("ai_api_key", ""))
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key.setPlaceholderText("API Key（仅保存在本机）")
         layout.addWidget(self.api_key)
-        self.vision_model = QLineEdit(settings.get("ai_vision_model", ""))
+        self.vision_model = ThemedLineEdit(settings.get("ai_vision_model", ""))
         self.vision_model.setPlaceholderText("视觉模型名称")
         layout.addWidget(self.vision_model)
-        self.embedding_model = QLineEdit(settings.get("ai_embedding_model", ""))
-        self.embedding_model.setPlaceholderText("向量模型名称（可选）")
+        self.embedding_model = ThemedLineEdit(settings.get("ai_embedding_model", ""))
+        self.embedding_model.setPlaceholderText(
+            "向量模型名称（可选；服务不支持 /embeddings 时请留空）"
+        )
         layout.addWidget(self.embedding_model)
-        privacy = QLabel("自动剪贴板捕获不会联网；AI 仅在你主动点击生成或语义搜索时使用。")
+        automation_row = QHBoxLayout()
+        automation_row.setSpacing(18)
+        self.auto_ocr = ToggleSwitch("图片自动 OCR")
+        self.auto_ocr.setChecked(settings.get("auto_ocr", False))
+        automation_row.addWidget(self.auto_ocr)
+        self.auto_description = ToggleSwitch("图片自动生成描述")
+        self.auto_description.setChecked(settings.get("auto_description", False))
+        automation_row.addWidget(self.auto_description)
+        automation_row.addStretch(1)
+        layout.addLayout(automation_row)
+        privacy = QLabel("自动捕获不会联网；自动 OCR/描述会将新图片发送到上方视觉模型。")
         privacy.setObjectName("Muted")
         privacy.setWordWrap(True)
         layout.addWidget(privacy)
+        self.bulk_image_button = QPushButton("一键 OCR 并生成全部图片描述")
+        self.bulk_image_button.setObjectName("SettingsAction")
+        self.bulk_image_button.setIcon(lucide_icon("scan-text"))
+        self.bulk_image_button.clicked.connect(self.bulk_processing_requested.emit)
+        if getattr(parent, "_bulk_image_request", None) is not None:
+            self.bulk_image_button.setText("批量处理中…")
+            self.bulk_image_button.setEnabled(False)
+        layout.addWidget(self.bulk_image_button)
         layout.addStretch()
         if dialog_size != preferred_size:
             scroll = QScrollArea()
@@ -2645,7 +2976,18 @@ class SettingsDialog(QDialog):
             "ai_api_key": self.api_key.text().strip(),
             "ai_vision_model": self.vision_model.text().strip(),
             "ai_embedding_model": self.embedding_model.text().strip(),
+            "auto_ocr": self.auto_ocr.isChecked(),
+            "auto_description": self.auto_description.isChecked(),
         }
+        if (values["auto_ocr"] or values["auto_description"]) and not (
+            values["ai_base_url"] and values["ai_vision_model"]
+        ):
+            QMessageBox.warning(
+                self,
+                "AI 服务未配置",
+                "启用自动 OCR 或自动描述前，请先填写 Base URL 和视觉模型名称。",
+            )
+            return
         try:
             self.settings.update(values)
         except (OSError, TypeError, ValueError) as exc:

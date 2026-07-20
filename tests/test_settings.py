@@ -23,6 +23,8 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(settings.get("start_with_windows"))
         self.assertTrue(settings.get("follow_system_theme"))
         self.assertEqual(settings.get("theme_mode"), "light")
+        self.assertFalse(settings.get("auto_ocr"))
+        self.assertFalse(settings.get("auto_description"))
 
     def test_invalid_and_unknown_values_are_ignored(self):
         self.path.write_text(
@@ -110,6 +112,8 @@ class SettingsTests(unittest.TestCase):
             settings.set("follow_system_theme", "yes")
         with self.assertRaises(TypeError):
             settings.set("start_with_windows", 1)
+        with self.assertRaises(TypeError):
+            settings.set("auto_ocr", 1)
 
     def test_current_sort_options_pass_validation(self):
         settings = Settings(self.path)

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Replaced the old Windows OCR path with OpenAI-compatible vision OCR using the `ocr this` prompt.
+- Added opt-in automatic OCR and image description for newly captured or imported images.
+- Added a structured image-description prompt for visible text, scene details, layout, colors, and search keywords.
+- Added right-click detail toggling for every item type and image triple-click opening while preserving double-click copy.
+- Themed text context menus and Markdown dialogs for light and dark mode, and removed the translucent detail splitter gap.
+- Fixed Aero Snap maximize/restore state synchronization and prevented restored windows from retaining maximized client bounds.
+
 ## 0.3.3 - 2026-07-14
 
 - Added asynchronous, recoverable deletion for large managed files and indexed content.

@@ -89,17 +89,6 @@ if errorlevel 1 goto :failed
   --workpath build\work ^
   --specpath build ^
   --collect-data lucide ^
-  --hidden-import winrt.windows.storage ^
-  --hidden-import winrt.windows.storage.streams ^
-  --hidden-import winrt.windows.graphics.imaging ^
-  --hidden-import winrt.windows.graphics.directx ^
-  --hidden-import winrt.windows.graphics.directx.direct3d11 ^
-  --hidden-import winrt.windows.globalization ^
-  --hidden-import winrt.windows.media.ocr ^
-  --hidden-import winrt.windows.system ^
-  --hidden-import winrt.windows.storage.search ^
-  --hidden-import winrt.windows.storage.provider ^
-  --hidden-import winrt.windows.storage.fileproperties ^
   clipsave.py
 if errorlevel 1 goto :failed
 

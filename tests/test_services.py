@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import ctypes
 from ctypes import wintypes
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 import urllib.request
+import urllib.error
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -919,7 +921,23 @@ class AIServiceTests(unittest.TestCase):
         request = open_request.call_args.args[0]
         self.assertTrue(service.configured)
         self.assertIsNone(request.get_header("Authorization"))
+        self.assertTrue(request.get_header("User-agent").startswith("ClipSave/"))
+        self.assertEqual(request.get_header("Accept"), "application/json")
         self.assertLessEqual(response.read_limit, 64 * 1024)
+
+    def test_cloudflare_1010_error_has_actionable_message(self):
+        service = AIService("https://example.com/v1", "secret", "vision", "")
+        error = urllib.error.HTTPError(
+            "https://example.com/v1/chat/completions",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b'{"title":"Error 1010: Access denied","type":"error-1010"}'),
+        )
+
+        with patch.object(service, "_open_request", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "Cloudflare Error 1010"):
+                service._post("/chat/completions", {})
 
     def test_embedding_provider_identity_excludes_url_credentials_and_query(self):
         first = AIService(
@@ -1081,6 +1099,60 @@ class AIServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "尺寸过大"):
                 service.describe_image(Path("image.png"))
         preflight.assert_called_once_with(Path("image.png"))
+
+    def test_ocr_image_uses_the_ocr_prompt_and_vision_endpoint(self):
+        service = AIService("http://localhost/v1", "", "vision", "")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "image.png"
+            PILImage.new("RGB", (8, 8), "white").save(path)
+            with patch("clipsave_app.services.PICTURE_DIR", root), patch.object(
+                service,
+                "_post",
+                return_value={"choices": [{"message": {"content": "Hello 123"}}]},
+            ) as post:
+                self.assertEqual(service.ocr_image(path), "Hello 123")
+
+        self.assertEqual(post.call_args.args[0], "/chat/completions")
+        payload = post.call_args.args[1]
+        self.assertEqual(payload["model"], "vision")
+        self.assertEqual(payload["messages"][0]["content"][0]["text"], "ocr this")
+        self.assertTrue(payload["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+
+    def test_ocr_image_accepts_an_empty_result_as_no_detected_text(self):
+        service = AIService("http://localhost/v1", "", "vision", "")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "blank.png"
+            PILImage.new("RGB", (8, 8), "white").save(path)
+            with patch("clipsave_app.services.PICTURE_DIR", root), patch.object(
+                service,
+                "_post",
+                return_value={"choices": [{"message": {"content": "   "}}]},
+            ):
+                self.assertEqual(service.ocr_image(path), "")
+
+    def test_description_prompt_is_structured_for_search_and_supports_content_parts(self):
+        service = AIService("http://localhost/v1", "", "vision", "")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "image.png"
+            PILImage.new("RGB", (8, 8), "white").save(path)
+            with patch("clipsave_app.services.PICTURE_DIR", root), patch.object(
+                service,
+                "_post",
+                return_value={
+                    "choices": [{"message": {"content": [{"type": "text", "text": "概览："}, {"text": "一张截图"}]}}]
+                },
+            ) as post:
+                self.assertEqual(service.describe_image(path), "概览：一张截图")
+        payload = post.call_args.args[1]
+        self.assertEqual(
+            payload["messages"][0]["content"][0]["text"],
+            service.IMAGE_DESCRIPTION_PROMPT,
+        )
+        self.assertIn("可见文字", service.IMAGE_DESCRIPTION_PROMPT)
+        self.assertIn("不要猜测", service.IMAGE_DESCRIPTION_PROMPT)
 
 
 class WindowsClipboardNotifierTests(unittest.TestCase):
