@@ -19,6 +19,7 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+SW_MAXIMIZE = 3
 SW_RESTORE = 9
 
 MONITOR_DEFAULTTONEAREST = 0x00000002
@@ -170,6 +171,17 @@ def native_window_is_maximized(hwnd: int) -> bool | None:
         return bool(_user32().IsZoomed(hwnd))
     except (AttributeError, OSError, ValueError):
         return None
+
+
+def maximize_native_window(hwnd: int) -> bool:
+    """Enter Win32 maximize state so Qt and the shell observe the same state."""
+    if not is_windows_qt_platform() or not hwnd:
+        return False
+    try:
+        _user32().ShowWindow(hwnd, SW_MAXIMIZE)
+        return True
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def restore_native_window(hwnd: int) -> bool:

@@ -540,6 +540,19 @@ class MainWindowTests(unittest.TestCase):
         restore.assert_called_once_with(int(self.window.winId()))
         show_normal.assert_not_called()
 
+    def test_toggle_maximized_enters_native_windows_maximize_state(self):
+        with patch(
+            "clipsave_app.main_window.is_windows_qt_platform", return_value=True
+        ), patch(
+            "clipsave_app.main_window.native_window_is_maximized", return_value=False
+        ), patch(
+            "clipsave_app.main_window.maximize_native_window", return_value=True
+        ) as maximize, patch.object(self.window, "showMaximized") as show_maximized:
+            self.window.toggle_maximized()
+
+        maximize.assert_called_once_with(int(self.window.winId()))
+        show_maximized.assert_not_called()
+
     def test_native_acrylic_retries_once_when_hidden_window_application_fails(self):
         with patch("clipsave_app.main_window.is_windows_qt_platform", return_value=True), patch.object(
             self.window, "winId", return_value=123

@@ -271,7 +271,7 @@ def run_probe() -> dict:
         normal_window_rect = _window_rect(user32, hwnd)
         normal_client_rect = _client_screen_rect(user32, hwnd)
 
-        window.showMaximized()
+        window.toggle_maximized()
         _wait(app, 260)
         qt_maximized = window.isMaximized()
         is_zoomed = bool(user32.IsZoomed(hwnd))
@@ -297,6 +297,7 @@ def run_probe() -> dict:
         _wait(app, 220)
         qt_restored_rect = _window_rect(user32, hwnd)
         qt_restored_client_rect = _client_screen_rect(user32, hwnd)
+        qt_restored_is_normal = not window.isMaximized() and not bool(user32.IsZoomed(hwnd))
 
         user32.SendMessageW(hwnd, WM_SYSCOMMAND, SC_MAXIMIZE, 0)
         _wait(app, 260)
@@ -360,6 +361,7 @@ def run_probe() -> dict:
             "maximized_edge_is_not_resizable": max_hit not in SIZING_HITS,
             "qt_restored_rect": qt_restored_rect,
             "qt_restored_client_rect": qt_restored_client_rect,
+            "qt_restored_is_normal": qt_restored_is_normal,
             "qt_restore_preserved_geometry": qt_restored_rect == normal_window_rect,
             "qt_restore_client_fills_window": qt_restored_client_rect == qt_restored_rect,
             "native_qt_maximized": native_qt_maximized,
@@ -403,10 +405,12 @@ def main() -> int:
         result["all_cursors_correct"],
         result["native_drag_succeeded"],
         result["qt_maximized"],
+        result["win32_is_zoomed"],
         result["maximized_window_matches_work_area"],
         result["maximized_client_matches_work_area"],
         result["maximized_extended_frame_within_work_area"],
         result["maximized_edge_is_not_resizable"],
+        result["qt_restored_is_normal"],
         result["qt_restore_preserved_geometry"],
         result["qt_restore_client_fills_window"],
         result["native_qt_maximized"],

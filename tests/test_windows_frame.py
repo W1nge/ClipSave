@@ -139,6 +139,15 @@ class WindowsFrameTests(unittest.TestCase):
 
         user32.IsZoomed.assert_called_once_with(123)
 
+    def test_maximize_native_window_uses_sw_maximize(self):
+        user32 = Mock()
+        with patch.object(windows_frame, "is_windows_qt_platform", return_value=True), patch.object(
+            windows_frame, "_user32", return_value=user32
+        ):
+            self.assertTrue(windows_frame.maximize_native_window(123))
+
+        user32.ShowWindow.assert_called_once_with(123, windows_frame.SW_MAXIMIZE)
+
     def test_restore_native_window_uses_sw_restore(self):
         user32 = Mock()
         with patch.object(windows_frame, "is_windows_qt_platform", return_value=True), patch.object(
@@ -151,6 +160,7 @@ class WindowsFrameTests(unittest.TestCase):
     def test_native_window_helpers_are_disabled_off_windows(self):
         with patch.object(windows_frame, "is_windows_qt_platform", return_value=False):
             self.assertIsNone(windows_frame.native_window_is_maximized(123))
+            self.assertFalse(windows_frame.maximize_native_window(123))
             self.assertFalse(windows_frame.restore_native_window(123))
 
     def test_nccalcsize_uses_monitor_work_area_when_maximized(self):

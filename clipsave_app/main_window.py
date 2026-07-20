@@ -57,6 +57,7 @@ from .windows_frame import (
     handle_nccalcsize,
     handle_ncactivate,
     is_windows_qt_platform,
+    maximize_native_window,
     native_window_is_maximized,
     restore_native_window,
     window_dpi_scale,
@@ -515,7 +516,9 @@ class MainWindow(QMainWindow):
             if not restore_native_window(hwnd):
                 self.showNormal()
         else:
-            self.showMaximized()
+            hwnd = int(self.winId()) if is_windows_qt_platform() else 0
+            if not maximize_native_window(hwnd):
+                self.showMaximized()
         self.window_title_bar.update_maximize_state(self._window_is_maximized())
         QTimer.singleShot(
             0,

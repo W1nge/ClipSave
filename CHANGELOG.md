@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Use native Windows maximize state for the custom title-bar button so maximize and restore remain synchronized with the shell.
+
 ## 0.3.4 - 2026-07-21
 
 - Replaced the old Windows OCR path with OpenAI-compatible vision OCR using the `ocr this` prompt.
