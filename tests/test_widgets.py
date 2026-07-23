@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFrame,
+    QLabel,
     QProxyStyle,
     QScrollArea,
     QStyle,
@@ -41,6 +42,7 @@ from clipsave_app.widgets import (
     MAX_RICH_MARKDOWN_BYTES,
     Sidebar,
     SettingsDialog,
+    TextDialog,
     _SafeMarkdownBrowser,
     _THUMBNAIL_CACHE,
     _WheelRemainder,
@@ -187,6 +189,63 @@ class ThumbnailPixmapTests(unittest.TestCase):
                 self.assertIsNone(index.data(Qt.ItemDataRole.ToolTipRole))
                 view.close()
 
+    def test_markdown_card_preview_renders_format_instead_of_source_markers(self):
+        grid = AssetGrid()
+        try:
+            document = grid.delegate._markdown_document(
+                "# ClipSave\n\n---\n\n**00:01:43**",
+                220,
+                True,
+                grid.font(),
+            )
+
+            plain = document.toPlainText()
+            self.assertIn("ClipSave", plain)
+            self.assertIn("00:01:43", plain)
+            self.assertNotIn("#", plain)
+            self.assertNotIn("**", plain)
+        finally:
+            grid.close()
+
+    def test_dark_markdown_card_draws_light_text(self):
+        grid = AssetGrid()
+        canvas = QImage(240, 180, QImage.Format.Format_RGB32)
+        canvas.fill(QColor("#262626"))
+        painter = QPainter(canvas)
+        try:
+            grid.delegate._draw_markdown_preview(
+                painter,
+                QRect(8, 8, 220, 160),
+                "# ClipSave\n\n**00:19:22**\n\nC:\\\\Users\\\\Winge",
+                True,
+                grid.font(),
+            )
+        finally:
+            painter.end()
+            grid.close()
+
+        light_pixels = sum(
+            1
+            for x in range(canvas.width())
+            for y in range(canvas.height())
+            if canvas.pixelColor(x, y).lightness() >= 140
+        )
+        self.assertGreater(light_pixels, 40)
+
+    def test_grid_preview_uses_equal_left_right_and_bottom_insets(self):
+        grid = AssetGrid()
+        try:
+            item_rect = QRect(0, 0, 260, grid.delegate.card_height + 12)
+            card = grid.delegate.card_rect(item_rect)
+            preview = grid.delegate.preview_rect(item_rect)
+
+            self.assertEqual(preview.left() - card.left(), 10)
+            self.assertEqual(card.right() - preview.right(), 10)
+            self.assertEqual(card.bottom() - preview.bottom(), 10)
+            self.assertEqual(preview.top() - card.top(), 42)
+        finally:
+            grid.close()
+
     def test_touchpad_fractional_wheel_delta_accumulates_between_events(self):
         remainder = _WheelRemainder()
         event = QWheelEvent(
@@ -220,6 +279,47 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertTrue(scroll_bar.active)
         self.assertTrue(scroll_bar.hide_timer.isActive())
         scroll_bar.close()
+
+    def test_auto_hide_scrollbar_active_state_is_fully_custom_painted(self):
+        previous_dark_theme = self.app.property("darkTheme")
+        scroll_bar = AutoHideScrollBar()
+        try:
+            self.app.setProperty("darkTheme", True)
+            scroll_bar.resize(14, 140)
+            scroll_bar.setRange(0, 100)
+            scroll_bar.setPageStep(25)
+            scroll_bar.setValue(40)
+            scroll_bar.set_active(True)
+
+            image = QImage(scroll_bar.size(), QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.transparent)
+            scroll_bar.render(image)
+
+            colors = {
+                image.pixelColor(x, y).name()
+                for x in range(image.width())
+                for y in range(image.height())
+            }
+            self.assertEqual(colors, {"#202020", "#777777"})
+            handle = scroll_bar._handle_rect()
+            self.assertEqual(handle.width(), 10)
+            self.assertGreaterEqual(handle.height(), 32)
+        finally:
+            scroll_bar.close()
+            self.app.setProperty("darkTheme", previous_dark_theme)
+
+    def test_compact_auto_hide_scrollbar_keeps_the_same_proportions(self):
+        scroll_bar = AutoHideScrollBar(track_width=8, light_background="#ffffff")
+        try:
+            scroll_bar.resize(8, 140)
+            scroll_bar.setRange(0, 100)
+            scroll_bar.setPageStep(25)
+            scroll_bar.set_active(True)
+
+            self.assertEqual(scroll_bar.width(), 8)
+            self.assertEqual(scroll_bar._handle_rect().width(), 6)
+        finally:
+            scroll_bar.close()
 
     def test_dark_combo_box_has_no_native_drop_down_edge(self):
         previous_stylesheet = self.app.styleSheet()
@@ -780,6 +880,47 @@ class ThumbnailPixmapTests(unittest.TestCase):
         finally:
             QApplication.setDoubleClickInterval(previous_interval)
 
+    def test_text_double_click_activates_and_third_click_opens_reader(self):
+        previous_interval = QApplication.doubleClickInterval()
+        QApplication.setDoubleClickInterval(80)
+        try:
+            for view in (AssetGrid(), AssetTable()):
+                with self.subTest(view=type(view).__name__):
+                    view.resize(720, 400)
+                    view.show()
+                    view.set_items(asset_records(1, kind="text"))
+                    self.app.processEvents()
+                    activated = Mock()
+                    opened = Mock()
+                    view.item_activated.connect(activated)
+                    view.open_requested.connect(opened)
+                    index = view.model().index(0, 0)
+                    point = (
+                        view.delegate.card_rect(view.visualRect(index)).center()
+                        if isinstance(view, AssetGrid)
+                        else view.visualRect(index).center()
+                    )
+
+                    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+                    QTest.mouseDClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+                    QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+                    self.app.processEvents()
+
+                    activated.assert_called_once_with(1)
+                    opened.assert_called_once_with(1)
+                    view.close()
+        finally:
+            QApplication.setDoubleClickInterval(previous_interval)
+
+    def test_text_dialog_displays_plain_text_without_markdown_rendering(self):
+        content = "# literal heading\n**literal emphasis**"
+        dialog = TextDialog("Copied text", content)
+        try:
+            self.assertTrue(dialog.property("textDialog"))
+            self.assertEqual(dialog.browser.toPlainText(), content)
+        finally:
+            dialog.close()
+
     def test_table_favorite_control_emits_requested_change(self):
         table = AssetTable()
         table.resize(720, 300)
@@ -919,6 +1060,9 @@ class ThumbnailPixmapTests(unittest.TestCase):
         panel.show()
         self.assertTrue(wait_for(lambda: panel.verticalScrollBar().maximum() > 0))
         self.assertGreater(panel.content_widget.sizeHint().height(), panel.viewport().height())
+        scroll_bar = panel.verticalScrollBar()
+        scroll_bar.set_active(True)
+        self.assertEqual(scroll_bar._handle_rect().right(), scroll_bar.rect().right())
         panel.close()
 
     def test_detail_long_filename_and_path_do_not_expand_panel(self):
@@ -972,7 +1116,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
         settings = Mock()
         settings.get.side_effect = lambda _key, default=None: default
         dialog = SettingsDialog(settings)
-        self.assertEqual(dialog.size(), QSize(620, 560))
+        self.assertEqual(dialog.size(), QSize(720, 600))
         self.assertEqual(dialog.layout().contentsMargins().left(), 1)
         self.assertTrue(dialog.property("settingsDialog"))
         self.assertTrue(dialog.follow_system_theme.isChecked())
@@ -987,6 +1131,11 @@ class ThumbnailPixmapTests(unittest.TestCase):
         content = dialog.findChild(QWidget, "DialogContent")
         self.assertIsNotNone(content)
         self.assertLessEqual(content.sizeHint().height(), content.height())
+        self.assertFalse(hasattr(dialog, "embedding_model"))
+        self.assertNotIn(
+            "向量",
+            " ".join(label.text() for label in dialog.findChildren(QLabel)),
+        )
         dialog.close()
 
     def test_dialogs_fit_small_available_screen_without_unbounded_geometry(self):

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.0.0 - 2026-07-23
+
+- Replaced embedding-based semantic search with on-demand AI query expansion. Expanded terms are OR-matched locally without uploading library records or requiring a vector model.
+- Removed runtime embedding generation and the embedding-model setting while retaining legacy database columns for backward compatibility.
+- Added resumable bulk OCR and image-description processing with persistent stage-level progress, so interrupted jobs continue without repeating completed OCR requests.
+- Added Markdown rendering inside homepage cards, a plain-text reader opened by triple-click, single-line path presentation, and streamlined cards with larger preview areas.
+- Added independent automatic OCR and image-description controls backed by the configured OpenAI-compatible vision service.
+- Corrected native maximize, restore, Aero Snap and cross-monitor work-area synchronization for the frameless Windows window.
+- Improved clipboard contention recovery, precision-touchpad scrolling, single-instance wake-up delivery, settings durability, database recovery and asynchronous shutdown safety.
+- Refined light and dark Fluent surfaces, custom scrollbars, detail resizing and edge-aligned detail scrolling.
+
 ## 0.3.5 - 2026-07-21
 
 - Use native Windows maximize state for the custom title-bar button so maximize and restore remain synchronized with the shell.

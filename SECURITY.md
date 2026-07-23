@@ -15,8 +15,9 @@
 
 - Clipboard monitoring, ordinary local search and Markdown reading do not use the network.
 - OCR and image descriptions use the configured OpenAI-compatible vision endpoint when the user invokes them or enables automatic processing. The selected image is encoded and sent to that endpoint; it is not sent when both automatic settings are disabled and no AI command is invoked.
+- Expand Search sends only the current user-entered search phrase to the configured endpoint. Returned expansion terms are matched against the local database; library records, OCR text and image descriptions are not included in that request.
 - Single-instance coordination uses a local Qt IPC endpoint and only accepts a request to show the existing window.
-- Online AI is an independent, explicit action. Automatic OCR and description are opt-in settings and apply only to newly captured or imported images.
+- Online AI is an independent, explicit action. Automatic OCR and description are opt-in settings and apply only to newly captured or imported images; query expansion runs only when the user clicks Expand Search.
 
 ## Data protection limits
 

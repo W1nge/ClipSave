@@ -24,7 +24,6 @@ from clipsave_app.constants import (
     MAX_AI_RESPONSE_BYTES,
     MAX_CLIPBOARD_IMAGE_BYTES,
     MAX_CLIPBOARD_TEXT_BYTES,
-    MAX_EMBEDDING_DIMENSIONS,
 )
 from clipsave_app.database import LibraryDatabase
 from clipsave_app.services import (
@@ -912,7 +911,7 @@ class AIServiceTests(unittest.TestCase):
                 preflight_image_file(path)
 
     def test_local_http_service_can_be_configured_without_api_key(self):
-        service = AIService("http://127.0.0.1:11434/v1", "", "vision", "embedding")
+        service = AIService("http://127.0.0.1:11434/v1", "", "vision")
         response = FakeResponse(json.dumps({"ok": True}).encode("utf-8"))
 
         with patch.object(service, "_open_request", return_value=response) as open_request:
@@ -926,7 +925,7 @@ class AIServiceTests(unittest.TestCase):
         self.assertLessEqual(response.read_limit, 64 * 1024)
 
     def test_cloudflare_1010_error_has_actionable_message(self):
-        service = AIService("https://example.com/v1", "secret", "vision", "")
+        service = AIService("https://example.com/v1", "secret", "vision")
         error = urllib.error.HTTPError(
             "https://example.com/v1/chat/completions",
             403,
@@ -939,18 +938,8 @@ class AIServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Cloudflare Error 1010"):
                 service._post("/chat/completions", {})
 
-    def test_embedding_provider_identity_excludes_url_credentials_and_query(self):
-        first = AIService(
-            "https://user:secret@example.com/v1?tenant=one", "", "vision", "embedding"
-        )
-        second = AIService("https://example.com/v1?tenant=two", "", "vision", "embedding")
-
-        self.assertEqual(first.embedding_provider, second.embedding_provider)
-        self.assertNotIn("secret", first.embedding_provider)
-        self.assertTrue(first.embedding_provider.startswith("openai-compatible:"))
-
     def test_ai_open_timeout_uses_remaining_overall_deadline(self):
-        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        service = AIService("http://localhost/v1", "", "vision")
         response = FakeResponse(b'{"ok": true}')
         with patch(
             "clipsave_app.services.time.monotonic",
@@ -961,7 +950,7 @@ class AIServiceTests(unittest.TestCase):
         self.assertAlmostEqual(open_request.call_args.kwargs["timeout"], 89.75)
 
     def test_ai_response_size_and_shape_are_validated(self):
-        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        service = AIService("http://localhost/v1", "", "vision")
         response = FakeResponse(lambda limit: b"x" * limit)
         with patch.object(service, "_open_request", return_value=response):
             with self.assertRaisesRegex(RuntimeError, "响应过大"):
@@ -975,24 +964,44 @@ class AIServiceTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "choices"):
                     service.describe_image(path)
 
-    def test_embedding_must_be_numeric_finite_and_bounded(self):
-        service = AIService("http://localhost/v1", "", "vision", "embedding")
-        service._post = lambda _path, _payload, _cancel_event=None: {"data": [{"embedding": [1, 2.5]}]}
-        self.assertEqual(service.embed("query"), [1.0, 2.5])
+    def test_search_expansion_uses_text_completion_and_returns_bounded_or_terms(self):
+        service = AIService("http://localhost/v1", "", "vision")
+        service._post = Mock(
+            return_value={
+                "choices": [{
+                    "message": {
+                        "content": '```json\n{"terms":["错误弹窗","error dialog","错误弹窗",42]}\n```'
+                    }
+                }]
+            }
+        )
 
-        service._post = lambda _path, _payload, _cancel_event=None: {"data": [{"embedding": [1, float("nan")]}]}
-        with self.assertRaisesRegex(RuntimeError, "非有限"):
-            service.embed("query")
+        self.assertEqual(
+            service.expand_search_query("  蓝色   报错窗口  "),
+            ["蓝色 报错窗口", "错误弹窗", "error dialog"],
+        )
+        path, payload = service._post.call_args.args[:2]
+        self.assertEqual(path, "/chat/completions")
+        self.assertEqual(payload["model"], "vision")
+        self.assertIn("OR 搜索", payload["messages"][0]["content"])
+        self.assertIn('"蓝色 报错窗口"', payload["messages"][1]["content"])
 
-        service._post = lambda _path, _payload, _cancel_event=None: {
-            "data": [{"embedding": [0] * (MAX_EMBEDDING_DIMENSIONS + 1)}]
-        }
-        with self.assertRaisesRegex(RuntimeError, "维度过大"):
-            service.embed("query")
-        self.assertEqual(service.similarity([1.0, float("inf")], [1.0, 2.0]), -1.0)
+    def test_search_expansion_rejects_invalid_or_empty_json(self):
+        service = AIService("http://localhost/v1", "", "vision")
+        service._post = Mock(
+            return_value={"choices": [{"message": {"content": "not json"}}]}
+        )
+        with self.assertRaisesRegex(RuntimeError, "搜索词 JSON"):
+            service.expand_search_query("query")
+
+        service._post = Mock(
+            return_value={"choices": [{"message": {"content": '{"terms":[]}'}}]}
+        )
+        with self.assertRaisesRegex(RuntimeError, "可用的扩展搜索词"):
+            service.expand_search_query("query")
 
     def test_cancelled_ai_request_stops_before_network_access(self):
-        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        service = AIService("http://localhost/v1", "", "vision")
         cancel_event = threading.Event()
         cancel_event.set()
         with patch.object(service, "_open_request") as open_request:
@@ -1001,7 +1010,7 @@ class AIServiceTests(unittest.TestCase):
         open_request.assert_not_called()
 
     def test_ai_response_uses_interruptible_single_read_chunks(self):
-        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        service = AIService("http://localhost/v1", "", "vision")
         cancel_event = threading.Event()
 
         class InterruptibleResponse(FakeResponse):
@@ -1019,7 +1028,7 @@ class AIServiceTests(unittest.TestCase):
                 service._post("/test", {}, cancel_event)
 
     def test_cancelled_ai_body_read_closes_active_response(self):
-        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        service = AIService("http://localhost/v1", "", "vision")
         cancel_event = threading.Event()
         closed = threading.Event()
 
@@ -1043,7 +1052,7 @@ class AIServiceTests(unittest.TestCase):
         self.assertTrue(closed.is_set())
 
     def test_cross_origin_ai_redirect_is_refused_before_forwarding_headers(self):
-        service = AIService("https://api.example/v1", "secret", "vision", "")
+        service = AIService("https://api.example/v1", "secret", "vision")
         request = urllib.request.Request(
             "https://api.example/v1/chat/completions",
             headers={"Authorization": "Bearer secret"},
@@ -1060,7 +1069,7 @@ class AIServiceTests(unittest.TestCase):
             )
 
     def test_describe_image_rejects_replacement_after_snapshot(self):
-        service = AIService("http://localhost/v1", "", "vision", "")
+        service = AIService("http://localhost/v1", "", "vision")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / "image.png"
@@ -1077,7 +1086,7 @@ class AIServiceTests(unittest.TestCase):
             post.assert_not_called()
 
     def test_describe_image_rejects_index_hash_mismatch_before_network(self):
-        service = AIService("http://localhost/v1", "", "vision", "")
+        service = AIService("http://localhost/v1", "", "vision")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / "image.png"
@@ -1094,14 +1103,14 @@ class AIServiceTests(unittest.TestCase):
             post.assert_not_called()
 
     def test_describe_image_preflights_pixels_before_posting(self):
-        service = AIService("http://localhost/v1", "", "vision", "embedding")
+        service = AIService("http://localhost/v1", "", "vision")
         with patch("clipsave_app.services.preflight_image_file", side_effect=ValueError("图片尺寸过大")) as preflight:
             with self.assertRaisesRegex(ValueError, "尺寸过大"):
                 service.describe_image(Path("image.png"))
         preflight.assert_called_once_with(Path("image.png"))
 
     def test_ocr_image_uses_the_ocr_prompt_and_vision_endpoint(self):
-        service = AIService("http://localhost/v1", "", "vision", "")
+        service = AIService("http://localhost/v1", "", "vision")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / "image.png"
@@ -1120,7 +1129,7 @@ class AIServiceTests(unittest.TestCase):
         self.assertTrue(payload["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
 
     def test_ocr_image_accepts_an_empty_result_as_no_detected_text(self):
-        service = AIService("http://localhost/v1", "", "vision", "")
+        service = AIService("http://localhost/v1", "", "vision")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / "blank.png"
@@ -1133,7 +1142,7 @@ class AIServiceTests(unittest.TestCase):
                 self.assertEqual(service.ocr_image(path), "")
 
     def test_description_prompt_is_structured_for_search_and_supports_content_parts(self):
-        service = AIService("http://localhost/v1", "", "vision", "")
+        service = AIService("http://localhost/v1", "", "vision")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / "image.png"

@@ -21,7 +21,6 @@ DEFAULTS = {
     "ai_base_url": "",
     "ai_api_key": "",
     "ai_vision_model": "",
-    "ai_embedding_model": "",
     "auto_ocr": False,
     "auto_description": False,
 }
@@ -30,7 +29,6 @@ _STRING_LIMITS = {
     "ai_base_url": 8192,
     "ai_api_key": 16_384,
     "ai_vision_model": 512,
-    "ai_embedding_model": 512,
 }
 
 _BOOLEAN_KEYS = {
@@ -46,7 +44,6 @@ _STRING_KEYS = {
     "ai_base_url",
     "ai_api_key",
     "ai_vision_model",
-    "ai_embedding_model",
 }
 _CHOICES = {
     "view_mode": {"grid", "list"},

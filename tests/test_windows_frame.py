@@ -157,6 +157,75 @@ class WindowsFrameTests(unittest.TestCase):
 
         user32.ShowWindow.assert_called_once_with(123, windows_frame.SW_RESTORE)
 
+    def test_maximized_work_area_sync_uses_destination_monitor_physical_bounds(self):
+        user32 = Mock()
+        user32.IsZoomed.return_value = 1
+        user32.MonitorFromWindow.return_value = 456
+
+        def fill_monitor_info(_monitor, pointer):
+            info = ctypes.cast(
+                pointer, ctypes.POINTER(windows_frame.MONITORINFO)
+            ).contents
+            info.rcWork = windows_frame.wintypes.RECT(61, 0, 1920, 1040)
+            return 1
+
+        def fill_window_rect(_hwnd, pointer):
+            rect = ctypes.cast(
+                pointer, ctypes.POINTER(windows_frame.wintypes.RECT)
+            ).contents
+            rect.left, rect.top, rect.right, rect.bottom = 61, 0, 2621, 1040
+            return 1
+
+        user32.GetMonitorInfoW.side_effect = fill_monitor_info
+        user32.GetWindowRect.side_effect = fill_window_rect
+        user32.SetWindowPos.return_value = 1
+        with patch.object(windows_frame, "is_windows_qt_platform", return_value=True), patch.object(
+            windows_frame, "_user32", return_value=user32
+        ):
+            synced = windows_frame.synchronize_maximized_work_area(123)
+
+        self.assertTrue(synced)
+        user32.SetWindowPos.assert_called_once_with(
+            123,
+            None,
+            61,
+            0,
+            1859,
+            1040,
+            windows_frame.SWP_NOZORDER
+            | windows_frame.SWP_NOACTIVATE
+            | windows_frame.SWP_FRAMECHANGED,
+        )
+
+    def test_maximized_work_area_sync_is_noop_when_bounds_already_match(self):
+        user32 = Mock()
+        user32.IsZoomed.return_value = 1
+        user32.MonitorFromWindow.return_value = 456
+
+        def fill_monitor_info(_monitor, pointer):
+            info = ctypes.cast(
+                pointer, ctypes.POINTER(windows_frame.MONITORINFO)
+            ).contents
+            info.rcWork = windows_frame.wintypes.RECT(-1920, 0, 0, 1040)
+            return 1
+
+        def fill_window_rect(_hwnd, pointer):
+            rect = ctypes.cast(
+                pointer, ctypes.POINTER(windows_frame.wintypes.RECT)
+            ).contents
+            rect.left, rect.top, rect.right, rect.bottom = -1920, 0, 0, 1040
+            return 1
+
+        user32.GetMonitorInfoW.side_effect = fill_monitor_info
+        user32.GetWindowRect.side_effect = fill_window_rect
+        with patch.object(windows_frame, "is_windows_qt_platform", return_value=True), patch.object(
+            windows_frame, "_user32", return_value=user32
+        ):
+            synced = windows_frame.synchronize_maximized_work_area(123)
+
+        self.assertTrue(synced)
+        user32.SetWindowPos.assert_not_called()
+
     def test_native_window_helpers_are_disabled_off_windows(self):
         with patch.object(windows_frame, "is_windows_qt_platform", return_value=False):
             self.assertIsNone(windows_frame.native_window_is_maximized(123))

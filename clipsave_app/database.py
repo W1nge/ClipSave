@@ -279,6 +279,7 @@ class LibraryDatabase:
     BACKUP_LIMIT = 3
     MAX_BACKUP_BYTES = 8 * 1024 * 1024 * 1024
     SUMMARY_CONTENT_LIMIT = 330
+    MAX_SEARCH_TERMS = 16
     IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
     REQUIRED_COLUMNS = {
         "collections": {"id", "name", "created_at"},
@@ -2175,6 +2176,7 @@ class LibraryDatabase:
         summary_only: bool = False,
         limit: int | None = None,
         offset: int = 0,
+        query_terms: Iterable[str] | None = None,
     ) -> list[sqlite3.Row]:
         if limit is not None and (not isinstance(limit, int) or limit < 0):
             raise ValueError("limit must be a non-negative integer or None")
@@ -2183,23 +2185,48 @@ class LibraryDatabase:
         clauses = ["i.missing = 0"]
         parameters: list[object] = []
         joins = ""
-        if query:
-            clauses.append(
-                """(
-                    i.title LIKE ? ESCAPE '\\' OR i.content LIKE ? ESCAPE '\\'
-                    OR i.ocr_text LIKE ? ESCAPE '\\' OR i.ai_description LIKE ? ESCAPE '\\'
-                    OR i.notes LIKE ? ESCAPE '\\'
-                    OR EXISTS(
-                        SELECT 1
-                        FROM item_tags search_link
-                        JOIN tags search_tag ON search_tag.id=search_link.tag_id
-                        WHERE search_link.item_id=i.id AND search_tag.name LIKE ? ESCAPE '\\'
-                    )
-                )"""
-            )
-            escaped_query = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            token = f"%{escaped_query}%"
-            parameters.extend([token] * 6)
+        if query_terms is None:
+            search_terms = [query] if query else []
+        else:
+            if isinstance(query_terms, (str, bytes)):
+                raise TypeError("query_terms must be an iterable of strings")
+            search_terms = []
+            seen_terms: set[str] = set()
+            for value in query_terms:
+                if not isinstance(value, str):
+                    raise TypeError("query_terms must contain only strings")
+                term = value.strip()
+                if not term:
+                    continue
+                key = term.casefold()
+                if key in seen_terms:
+                    continue
+                seen_terms.add(key)
+                search_terms.append(term)
+                if len(search_terms) > self.MAX_SEARCH_TERMS:
+                    raise ValueError(f"query_terms cannot contain more than {self.MAX_SEARCH_TERMS} terms")
+            if not search_terms and query:
+                search_terms.append(query)
+        if search_terms:
+            term_clauses = []
+            for term in search_terms:
+                term_clauses.append(
+                    """(
+                        i.title LIKE ? ESCAPE '\\' OR i.content LIKE ? ESCAPE '\\'
+                        OR i.ocr_text LIKE ? ESCAPE '\\' OR i.ai_description LIKE ? ESCAPE '\\'
+                        OR i.notes LIKE ? ESCAPE '\\'
+                        OR EXISTS(
+                            SELECT 1
+                            FROM item_tags search_link
+                            JOIN tags search_tag ON search_tag.id=search_link.tag_id
+                            WHERE search_link.item_id=i.id AND search_tag.name LIKE ? ESCAPE '\\'
+                        )
+                    )"""
+                )
+                escaped_term = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                token = f"%{escaped_term}%"
+                parameters.extend([token] * 6)
+            clauses.append(f"({' OR '.join(term_clauses)})")
         if kind:
             clauses.append("i.kind = ?")
             parameters.append(kind)

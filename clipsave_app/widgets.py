@@ -15,6 +15,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QRect,
+    QRectF,
     QRunnable,
     QSize,
     Qt,
@@ -25,7 +26,20 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtGui import (
+    QAbstractTextDocumentLayout,
+    QColor,
+    QFont,
+    QIcon,
+    QImage,
+    QImageReader,
+    QPainter,
+    QPalette,
+    QPen,
+    QPixmap,
+    QTextDocument,
+    QWheelEvent,
+)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -44,6 +58,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QMenu,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QScrollBar,
@@ -768,9 +783,25 @@ class CopyToast(QFrame):
 
 
 class AutoHideScrollBar(QScrollBar):
-    def __init__(self, orientation=Qt.Orientation.Vertical, parent=None):
+    def __init__(
+        self,
+        orientation=Qt.Orientation.Vertical,
+        parent=None,
+        *,
+        track_width: int | None = None,
+        light_background: str = "#f6f6f6",
+        align_to_edge: bool = False,
+    ):
         super().__init__(orientation, parent)
         self.setObjectName("AutoHideScrollBar")
+        self._light_background = light_background
+        self._align_to_edge = align_to_edge
+        if track_width is not None:
+            thickness = max(1, int(track_width))
+            if orientation == Qt.Orientation.Vertical:
+                self.setFixedWidth(thickness)
+            else:
+                self.setFixedHeight(thickness)
         self.active = False
         self.setProperty("active", False)
         self.hide_timer = QTimer(self)
@@ -788,12 +819,55 @@ class AutoHideScrollBar(QScrollBar):
         self.update()
 
     def paintEvent(self, event) -> None:
-        if self.active:
-            super().paintEvent(event)
-            return
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#202020" if dark_theme_active() else "#f6f6f6"))
+        dark = dark_theme_active()
+        painter.fillRect(
+            self.rect(), QColor("#202020" if dark else self._light_background)
+        )
+        if self.active and self.maximum() > self.minimum():
+            handle = self._handle_rect()
+            if handle.isValid():
+                if self.isSliderDown() or self.underMouse():
+                    color = QColor("#969696" if dark else "#768191")
+                else:
+                    color = QColor("#777777" if dark else "#9ca5b2")
+                painter.fillRect(handle, color)
         painter.end()
+
+    def _handle_rect(self) -> QRect:
+        vertical = self.orientation() == Qt.Orientation.Vertical
+        track_length = self.height() if vertical else self.width()
+        track_thickness = self.width() if vertical else self.height()
+        if track_length <= 0 or track_thickness <= 0:
+            return QRect()
+
+        value_range = self.maximum() - self.minimum()
+        page_step = max(0, self.pageStep())
+        proportional_length = (
+            round(track_length * page_step / (value_range + page_step))
+            if page_step
+            else 0
+        )
+        handle_length = min(track_length, max(32, proportional_length))
+        available = max(0, track_length - handle_length)
+        position = QStyle.sliderPositionFromValue(
+            self.minimum(),
+            self.maximum(),
+            self.value(),
+            available,
+            self.invertedAppearance(),
+        )
+        handle_thickness = min(
+            max(3, round(track_thickness * 10 / 14)), track_thickness
+        )
+        inset = (
+            track_thickness - handle_thickness
+            if self._align_to_edge
+            else (track_thickness - handle_thickness) // 2
+        )
+        if vertical:
+            return QRect(inset, position, handle_thickness, handle_length)
+        return QRect(position, inset, handle_length, handle_thickness)
 
     def reveal_temporarily(self) -> None:
         self.set_active(True)
@@ -1504,6 +1578,7 @@ class AssetGridDelegate(QStyledItemDelegate):
         self.view = view
         self.favorite_on = lucide_icon("star", "#f4a100", 18, "#f4a100").pixmap(18, 18)
         self.favorite_off = lucide_icon("star", "#f4a100", 18).pixmap(18, 18)
+        self._markdown_documents: OrderedDict[tuple[object, ...], QTextDocument] = OrderedDict()
 
     def sizeHint(self, option, index) -> QSize:
         return self.view.gridSize()
@@ -1512,9 +1587,56 @@ class AssetGridDelegate(QStyledItemDelegate):
     def card_rect(rect: QRect) -> QRect:
         return rect.adjusted(6, 6, -6, -6)
 
+    def preview_rect(self, rect: QRect) -> QRect:
+        return self.card_rect(rect).adjusted(10, 42, -10, -10)
+
     def favorite_rect(self, rect: QRect) -> QRect:
         card = self.card_rect(rect)
         return QRect(card.right() - 31, card.top() + 9, 24, 24)
+
+    def _markdown_document(
+        self,
+        content: str,
+        width: int,
+        dark: bool,
+        font: QFont,
+    ) -> QTextDocument:
+        preview_content = content[:2000]
+        key = (preview_content, width, dark, font.toString())
+        cached = self._markdown_documents.pop(key, None)
+        if cached is not None:
+            self._markdown_documents[key] = cached
+            return cached
+        document = QTextDocument()
+        document.setDocumentMargin(0)
+        document.setDefaultFont(font)
+        document.setMarkdown(preview_content)
+        document.setTextWidth(max(1, width))
+        self._markdown_documents[key] = document
+        while len(self._markdown_documents) > 64:
+            self._markdown_documents.popitem(last=False)
+        return document
+
+    def _draw_markdown_preview(
+        self,
+        painter: QPainter,
+        rect: QRect,
+        content: str,
+        dark: bool,
+        font: QFont,
+    ) -> None:
+        document = self._markdown_document(content, rect.width(), dark, font)
+        painter.save()
+        painter.setClipRect(rect)
+        painter.translate(rect.topLeft())
+        context = QAbstractTextDocumentLayout.PaintContext()
+        context.clip = QRectF(0, 0, rect.width(), rect.height())
+        context.palette.setColor(
+            QPalette.ColorRole.Text,
+            QColor("#dedede" if dark else "#354052"),
+        )
+        document.documentLayout().draw(painter, context)
+        painter.restore()
 
     def paint(self, painter, option, index) -> None:
         record = index.data(AssetItemModel.ItemRole)
@@ -1530,7 +1652,6 @@ class AssetGridDelegate(QStyledItemDelegate):
         painter.drawRoundedRect(card, 6, 6)
 
         muted = QColor("#a7adb7" if dark else "#7a8699")
-        primary = QColor("#f2f2f2" if dark else "#172033")
         left = card.left() + 10
         right = card.right() - 10
         kind = TYPE_LABELS.get(record["kind"], record["kind"])
@@ -1551,7 +1672,7 @@ class AssetGridDelegate(QStyledItemDelegate):
             favorite,
         )
 
-        preview = QRect(left, card.top() + 42, card.width() - 20, 150)
+        preview = self.preview_rect(option.rect)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(
             QColor("#303030" if record["kind"] == "image" else "#262626")
@@ -1577,26 +1698,22 @@ class AssetGridDelegate(QStyledItemDelegate):
                 painter.drawPixmap(target, scaled)
         elif record["kind"] != "image":
             content = str(record["content"] or "").strip() or str(record["title"])
-            painter.setPen(QColor("#dedede" if dark else "#354052"))
-            painter.drawText(
-                preview.adjusted(10, 9, -10, -9),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
-                content[:330],
-            )
+            if record["kind"] == "markdown":
+                self._draw_markdown_preview(
+                    painter,
+                    preview.adjusted(10, 9, -10, -9),
+                    content,
+                    dark,
+                    option.font,
+                )
+            else:
+                painter.setPen(QColor("#dedede" if dark else "#354052"))
+                painter.drawText(
+                    preview.adjusted(10, 9, -10, -9),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+                    content[:330],
+                )
 
-        title_font = QFont(option.font)
-        title_font.setWeight(QFont.Weight.Medium)
-        painter.setFont(title_font)
-        painter.setPen(primary)
-        title = painter.fontMetrics().elidedText(str(record["title"]), Qt.TextElideMode.ElideRight, card.width() - 20)
-        painter.drawText(QRect(left, card.top() + 200, card.width() - 20, 24), Qt.AlignmentFlag.AlignVCenter, title)
-        painter.setFont(option.font)
-        painter.setPen(muted)
-        if record["kind"] == "image" and record["width"]:
-            detail = f"{record['width']} × {record['height']}   {human_size(record['file_size'])}"
-        else:
-            detail = f"{kind}   {human_size(record['file_size'])}"
-        painter.drawText(QRect(left, card.top() + 225, card.width() - 20, 20), Qt.AlignmentFlag.AlignVCenter, detail)
         painter.restore()
 
 
@@ -1624,8 +1741,8 @@ class _ItemRightClickGesture:
         self.view.detail_requested.emit(item_id)
 
 
-class _ImageTripleClickGesture:
-    """Keep image double-click immediate while recognizing a following third click."""
+class _ItemTripleClickGesture:
+    """Keep double-click immediate while recognizing a following third click."""
 
     def __init__(self, view) -> None:
         self.view = view
@@ -1723,7 +1840,7 @@ class AssetGrid(QListView):
         self._suppress_selection_signal = False
         self._wheel_remainder = _WheelRemainder()
         self._right_click = _ItemRightClickGesture(self)
-        self._left_click = _ImageTripleClickGesture(self)
+        self._left_click = _ItemTripleClickGesture(self)
         self.selectionModel().currentChanged.connect(self._index_selected)
         self.selectionModel().selectionChanged.connect(self._selection_changed)
         self.doubleClicked.connect(self._index_activated)
@@ -1922,8 +2039,8 @@ class AssetGrid(QListView):
     def mousePressEvent(self, event) -> None:
         point = event.position().toPoint()
         if event.button() == Qt.MouseButton.LeftButton:
-            image_id = self._image_id_at(point)
-            if self._left_click.press(image_id):
+            triple_click_id = self._triple_click_id_at(point)
+            if self._left_click.press(triple_click_id):
                 event.accept()
                 return
         else:
@@ -1981,8 +2098,8 @@ class AssetGrid(QListView):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
-            image_id = self._image_id_at(point)
-            if self._left_click.double_click(image_id):
+            triple_click_id = self._triple_click_id_at(point)
+            if self._left_click.double_click(triple_click_id):
                 event.accept()
                 return
         super().mouseDoubleClickEvent(event)
@@ -2000,6 +2117,15 @@ class AssetGrid(QListView):
             return None
         record = index.data(AssetItemModel.ItemRole)
         if record is None or record["kind"] != "image":
+            return None
+        return int(record["id"])
+
+    def _triple_click_id_at(self, point: QPoint) -> int | None:
+        index = self.indexAt(point)
+        if not index.isValid():
+            return None
+        record = index.data(AssetItemModel.ItemRole)
+        if record is None or record["kind"] not in {"image", "text"}:
             return None
         return int(record["id"])
 
@@ -2090,7 +2216,7 @@ class AssetTable(QTableView):
         self._wheel_remainder = _WheelRemainder()
         self._favorite_press_row = -1
         self._right_click = _ItemRightClickGesture(self)
-        self._left_click = _ImageTripleClickGesture(self)
+        self._left_click = _ItemTripleClickGesture(self)
 
     def wheelEvent(self, event) -> None:
         scaled_event = _half_speed_wheel_event(event, self._wheel_remainder)
@@ -2166,8 +2292,8 @@ class AssetTable(QTableView):
     def mousePressEvent(self, event) -> None:
         point = event.position().toPoint()
         if event.button() == Qt.MouseButton.LeftButton:
-            image_id = self._image_id_at(point)
-            if self._left_click.press(image_id):
+            triple_click_id = self._triple_click_id_at(point)
+            if self._left_click.press(triple_click_id):
                 event.accept()
                 return
         else:
@@ -2239,8 +2365,8 @@ class AssetTable(QTableView):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
-            image_id = self._image_id_at(point)
-            if self._left_click.double_click(image_id):
+            triple_click_id = self._triple_click_id_at(point)
+            if self._left_click.double_click(triple_click_id):
                 event.accept()
                 return
         super().mouseDoubleClickEvent(event)
@@ -2258,6 +2384,15 @@ class AssetTable(QTableView):
             return None
         record = index.data(AssetItemModel.ItemRole)
         if record is None or record["kind"] != "image":
+            return None
+        return int(record["id"])
+
+    def _triple_click_id_at(self, point: QPoint) -> int | None:
+        index = self.indexAt(point)
+        if not index.isValid():
+            return None
+        record = index.data(AssetItemModel.ItemRole)
+        if record is None or record["kind"] not in {"image", "text"}:
             return None
         return int(record["id"])
 
@@ -2318,6 +2453,13 @@ class DetailPanel(QScrollArea):
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBar(
+            AutoHideScrollBar(
+                track_width=8,
+                light_background="#f6f6f6",
+                align_to_edge=True,
+            )
+        )
         self.setMinimumWidth(280)
         self.setMaximumWidth(340)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
@@ -2367,7 +2509,7 @@ class DetailPanel(QScrollArea):
         layout.addWidget(self.preview_stack, 1)
         self.meta = ThemedSelectableLabel()
         self.meta.setTextFormat(Qt.TextFormat.PlainText)
-        self.meta.setWordWrap(True)
+        self.meta.setWordWrap(False)
         self.meta.setMinimumWidth(0)
         self.meta.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.meta.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -2773,6 +2915,36 @@ class MarkdownDialog(QDialog):
         root.addWidget(content_widget, 1)
 
 
+class TextDialog(QDialog):
+    def __init__(self, title: str, content: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setObjectName("FluentDialog")
+        self.setProperty("textDialog", True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.resize(_fit_dialog_size(self, QSize(920, 700)))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(1, 1, 1, 1)
+        root.setSpacing(0)
+        title_bar = DialogTitleBar(title)
+        title_bar.close_button.clicked.connect(self.reject)
+        root.addWidget(title_bar)
+
+        content_widget = QWidget()
+        content_widget.setObjectName("DialogContent")
+        layout = QVBoxLayout(content_widget)
+        layout.setContentsMargins(18, 14, 18, 18)
+        browser = _SafeMarkdownBrowser()
+        browser.setObjectName("MarkdownBrowser")
+        browser.setOpenExternalLinks(False)
+        browser.setPlainText(content)
+        self.browser = browser
+        layout.addWidget(browser)
+        root.addWidget(content_widget, 1)
+
+
 class DateDialog(QDialog):
     day_selected = Signal(str)
 
@@ -2818,6 +2990,41 @@ class DateDialog(QDialog):
         self.accept()
 
 
+def _settings_section_header(title: str, glyph: str) -> QWidget:
+    header = QWidget()
+    header.setObjectName("SettingsSectionHeader")
+    layout = QHBoxLayout(header)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+    icon = QLabel()
+    icon.setObjectName("SettingsSectionIcon")
+    icon.setFixedSize(20, 20)
+    icon.setPixmap(lucide_icon(glyph, "#21a8fb", 17).pixmap(17, 17))
+    layout.addWidget(icon)
+    heading = QLabel(title)
+    heading.setObjectName("SectionTitle")
+    layout.addWidget(heading)
+    divider = QFrame()
+    divider.setObjectName("SettingsDivider")
+    divider.setFixedHeight(1)
+    layout.addWidget(divider, 1)
+    return header
+
+
+def _settings_field(label: str, field: QWidget) -> QWidget:
+    container = QWidget()
+    container.setObjectName("SettingsField")
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(4)
+    caption = QLabel(label)
+    caption.setObjectName("SettingsCaption")
+    layout.addWidget(caption)
+    field.setMinimumHeight(34)
+    layout.addWidget(field)
+    return container
+
+
 class SettingsDialog(QDialog):
     import_requested = Signal()
     bulk_processing_requested = Signal()
@@ -2831,7 +3038,7 @@ class SettingsDialog(QDialog):
         self.setObjectName("FluentDialog")
         self.setProperty("settingsDialog", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        preferred_size = QSize(620, 560)
+        preferred_size = QSize(720, 600)
         dialog_size = _fit_dialog_size(self, preferred_size)
         self.setFixedSize(dialog_size)
         root = QVBoxLayout(self)
@@ -2843,31 +3050,36 @@ class SettingsDialog(QDialog):
 
         content = QWidget()
         content.setObjectName("DialogContent")
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(24, 0, 24, 0)
-        layout.setSpacing(2)
-        heading = QLabel("常规")
-        heading.setObjectName("SectionTitle")
-        layout.addWidget(heading)
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(24, 14, 24, 14)
+        content_layout.setSpacing(22)
+
+        left_column = QWidget()
+        left_column.setObjectName("SettingsColumn")
+        left_layout = QVBoxLayout(left_column)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(_settings_section_header("常规", "sliders-horizontal"))
         self.close_to_tray = FluentComboBox()
         self.close_to_tray.addItem("关闭窗口时最小化到托盘", True)
         self.close_to_tray.addItem("关闭窗口时退出", False)
         self.close_to_tray.setCurrentIndex(0 if settings.get("close_to_tray", True) else 1)
-        layout.addWidget(self.close_to_tray)
+        self.close_to_tray.setMinimumHeight(34)
+        left_layout.addWidget(self.close_to_tray)
         self.start_with_windows = ToggleSwitch("开机时自动启动 ClipSave")
         self.start_with_windows.setChecked(settings.get("start_with_windows", False))
         self.start_with_windows.setToolTip("登录 Windows 后自动启动 ClipSave")
-        layout.addWidget(self.start_with_windows)
+        left_layout.addWidget(self.start_with_windows)
         self.follow_system_theme = ToggleSwitch("跟随 Windows 深浅色主题")
         self.follow_system_theme.setChecked(settings.get("follow_system_theme", True))
-        layout.addWidget(self.follow_system_theme)
+        left_layout.addWidget(self.follow_system_theme)
         self.dark_theme_switch = ToggleSwitch("使用深色主题")
         self.dark_theme_switch.setChecked(settings.get("theme_mode", "light") == "dark")
         self.dark_theme_switch.setEnabled(not self.follow_system_theme.isChecked())
         self.follow_system_theme.toggled.connect(
             lambda checked: self.dark_theme_switch.setEnabled(not checked)
         )
-        layout.addWidget(self.dark_theme_switch)
+        left_layout.addWidget(self.dark_theme_switch)
         hotkey_state = getattr(parent, "global_hotkey_registered", None)
         if hotkey_state is False:
             hotkey_text = "全局唤醒快捷键：Ctrl + Alt + V（注册失败，可能已被占用）"
@@ -2876,70 +3088,116 @@ class SettingsDialog(QDialog):
         else:
             hotkey_text = "全局唤醒快捷键：Ctrl + Alt + V"
         self.hotkey_status = QLabel(hotkey_text)
-        layout.addWidget(self.hotkey_status)
-        layout.addSpacing(3)
+        self.hotkey_status.setObjectName("SettingsCaption")
+        self.hotkey_status.setWordWrap(True)
+        left_layout.addWidget(self.hotkey_status)
+        left_layout.addSpacing(8)
         from .constants import DATA_DIR, LIBRARY_DIR
 
-        storage_heading = QLabel("本地存储")
-        storage_heading.setObjectName("SectionTitle")
-        layout.addWidget(storage_heading)
-        storage = QLabel(f"剪贴板文件：{LIBRARY_DIR}\n数据库和设置：{DATA_DIR}\n所有自动捕获内容仅写入本机。")
-        storage.setWordWrap(True)
-        storage.setObjectName("Muted")
-        layout.addWidget(storage)
+        left_layout.addWidget(_settings_section_header("本地存储", "hard-drive"))
+        for caption_text, path, attribute_name in (
+            ("剪贴板文件", LIBRARY_DIR, "library_path_label"),
+            ("数据库和设置", DATA_DIR, "data_path_label"),
+        ):
+            caption = QLabel(caption_text)
+            caption.setObjectName("SettingsCaption")
+            left_layout.addWidget(caption)
+            path_label = ThemedSelectableLabel(str(path))
+            path_label.setObjectName("SettingsPath")
+            path_label.setWordWrap(False)
+            path_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            path_label.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+            )
+            path_label.setToolTip(str(path))
+            setattr(self, attribute_name, path_label)
+            left_layout.addWidget(path_label)
+        storage_privacy = QLabel("所有自动捕获内容仅写入本机。")
+        storage_privacy.setObjectName("Muted")
+        left_layout.addWidget(storage_privacy)
+        storage_actions = QHBoxLayout()
+        storage_actions.setSpacing(8)
         self.import_button = QPushButton("导入文件")
         self.import_button.setObjectName("SettingsAction")
         self.import_button.setIcon(lucide_icon("plus"))
         self.import_button.clicked.connect(self.import_requested.emit)
-        layout.addWidget(self.import_button)
+        storage_actions.addWidget(self.import_button, 1)
         open_storage = QPushButton("打开本地资料库")
         open_storage.setObjectName("SettingsAction")
         open_storage.setIcon(lucide_icon("folder"))
         open_storage.clicked.connect(lambda: _startfile_or_warn(self, LIBRARY_DIR))
         self.open_storage_button = open_storage
-        layout.addWidget(open_storage)
-        layout.addSpacing(3)
-        ai_heading = QLabel("OpenAI-compatible AI 服务（独立的主动功能）")
-        ai_heading.setObjectName("SectionTitle")
-        layout.addWidget(ai_heading)
+        storage_actions.addWidget(open_storage, 1)
+        left_layout.addLayout(storage_actions)
+        left_layout.addStretch(1)
+
+        right_column = QWidget()
+        right_column.setObjectName("SettingsColumn")
+        right_layout = QVBoxLayout(right_column)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+        right_layout.addWidget(_settings_section_header("AI 服务", "sparkles"))
+        ai_caption = QLabel("OpenAI-compatible 视觉模型")
+        ai_caption.setObjectName("SettingsCaption")
+        right_layout.addWidget(ai_caption)
         self.base_url = ThemedLineEdit(settings.get("ai_base_url", ""))
         self.base_url.setPlaceholderText("Base URL，例如 https://example.com/v1")
-        layout.addWidget(self.base_url)
+        right_layout.addWidget(_settings_field("Base URL", self.base_url))
         self.api_key = ThemedLineEdit(settings.get("ai_api_key", ""))
         self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.api_key.setPlaceholderText("API Key（仅保存在本机）")
-        layout.addWidget(self.api_key)
+        right_layout.addWidget(_settings_field("API Key", self.api_key))
         self.vision_model = ThemedLineEdit(settings.get("ai_vision_model", ""))
         self.vision_model.setPlaceholderText("视觉模型名称")
-        layout.addWidget(self.vision_model)
-        self.embedding_model = ThemedLineEdit(settings.get("ai_embedding_model", ""))
-        self.embedding_model.setPlaceholderText(
-            "向量模型名称（可选；服务不支持 /embeddings 时请留空）"
-        )
-        layout.addWidget(self.embedding_model)
-        automation_row = QHBoxLayout()
-        automation_row.setSpacing(18)
+        right_layout.addWidget(_settings_field("视觉模型", self.vision_model))
+        right_layout.addSpacing(2)
         self.auto_ocr = ToggleSwitch("图片自动 OCR")
         self.auto_ocr.setChecked(settings.get("auto_ocr", False))
-        automation_row.addWidget(self.auto_ocr)
+        right_layout.addWidget(self.auto_ocr)
         self.auto_description = ToggleSwitch("图片自动生成描述")
         self.auto_description.setChecked(settings.get("auto_description", False))
-        automation_row.addWidget(self.auto_description)
-        automation_row.addStretch(1)
-        layout.addLayout(automation_row)
+        right_layout.addWidget(self.auto_description)
         privacy = QLabel("自动捕获不会联网；自动 OCR/描述会将新图片发送到上方视觉模型。")
         privacy.setObjectName("Muted")
         privacy.setWordWrap(True)
-        layout.addWidget(privacy)
+        right_layout.addWidget(privacy)
         self.bulk_image_button = QPushButton("一键 OCR 并生成全部图片描述")
         self.bulk_image_button.setObjectName("SettingsAction")
         self.bulk_image_button.setIcon(lucide_icon("scan-text"))
         self.bulk_image_button.clicked.connect(self.bulk_processing_requested.emit)
-        if getattr(parent, "_bulk_image_request", None) is not None:
-            self.bulk_image_button.setText("批量处理中…")
-            self.bulk_image_button.setEnabled(False)
-        layout.addWidget(self.bulk_image_button)
-        layout.addStretch()
+        right_layout.addWidget(self.bulk_image_button)
+        self.bulk_progress_label = QLabel()
+        self.bulk_progress_label.setObjectName("SettingsCaption")
+        self.bulk_progress_label.setWordWrap(False)
+        right_layout.addWidget(self.bulk_progress_label)
+        self.bulk_progress = QProgressBar()
+        self.bulk_progress.setObjectName("BulkImageProgress")
+        self.bulk_progress.setTextVisible(False)
+        right_layout.addWidget(self.bulk_progress)
+        self._bulk_progress_provider = parent
+        self._bulk_progress_timer = QTimer(self)
+        self._bulk_progress_timer.setInterval(250)
+        self._bulk_progress_timer.timeout.connect(self._refresh_bulk_progress)
+        self._bulk_progress_timer.start()
+        self._refresh_bulk_progress()
+        right_layout.addStretch(1)
+
+        compact = dialog_size != preferred_size
+        if compact:
+            content_layout.setDirection(QVBoxLayout.Direction.TopToBottom)
+            content_layout.setSpacing(18)
+            content_layout.addWidget(left_column)
+            content_layout.addWidget(right_column)
+        else:
+            content_layout.addWidget(left_column, 1)
+            column_divider = QFrame()
+            column_divider.setObjectName("SettingsColumnDivider")
+            column_divider.setFixedWidth(1)
+            content_layout.addWidget(column_divider)
+            content_layout.addWidget(right_column, 1)
+
         if dialog_size != preferred_size:
             scroll = QScrollArea()
             scroll.setObjectName("DialogScroll")
@@ -2966,6 +3224,67 @@ class SettingsDialog(QDialog):
         footer_layout.addWidget(save)
         root.addWidget(footer)
 
+    def _refresh_bulk_progress(self) -> None:
+        provider = getattr(self._bulk_progress_provider, "bulk_image_progress_snapshot", None)
+        if callable(provider):
+            state = provider()
+        else:
+            active = getattr(self._bulk_progress_provider, "_bulk_image_request", None) is not None
+            state = {
+                "active": active,
+                "resumable": False,
+                "processed": 0,
+                "total": 0,
+                "phase": "正在处理" if active else "",
+                "error": "",
+            }
+        active = bool(state.get("active"))
+        resumable = bool(state.get("resumable"))
+        processed = max(0, int(state.get("processed") or 0))
+        total = max(0, int(state.get("total") or 0))
+        phase = str(state.get("phase") or "")
+        error = str(state.get("error") or "")
+        visible = active or resumable or bool(error)
+        self.bulk_progress_label.setVisible(visible)
+        self.bulk_progress.setVisible(visible and total > 0)
+        if total > 0:
+            self.bulk_progress.setRange(0, total)
+            self.bulk_progress.setValue(min(processed, total))
+            self.bulk_progress.setFormat(f"{processed:,} / {total:,}")
+        if active:
+            self.bulk_image_button.setText("批量处理中…")
+            self.bulk_image_button.setEnabled(False)
+        elif resumable:
+            self.bulk_image_button.setText("继续 OCR 与描述")
+            self.bulk_image_button.setEnabled(True)
+        else:
+            self.bulk_image_button.setText("一键 OCR 并生成全部图片描述")
+            self.bulk_image_button.setEnabled(True)
+        if error:
+            self.bulk_progress_label.setText(
+                f"{phase or '已暂停'}  {processed:,}/{total:,}：{error[:80]}"
+            )
+        elif visible:
+            self.bulk_progress_label.setText(
+                f"{phase or '等待继续'}  {processed:,}/{total:,}"
+            )
+        else:
+            self.bulk_progress_label.clear()
+
+    def persist_bulk_configuration(self) -> bool:
+        try:
+            self.settings.update(
+                {
+                    "ai_base_url": self.base_url.text().strip(),
+                    "ai_api_key": self.api_key.text().strip(),
+                    "ai_vision_model": self.vision_model.text().strip(),
+                }
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "AI 设置保存失败", str(exc))
+            return False
+        return True
+
     def accept(self) -> None:
         values = {
             "close_to_tray": self.close_to_tray.currentData(),
@@ -2975,7 +3294,6 @@ class SettingsDialog(QDialog):
             "ai_base_url": self.base_url.text().strip(),
             "ai_api_key": self.api_key.text().strip(),
             "ai_vision_model": self.vision_model.text().strip(),
-            "ai_embedding_model": self.embedding_model.text().strip(),
             "auto_ocr": self.auto_ocr.isChecked(),
             "auto_description": self.auto_description.isChecked(),
         }

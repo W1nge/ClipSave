@@ -2037,6 +2037,48 @@ class LibraryDatabaseTests(unittest.TestCase):
             ["under_score"],
         )
 
+    def test_expanded_search_terms_are_combined_with_or_across_searchable_fields(self):
+        first_id = self.database.add_text("a blue settings window")
+        second_id = self.database.add_text("ordinary body")
+        self.database.update_ocr(second_id, "Cloudflare error 1010")
+        third_id = self.database.add_text("unrelated body")
+        self.database.add_tag(third_id, "warning dialog")
+
+        results = self.database.query_items(
+            query="does not participate",
+            query_terms=["blue settings", "error 1010", "warning dialog"],
+            sort="oldest",
+        )
+
+        self.assertEqual([row["id"] for row in results], [first_id, second_id, third_id])
+
+    def test_expanded_search_terms_are_deduplicated_and_escape_like_wildcards(self):
+        percent_id = self.database.add_text("100% complete")
+        underscore_id = self.database.add_text("under_score")
+        self.database.add_text("1000 and underXscore")
+
+        results = self.database.query_items(
+            query_terms=["100%", "100%", "under_score"],
+            sort="oldest",
+        )
+
+        self.assertEqual([row["id"] for row in results], [percent_id, underscore_id])
+
+    def test_expanded_search_rejects_invalid_or_excessive_terms(self):
+        fallback_id = self.database.add_text("fallback phrase")
+        self.assertEqual(
+            [row["id"] for row in self.database.query_items(query="fallback", query_terms=[])],
+            [fallback_id],
+        )
+        with self.assertRaises(TypeError):
+            self.database.query_items(query_terms="not a term list")
+        with self.assertRaises(TypeError):
+            self.database.query_items(query_terms=["valid", 42])
+        with self.assertRaises(ValueError):
+            self.database.query_items(
+                query_terms=[f"term-{index}" for index in range(self.database.MAX_SEARCH_TERMS + 1)]
+            )
+
     def test_summary_query_bounds_payload_and_supports_pagination(self):
         ids = []
         for index in range(3):

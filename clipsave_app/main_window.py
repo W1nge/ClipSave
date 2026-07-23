@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import json
 import os
 import threading
 import time
@@ -32,6 +31,14 @@ from PySide6.QtWidgets import (
 )
 from send2trash import send2trash
 
+from .bulk_checkpoint import (
+    BulkImageCheckpoint,
+    checkpoint_path,
+    clear_checkpoint,
+    load_checkpoint,
+    new_checkpoint,
+    save_checkpoint,
+)
 from .constants import APP_NAME, LIBRARY_DIR, MAX_IMPORT_BYTES, MAX_MARKDOWN_BYTES
 from .database import ImportFileResult, LibraryDatabase
 from .services import (
@@ -49,9 +56,11 @@ from .startup import set_start_with_windows
 from .storage import is_under_local_store, recycle_managed_file
 from .styles import DARK_STYLESHEET, LIGHT_STYLESHEET
 from .windows_frame import (
+    WM_DPICHANGED,
     WM_GETMINMAXINFO,
     WM_NCACTIVATE,
     WM_NCCALCSIZE,
+    WM_WINDOWPOSCHANGED,
     enable_native_resize_frame,
     handle_getminmaxinfo,
     handle_nccalcsize,
@@ -60,6 +69,7 @@ from .windows_frame import (
     maximize_native_window,
     native_window_is_maximized,
     restore_native_window,
+    synchronize_maximized_work_area,
     window_dpi_scale,
     window_rect,
 )
@@ -75,6 +85,7 @@ from .widgets import (
     FluentMessageBox as QMessageBox,
     IconButton,
     MarkdownDialog,
+    TextDialog,
     SettingsDialog,
     ResizeHandle,
     Sidebar,
@@ -119,7 +130,7 @@ class AsyncSignals(QObject):
 
 
 class BulkImageSignals(QObject):
-    progress = Signal(int, int, int)
+    progress = Signal(int, int, int, str)
     finished = Signal(object)
 
 
@@ -162,9 +173,9 @@ class MainWindow(QMainWindow):
         self._ocr_requests: dict[int, tuple[object, AsyncSignals]] = {}
         self._automatic_ai_items: set[int] = set()
         self._automatic_ocr_items: set[int] = set()
-        self._semantic_request: tuple[object, AsyncSignals] | None = None
-        self._semantic_results_active = False
-        self._semantic_ordered_ids: list[int] = []
+        self._expanded_search_request: tuple[object, AsyncSignals] | None = None
+        self._expanded_search_query = ""
+        self._expanded_search_terms: tuple[str, ...] = ()
         self._session_hidden_item_ids: set[int] = set()
         self._pending_delete_item_ids: set[int] = set()
         self._delete_requests: dict[int, tuple[object, AsyncSignals, bool, bool]] = {}
@@ -174,6 +185,8 @@ class MainWindow(QMainWindow):
         self._copy_request: tuple[object, AsyncSignals, int] | None = None
         self._backup_request: tuple[object, AsyncSignals] | None = None
         self._bulk_image_request: tuple[object, BulkImageSignals] | None = None
+        self._bulk_image_checkpoint_path = checkpoint_path(Path(settings.path))
+        self._bulk_image_progress_state = self._initial_bulk_image_progress_state()
         self._async_tasks: dict[object, tuple[threading.Event, threading.Thread]] = {}
         self._bounded_tasks: dict[object, object] = {}
         self._async_tasks_lock = threading.Lock()
@@ -183,6 +196,7 @@ class MainWindow(QMainWindow):
         self._native_resize_frame_enabled = False
         self._native_resize_frame_hwnd: int | None = None
         self._native_acrylic_hwnd: int | None = None
+        self._maximized_bounds_sync_pending = False
         self._initial_position_constrained = False
         self.global_hotkey_registered: bool | None = None
         self.dark_theme = self._desired_dark_theme()
@@ -244,7 +258,7 @@ class MainWindow(QMainWindow):
             button.refresh_theme()
         self.window_title_bar.update_maximize_state(self._window_is_maximized())
         self.sidebar.set_active(getattr(self.sidebar, "active_key", ""))
-        self.semantic_button.setIcon(lucide_icon("sparkles"))
+        self.expanded_search_button.setIcon(lucide_icon("sparkles"))
         self.detail.ai_button.setIcon(lucide_icon("sparkles"))
         self.detail.ocr_button.setIcon(lucide_icon("scan-text"))
         self.grid.viewport().update()
@@ -313,13 +327,13 @@ class MainWindow(QMainWindow):
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(560)
         self.search.setMinimumWidth(160)
-        self.search.textChanged.connect(lambda _text: self.search_timer.start())
+        self.search.textChanged.connect(self._search_text_changed)
         top_layout.addWidget(self.search, 3)
-        self.semantic_button = QPushButton("语义搜索")
-        self.semantic_button.setIcon(lucide_icon("sparkles"))
-        self.semantic_button.setToolTip("使用已生成的图片向量按含义搜索")
-        self.semantic_button.clicked.connect(self.semantic_search)
-        top_layout.addWidget(self.semantic_button)
+        self.expanded_search_button = QPushButton("扩大搜索")
+        self.expanded_search_button.setIcon(lucide_icon("sparkles"))
+        self.expanded_search_button.setToolTip("使用 AI 扩展搜索词，并在本地扩大匹配范围")
+        self.expanded_search_button.clicked.connect(self.expand_search)
+        top_layout.addWidget(self.expanded_search_button)
         top_layout.addStretch(1)
         self.sort_button = QPushButton(
             SORT_BUTTON_LABELS.get(self.current_sort, SORT_BUTTON_LABELS["newest"]) + "  ▾"
@@ -415,7 +429,8 @@ class MainWindow(QMainWindow):
         self.detail.ocr_requested.connect(self.generate_ocr)
         self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.content_splitter.setObjectName("ContentSplitter")
-        self.content_splitter.setHandleWidth(8)
+        # A 1 px Qt splitter keeps an expanded grab target overlapping both panes.
+        self.content_splitter.setHandleWidth(1)
         self.content_splitter.setChildrenCollapsible(False)
         self.content_splitter.addWidget(self.library_surface)
         self.content_splitter.addWidget(self.detail)
@@ -565,6 +580,8 @@ class MainWindow(QMainWindow):
                 handled, result = handle_nccalcsize(int(msg.hWnd), int(msg.wParam), int(msg.lParam))
                 if handled:
                     return True, result
+            if msg.message in (WM_WINDOWPOSCHANGED, WM_DPICHANGED):
+                self._schedule_maximized_bounds_sync()
             if msg.message == 0x0231:  # WM_ENTERSIZEMOVE
                 self._begin_interactive_resize()
             elif msg.message == 0x0232:  # WM_EXITSIZEMOVE
@@ -585,6 +602,18 @@ class MainWindow(QMainWindow):
                 if hit is not None:
                     return True, hit
         return super().nativeEvent(event_type, message)
+
+    def _schedule_maximized_bounds_sync(self) -> None:
+        if self._maximized_bounds_sync_pending:
+            return
+        self._maximized_bounds_sync_pending = True
+        QTimer.singleShot(0, self._synchronize_maximized_bounds)
+
+    def _synchronize_maximized_bounds(self) -> None:
+        self._maximized_bounds_sync_pending = False
+        if self._closing or self._quit_in_progress or not is_windows_qt_platform():
+            return
+        synchronize_maximized_work_area(int(self.winId()))
 
     @classmethod
     def _windows_resize_hit_test(
@@ -720,6 +749,18 @@ class MainWindow(QMainWindow):
         self._refresh_navigation_metadata()
         self.refresh_items()
 
+    def _search_text_changed(self, _text: str) -> None:
+        self._expanded_search_query = ""
+        self._expanded_search_terms = ()
+        self._cancel_expanded_search_request()
+        self.search_timer.start()
+
+    def _expanded_search_active(self) -> bool:
+        return bool(
+            self._expanded_search_terms
+            and self._expanded_search_query == self.search.text().strip()
+        )
+
     def _refresh_navigation_metadata(self) -> None:
         counts = self.database.counts()
         self.sidebar.set_primary(counts)
@@ -728,27 +769,31 @@ class MainWindow(QMainWindow):
         self.detail.set_collections(self.database.collections())
 
     def refresh_items(self) -> None:
-        self._semantic_results_active = False
-        self._cancel_semantic_request()
         self._items_offset = 0
         self._items_loading = False
         items = self._query_current_items(self.ITEM_PAGE_SIZE, 0)
         self._items_offset = len(items)
         self._items_has_more = len(items) == self.ITEM_PAGE_SIZE
         self._apply_items(items)
+        expanded_suffix = " · 已扩大搜索" if self._expanded_search_active() else ""
         self.result_count.setText(
-            f"{len(self.current_items):,}{'+' if self._items_has_more else ''} 项"
+            f"{len(self.current_items):,}{'+' if self._items_has_more else ''} 项{expanded_suffix}"
         )
         filters = []
         if self.current_day:
             filters.append(self.current_day)
         if self.search.text().strip():
-            filters.append(f"搜索：{self.search.text().strip()}")
+            label = f"搜索：{self.search.text().strip()}"
+            if self._expanded_search_active():
+                label += "（已扩大）"
+            filters.append(label)
         self.filter_hint.setText("  ·  ".join(filters))
 
     def _query_current_items(self, limit: int, offset: int):
+        expanded_terms = self._expanded_search_terms if self._expanded_search_active() else None
         return self.database.query_items(
             query=self.search.text().strip(),
+            query_terms=expanded_terms,
             kind=self.current_kind,
             favorite=self.current_favorite,
             day=self.current_day,
@@ -768,8 +813,7 @@ class MainWindow(QMainWindow):
 
     def load_more_items(self) -> None:
         if (
-            self._semantic_results_active
-            or self._items_loading
+            self._items_loading
             or not self._items_has_more
             or self._closing
             or self._quit_in_progress
@@ -786,8 +830,9 @@ class MainWindow(QMainWindow):
             self._apply_items(
                 self.current_items + [item for item in items if item["id"] not in existing_ids]
             )
+            expanded_suffix = " · 已扩大搜索" if self._expanded_search_active() else ""
             self.result_count.setText(
-                f"{len(self.current_items):,}{'+' if self._items_has_more else ''} 项"
+                f"{len(self.current_items):,}{'+' if self._items_has_more else ''} 项{expanded_suffix}"
             )
         finally:
             self._items_loading = False
@@ -1053,10 +1098,7 @@ class MainWindow(QMainWindow):
         if self._closing or self._quit_in_progress:
             return
         self.show_status("已保存一条新的剪贴板内容")
-        if self._semantic_request is not None or self._semantic_results_active:
-            self._refresh_navigation_metadata()
-        else:
-            self.refresh_library()
+        self.refresh_library()
         self._schedule_auto_image_tasks(_item_id)
 
     def activate_item(self, item_id: int) -> None:
@@ -1077,6 +1119,10 @@ class MainWindow(QMainWindow):
         if item["kind"] == "markdown":
             self._exec_transient_dialog(
                 MarkdownDialog(item["title"], item["content"], item["path"], self)
+            )
+        elif item["kind"] == "text":
+            self._exec_transient_dialog(
+                TextDialog(item["title"], item["content"], self)
             )
         elif item["kind"] == "image" and item["path"]:
             path = Path(item["path"])
@@ -1403,7 +1449,7 @@ class MainWindow(QMainWindow):
         ):
             return False
         self.detail.mark_notes_saved(item_id, notes)
-        if self.search.text().strip() and not self._semantic_results_active:
+        if self.search.text().strip():
             self.refresh_items()
         self.show_status("备注已保存")
         return True
@@ -1502,23 +1548,7 @@ class MainWindow(QMainWindow):
         self.show_status("集合已更新")
 
     def _refresh_after_mutation(self) -> None:
-        if not self._semantic_results_active:
-            self.refresh_library()
-            return
-        self._refresh_navigation_metadata()
-        base_items = self.database.query_items(
-            kind=self.current_kind,
-            favorite=self.current_favorite,
-            day=self.current_day,
-            recent_days=7 if self.current_recent else None,
-            collection_id=self.current_collection,
-            tag_id=self.current_tag,
-            sort=self.current_sort,
-            summary_only=True,
-        )
-        records = {row["id"]: row for row in base_items}
-        self._apply_items([records[item_id] for item_id in self._semantic_ordered_ids if item_id in records])
-        self.result_count.setText(f"{len(self.current_items):,} 项 · 按语义相关度")
+        self.refresh_library()
 
     def _run_database_action(self, action, title: str, status: str) -> bool:
         try:
@@ -1665,7 +1695,6 @@ class MainWindow(QMainWindow):
             lambda: self._confirm_bulk_image_processing(dialog)
         )
         result = self._exec_transient_dialog(dialog)
-        bulk_requested = bool(result and dialog.bulk_processing_confirmed)
         if result:
             start_with_windows = self.settings.get("start_with_windows", False)
             if start_with_windows != previous_start_with_windows:
@@ -1693,8 +1722,62 @@ class MainWindow(QMainWindow):
                     self._automatic_ai_items,
                     self._ai_requests,
                 )
-        if bulk_requested:
-            self.start_bulk_image_processing()
+
+    @staticmethod
+    def _bulk_progress_state(
+        checkpoint: BulkImageCheckpoint | None,
+        *,
+        active: bool = False,
+        phase: str = "",
+        error: str = "",
+    ) -> dict[str, object]:
+        if checkpoint is None:
+            return {
+                "active": False,
+                "resumable": False,
+                "processed": 0,
+                "total": 0,
+                "phase": phase,
+                "error": error,
+            }
+        return {
+            "active": active,
+            "resumable": checkpoint.processed < checkpoint.total,
+            "processed": checkpoint.processed,
+            "total": checkpoint.total,
+            "phase": phase,
+            "error": error,
+        }
+
+    def _initial_bulk_image_progress_state(self) -> dict[str, object]:
+        try:
+            checkpoint = load_checkpoint(self._bulk_image_checkpoint_path)
+            if checkpoint is not None and checkpoint.processed >= checkpoint.total:
+                clear_checkpoint(self._bulk_image_checkpoint_path)
+                checkpoint = None
+        except (OSError, ValueError) as exc:
+            return self._bulk_progress_state(
+                None,
+                phase="断点不可用",
+                error=str(exc),
+            )
+        phase = "已暂停，可继续处理" if checkpoint is not None else ""
+        return self._bulk_progress_state(checkpoint, phase=phase)
+
+    def bulk_image_progress_snapshot(self) -> dict[str, object]:
+        return dict(self._bulk_image_progress_state)
+
+    def _load_bulk_image_checkpoint(self) -> BulkImageCheckpoint | None:
+        try:
+            checkpoint = load_checkpoint(self._bulk_image_checkpoint_path)
+        except (OSError, ValueError) as exc:
+            self._bulk_image_progress_state = self._bulk_progress_state(
+                None,
+                phase="断点不可用",
+                error=str(exc),
+            )
+            return None
+        return checkpoint
 
     def _confirm_bulk_image_processing(self, dialog: SettingsDialog) -> None:
         if self._bulk_image_request is not None:
@@ -1709,28 +1792,43 @@ class MainWindow(QMainWindow):
                 "请先填写 Base URL 和视觉模型名称，再开始批量处理。",
             )
             return
-        image_count = len(self.database.query_items(kind="image", summary_only=True))
+        checkpoint = self._load_bulk_image_checkpoint()
+        if checkpoint is not None and checkpoint.processed >= checkpoint.total:
+            checkpoint = None
+        image_count = (
+            checkpoint.total
+            if checkpoint is not None
+            else len(self.database.query_items(kind="image", summary_only=True))
+        )
         if not image_count:
             QMessageBox.information(dialog, "没有图片", "本地资料库中没有可处理的图片。")
             return
-        answer = QMessageBox.question(
-            dialog,
-            "确认批量处理图片",
-            (
+        if checkpoint is not None:
+            confirmation = (
+                f"将从 {checkpoint.processed:,}/{checkpoint.total:,} 继续，"
+                f"当前阶段为{'生成描述' if checkpoint.stage == 'description' else 'OCR'}。\n\n"
+                "已经完成的图片不会重复请求。确定继续吗？"
+            )
+        else:
+            confirmation = (
                 f"将对现有 {image_count:,} 张图片重新执行 OCR 并生成描述，"
                 "已有 OCR 和描述会被覆盖。\n\n"
-                f"至少需要发送 {image_count * 2:,} 次视觉请求；如果填写了向量模型，"
-                "还会额外发送向量请求，可能产生费用。确定继续吗？"
-            ),
+                f"需要发送约 {image_count * 2:,} 次视觉请求，可能产生费用。确定继续吗？"
+            )
+        answer = QMessageBox.question(
+            dialog,
+            "继续批量处理图片" if checkpoint is not None else "确认批量处理图片",
+            confirmation,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        dialog.bulk_processing_confirmed = False
-        dialog.accept()
-        if dialog.result():
-            dialog.bulk_processing_confirmed = True
+        if not dialog.persist_bulk_configuration():
+            return
+        dialog.bulk_processing_confirmed = True
+        self.start_bulk_image_processing()
+        dialog._refresh_bulk_progress()
 
     def start_bulk_image_processing(self) -> None:
         if self._closing or self._quit_in_progress:
@@ -1746,29 +1844,46 @@ class MainWindow(QMainWindow):
                 "请先在设置中填写 Base URL 和视觉模型名称。",
             )
             return
-        image_ids = [
-            int(row["id"])
-            for row in self.database.query_items(
-                kind="image",
-                sort="oldest",
-                summary_only=True,
-            )
-        ]
-        if not image_ids:
-            QMessageBox.information(self, "没有图片", "本地资料库中没有可处理的图片。")
-            return
+        checkpoint = self._load_bulk_image_checkpoint()
+        if checkpoint is not None and checkpoint.processed >= checkpoint.total:
+            try:
+                clear_checkpoint(self._bulk_image_checkpoint_path)
+            except OSError as exc:
+                QMessageBox.warning(self, "批量处理无法启动", f"无法清理旧断点：{exc}")
+                return
+            checkpoint = None
+        if checkpoint is None:
+            image_ids = [
+                int(row["id"])
+                for row in self.database.query_items(
+                    kind="image",
+                    sort="oldest",
+                    summary_only=True,
+                )
+            ]
+            if not image_ids:
+                QMessageBox.information(self, "没有图片", "本地资料库中没有可处理的图片。")
+                return
+            checkpoint = new_checkpoint(image_ids)
+            try:
+                clear_checkpoint(self._bulk_image_checkpoint_path)
+                save_checkpoint(self._bulk_image_checkpoint_path, checkpoint)
+            except OSError as exc:
+                QMessageBox.warning(self, "批量处理无法启动", f"无法保存批处理断点：{exc}")
+                return
 
         token = object()
         signals = BulkImageSignals()
         self._async_signals.add(signals)
         self._bulk_image_request = (token, signals)
         signals.progress.connect(
-            lambda processed, total, item_id, request_token=token, request_signals=signals: self._bulk_image_progress(
+            lambda processed, total, item_id, phase, request_token=token, request_signals=signals: self._bulk_image_progress(
                 request_token,
                 request_signals,
                 processed,
                 total,
                 item_id,
+                phase,
             )
         )
         signals.finished.connect(
@@ -1778,22 +1893,30 @@ class MainWindow(QMainWindow):
                 result,
             )
         )
+        self._bulk_image_progress_state = self._bulk_progress_state(
+            checkpoint,
+            active=True,
+            phase="正在继续处理" if checkpoint.processed else "正在准备",
+        )
 
         def work(cancel_event: threading.Event) -> None:
-            total = len(image_ids)
+            current = checkpoint
+            total = current.total
             result = {
                 "total": total,
-                "completed": 0,
-                "skipped": 0,
-                "failed": 0,
+                "processed": current.processed,
+                "completed": current.completed,
+                "skipped": current.skipped,
+                "failed": current.failed,
                 "cancelled": False,
                 "error": "",
-                "embedding_error": "",
             }
-            embedding_enabled = bool(service.embedding_model)
-            for processed, item_id in enumerate(image_ids, 1):
+            while current.processed < total:
                 if cancel_event.is_set():
                     result["cancelled"] = True
+                    break
+                item_id = current.current_item_id
+                if item_id is None:
                     break
                 try:
                     item = self.database.get_item(item_id)
@@ -1801,57 +1924,60 @@ class MainWindow(QMainWindow):
                     result["error"] = f"读取图片索引失败：{exc}"
                     break
                 if not item or item["kind"] != "image" or not item["path"] or not item["content_hash"]:
-                    result["skipped"] += 1
-                    signals.progress.emit(processed, total, item_id)
+                    current = current.advance("skipped")
+                    try:
+                        save_checkpoint(self._bulk_image_checkpoint_path, current)
+                    except OSError as exc:
+                        result["error"] = f"无法保存批处理断点：{exc}"
+                        break
+                    signals.progress.emit(current.processed, total, item_id, "已跳过")
                     continue
                 try:
                     image_snapshot = preflight_image_file(Path(item["path"]))
                 except Exception:
-                    result["failed"] += 1
-                    signals.progress.emit(processed, total, item_id)
+                    current = current.advance("failed")
+                    try:
+                        save_checkpoint(self._bulk_image_checkpoint_path, current)
+                    except OSError as exc:
+                        result["error"] = f"无法保存批处理断点：{exc}"
+                        break
+                    signals.progress.emit(current.processed, total, item_id, "本地文件不可用")
                     continue
                 try:
-                    ocr_text = service.ocr_image(
-                        image_snapshot,
-                        cancel_event,
-                        expected_sha256=item["content_hash"],
-                    )
-                    image_snapshot.require_current()
-                    if not self.database.update_ocr_if_current(
-                        item_id,
-                        item["content_hash"],
-                        ocr_text,
-                    ):
-                        result["skipped"] += 1
-                        signals.progress.emit(processed, total, item_id)
-                        continue
-
+                    if current.stage == "ocr":
+                        signals.progress.emit(current.processed, total, item_id, "正在 OCR")
+                        ocr_text = service.ocr_image(
+                            image_snapshot,
+                            cancel_event,
+                            expected_sha256=item["content_hash"],
+                        )
+                        image_snapshot.require_current()
+                        if not self.database.update_ocr_if_current(
+                            item_id,
+                            item["content_hash"],
+                            ocr_text,
+                        ):
+                            current = current.advance("skipped")
+                            save_checkpoint(self._bulk_image_checkpoint_path, current)
+                            signals.progress.emit(current.processed, total, item_id, "图片已变化")
+                            continue
+                        current = current.at_stage("description")
+                        save_checkpoint(self._bulk_image_checkpoint_path, current)
+                    signals.progress.emit(current.processed, total, item_id, "正在生成描述")
                     description = service.describe_image(
                         image_snapshot,
                         cancel_event,
                         expected_sha256=item["content_hash"],
                     )
-                    embedding = None
-                    if embedding_enabled:
-                        try:
-                            embedding = service.embed(description, cancel_event)
-                        except OperationCancelled:
-                            raise
-                        except Exception as exc:
-                            result["embedding_error"] = str(exc)
-                            embedding_enabled = False
                     image_snapshot.require_current()
                     if not self.database.update_ai_if_current(
                         item_id,
                         item["content_hash"],
                         description,
-                        embedding,
-                        embedding_provider=service.embedding_provider,
-                        embedding_model=service.embedding_model,
-                        embedding_revision=service.EMBEDDING_REVISION,
                     ):
-                        result["skipped"] += 1
-                        signals.progress.emit(processed, total, item_id)
+                        current = current.advance("skipped")
+                        save_checkpoint(self._bulk_image_checkpoint_path, current)
+                        signals.progress.emit(current.processed, total, item_id, "图片已变化")
                         continue
                 except OperationCancelled:
                     result["cancelled"] = True
@@ -1859,8 +1985,21 @@ class MainWindow(QMainWindow):
                 except Exception as exc:
                     result["error"] = str(exc)
                     break
-                result["completed"] += 1
-                signals.progress.emit(processed, total, item_id)
+                current = current.advance("completed")
+                try:
+                    save_checkpoint(self._bulk_image_checkpoint_path, current)
+                except OSError as exc:
+                    result["error"] = f"无法保存批处理断点：{exc}"
+                    break
+                signals.progress.emit(current.processed, total, item_id, "已完成")
+            result.update(
+                {
+                    "processed": current.processed,
+                    "completed": current.completed,
+                    "skipped": current.skipped,
+                    "failed": current.failed,
+                }
+            )
             signals.finished.emit(result)
 
         try:
@@ -1868,9 +2007,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._bulk_image_request = None
             self._async_signals.discard(signals)
+            self._bulk_image_progress_state = self._bulk_progress_state(
+                checkpoint,
+                phase="已暂停，可继续处理",
+                error=str(exc),
+            )
             QMessageBox.warning(self, "批量处理无法启动", str(exc))
             return
-        self.show_status(f"批量处理已开始：共 {len(image_ids):,} 张图片")
+        self.show_status(
+            f"批量处理已开始：从 {checkpoint.processed:,}/{checkpoint.total:,} 继续"
+        )
 
     def _bulk_image_progress(
         self,
@@ -1879,12 +2025,23 @@ class MainWindow(QMainWindow):
         processed: int,
         total: int,
         item_id: int,
+        phase: str,
     ) -> None:
         if self._bulk_image_request != (token, signals) or self._closing:
             return
         if self.current_item_id == item_id:
             self.update_detail(item_id)
-        self.show_status(f"批量处理图片 {processed:,}/{total:,}")
+        self._bulk_image_progress_state.update(
+            {
+                "active": True,
+                "resumable": True,
+                "processed": processed,
+                "total": total,
+                "phase": phase,
+                "error": "",
+            }
+        )
+        self.show_status(f"批量处理图片 {processed:,}/{total:,}：{phase}")
 
     def _bulk_image_finished(
         self,
@@ -1896,11 +2053,33 @@ class MainWindow(QMainWindow):
         if self._bulk_image_request != (token, signals):
             return
         self._bulk_image_request = None
+        details = result if isinstance(result, dict) else {}
+        checkpoint = self._load_bulk_image_checkpoint()
+        error = str(details.get("error") or "")
+        completed_all = (
+            checkpoint is not None and checkpoint.processed >= checkpoint.total
+        )
+        if completed_all:
+            try:
+                clear_checkpoint(self._bulk_image_checkpoint_path)
+            except OSError as exc:
+                error = error or f"无法清理已完成的批处理断点：{exc}"
+            checkpoint = None
+        if checkpoint is not None:
+            self._bulk_image_progress_state = self._bulk_progress_state(
+                checkpoint,
+                phase="已暂停，可继续处理",
+                error=error,
+            )
+        else:
+            self._bulk_image_progress_state = self._bulk_progress_state(
+                None,
+                phase="已完成" if completed_all else "",
+                error=error,
+            )
         if self._closing or self._quit_in_progress:
             return
-        details = result if isinstance(result, dict) else {}
         self.refresh_library()
-        error = str(details.get("error") or "")
         if error:
             QMessageBox.warning(
                 self,
@@ -1909,23 +2088,14 @@ class MainWindow(QMainWindow):
                     f"服务请求失败，批量任务已停止。\n\n{error}\n\n"
                     f"已完成 {int(details.get('completed', 0)):,} 张，"
                     f"跳过 {int(details.get('skipped', 0)):,} 张，"
-                    f"本地文件失败 {int(details.get('failed', 0)):,} 张。"
+                    f"本地文件失败 {int(details.get('failed', 0)):,} 张。\n\n"
+                    "修复服务问题后，可在设置中从断点继续。"
                 ),
             )
             return
         if details.get("cancelled"):
             self.show_status("批量图片处理已取消")
             return
-        embedding_error = str(details.get("embedding_error") or "")
-        if embedding_error:
-            QMessageBox.warning(
-                self,
-                "向量生成已跳过",
-                (
-                    "OCR 和图片描述已继续完成，但当前向量模型或 /embeddings 接口不可用，"
-                    f"本次未生成语义搜索向量。\n\n{embedding_error}"
-                ),
-            )
         self.show_status(
             f"批量处理完成：成功 {int(details.get('completed', 0)):,} 张，"
             f"跳过 {int(details.get('skipped', 0)):,} 张，"
@@ -1965,7 +2135,6 @@ class MainWindow(QMainWindow):
             self.settings.get("ai_base_url", ""),
             self.settings.get("ai_api_key", ""),
             self.settings.get("ai_vision_model", ""),
-            self.settings.get("ai_embedding_model", ""),
         )
 
     @staticmethod
@@ -2175,15 +2344,15 @@ class MainWindow(QMainWindow):
                             self.detail.set_ai_busy(False)
                         else:
                             self.detail.set_ocr_busy(False)
-            if self._semantic_request is not None:
-                token, signals = self._semantic_request
+            if self._expanded_search_request is not None:
+                token, signals = self._expanded_search_request
                 if token in cancelled_tokens:
                     if token_done(token):
-                        self._semantic_request = None
+                        self._expanded_search_request = None
                         self._async_signals.discard(signals)
                         self._finish_async_token(token)
-                        self.semantic_button.setEnabled(True)
-                        self.semantic_button.setText("语义搜索")
+                        self.expanded_search_button.setEnabled(True)
+                        self.expanded_search_button.setText("扩大搜索")
                     else:
                         pending = True
             if self._copy_request is not None:
@@ -2326,16 +2495,12 @@ class MainWindow(QMainWindow):
         if automatic:
             self._automatic_ai_items.add(item_id)
         signals.succeeded.connect(
-            lambda result_item_id, description, embedding, request_token=token, request_signals=signals, request_hash=expected_content_hash, request_provider=service.embedding_provider, request_model=service.embedding_model, request_revision=service.EMBEDDING_REVISION: self._ai_succeeded(
+            lambda result_item_id, description, _unused, request_token=token, request_signals=signals, request_hash=expected_content_hash: self._ai_succeeded(
                 request_token,
                 request_signals,
                 result_item_id,
                 description,
-                embedding,
                 request_hash,
-                request_provider,
-                request_model,
-                request_revision,
             )
         )
         signals.failed.connect(
@@ -2352,24 +2517,9 @@ class MainWindow(QMainWindow):
                     cancel_event,
                     expected_sha256=expected_content_hash,
                 )
-                embedding_warning = ""
-                try:
-                    embedding = service.embed(description, cancel_event)
-                except OperationCancelled:
-                    raise
-                except Exception as exc:
-                    embedding = None
-                    embedding_warning = str(exc)
                 image_snapshot.require_current()
                 if not cancel_event.is_set():
-                    signals.succeeded.emit(
-                        item_id,
-                        description,
-                        {
-                            "embedding": embedding,
-                            "embedding_warning": embedding_warning,
-                        },
-                    )
+                    signals.succeeded.emit(item_id, description, None)
             except OperationCancelled:
                 return
             except Exception as exc:
@@ -2528,75 +2678,44 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "OCR 识别失败", message)
 
-    def semantic_search(self) -> None:
+    def expand_search(self) -> None:
         query = self.search.text().strip()
         if not query:
-            QMessageBox.information(self, "语义搜索", "先输入要查找的画面或含义。")
+            QMessageBox.information(self, "扩大搜索", "先输入要扩大查找范围的搜索词。")
             return
-        service = AIService(
-            self.settings.get("ai_base_url", ""),
-            self.settings.get("ai_api_key", ""),
-            self.settings.get("ai_vision_model", ""),
-            self.settings.get("ai_embedding_model", ""),
-        )
-        if not service.configured or not service.embedding_model:
-            QMessageBox.information(self, "语义搜索未配置", "请在设置中填写兼容服务、视觉模型和向量模型。")
+        service = self._ai_service()
+        if not service.configured:
+            QMessageBox.information(
+                self,
+                "AI 服务未配置",
+                "请先在设置中填写兼容服务地址和视觉模型名称。",
+            )
             self.open_settings()
             return
-        embedded_count = self.database.embedded_item_count(
-            embedding_provider=service.embedding_provider,
-            embedding_model=service.embedding_model,
-            embedding_revision=service.EMBEDDING_REVISION,
-        )
-        if not embedded_count:
-            QMessageBox.information(self, "没有语义索引", "请先在图片详情中生成 AI 描述和向量。")
-            return
         self.search_timer.stop()
-        self._cancel_semantic_request()
-        self.semantic_button.setEnabled(False)
-        self.semantic_button.setText("搜索中…")
+        self._cancel_expanded_search_request()
+        self.expanded_search_button.setEnabled(False)
+        self.expanded_search_button.setText("扩展中…")
         token = object()
         signals = AsyncSignals()
         self._async_signals.add(signals)
-        self._semantic_request = (token, signals)
+        self._expanded_search_request = (token, signals)
         signals.succeeded.connect(
-            lambda item_id, text, ordered_ids, request_token=token, request_signals=signals, request_query=query: self._semantic_succeeded(
-                request_token, request_signals, request_query, item_id, text, ordered_ids
+            lambda _item_id, _text, terms, request_token=token, request_signals=signals, request_query=query: self._expanded_search_succeeded(
+                request_token, request_signals, request_query, terms
             )
         )
         signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals: self._semantic_failed(
+            lambda message, request_token=token, request_signals=signals: self._expanded_search_failed(
                 request_token, request_signals, message
             )
         )
 
         def work(cancel_event: threading.Event) -> None:
             try:
-                query_vector = service.embed(query, cancel_event)
-                if not query_vector:
-                    raise RuntimeError("AI 服务未返回可用的 embedding。")
-                scored = []
-                after_id = 0
-                while True:
-                    rows = self.database.embedded_items_batch(
-                        after_id,
-                        256,
-                        embedding_provider=service.embedding_provider,
-                        embedding_model=service.embedding_model,
-                        embedding_dimensions=len(query_vector),
-                        embedding_revision=service.EMBEDDING_REVISION,
-                    )
-                    if not rows:
-                        break
-                    for row in rows:
-                        if cancel_event.is_set():
-                            raise OperationCancelled("Operation cancelled")
-                        vector = json.loads(row["embedding"])
-                        scored.append((service.similarity(query_vector, vector), row["id"]))
-                    after_id = int(rows[-1]["id"])
-                scored.sort(reverse=True)
+                terms = service.expand_search_query(query, cancel_event)
                 if not cancel_event.is_set():
-                    signals.succeeded.emit(-1, "", [item_id for score, item_id in scored if score > 0])
+                    signals.succeeded.emit(-1, "", terms)
             except OperationCancelled:
                 return
             except Exception as exc:
@@ -2607,63 +2726,60 @@ class MainWindow(QMainWindow):
             self._start_bounded_task(
                 token,
                 work,
-                estimated_bytes=min(max(embedded_count, 1) * 512, 8 * 1024 * 1024),
             )
-        except TaskCapacityExceeded as exc:
-            self._semantic_request = None
+        except (TaskCapacityExceeded, RuntimeError) as exc:
+            self._expanded_search_request = None
             self._async_signals.discard(signals)
-            self.semantic_button.setEnabled(True)
-            self.semantic_button.setText("语义搜索")
-            QMessageBox.warning(self, "语义搜索繁忙", str(exc))
+            self.expanded_search_button.setEnabled(True)
+            self.expanded_search_button.setText("扩大搜索")
+            QMessageBox.warning(self, "扩大搜索暂时不可用", str(exc))
 
-    def _semantic_succeeded(self, token: object, signals: AsyncSignals, query: str, _item_id: int, _text: str, ordered_ids) -> None:
+    def _expanded_search_succeeded(
+        self,
+        token: object,
+        signals: AsyncSignals,
+        query: str,
+        terms: object,
+    ) -> None:
         self._async_signals.discard(signals)
         self._finish_async_token(token)
         if self._closing:
             return
-        if self._semantic_request != (token, signals):
+        if self._expanded_search_request != (token, signals):
             return
-        self._semantic_request = None
-        self.semantic_button.setEnabled(True)
-        self.semantic_button.setText("语义搜索")
+        self._expanded_search_request = None
+        self.expanded_search_button.setEnabled(True)
+        self.expanded_search_button.setText("扩大搜索")
         if self.search.text().strip() != query:
             return
-        base_items = self.database.query_items(
-            kind=self.current_kind,
-            favorite=self.current_favorite,
-            day=self.current_day,
-            recent_days=7 if self.current_recent else None,
-            collection_id=self.current_collection,
-            tag_id=self.current_tag,
-            sort=self.current_sort,
-            summary_only=True,
-        )
-        records = {row["id"]: row for row in base_items}
-        self._apply_items([records[item_id] for item_id in ordered_ids if item_id in records])
-        self._semantic_ordered_ids = list(ordered_ids)
-        self._semantic_results_active = True
-        self.result_count.setText(f"{len(self.current_items):,} 项 · 按语义相关度")
+        if not isinstance(terms, list) or not terms:
+            QMessageBox.warning(self, "扩大搜索失败", "AI 服务没有返回可用的扩展搜索词。")
+            return
+        self._expanded_search_query = query
+        self._expanded_search_terms = tuple(terms)
+        self.refresh_items()
+        self.show_status(f"搜索范围已扩大：使用 {len(self._expanded_search_terms):,} 个搜索词")
 
-    def _semantic_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
+    def _expanded_search_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
         self._async_signals.discard(signals)
         self._finish_async_token(token)
         if self._closing:
             return
-        if self._semantic_request != (token, signals):
+        if self._expanded_search_request != (token, signals):
             return
-        self._semantic_request = None
-        self.semantic_button.setEnabled(True)
-        self.semantic_button.setText("语义搜索")
-        QMessageBox.warning(self, "语义搜索失败", message)
+        self._expanded_search_request = None
+        self.expanded_search_button.setEnabled(True)
+        self.expanded_search_button.setText("扩大搜索")
+        QMessageBox.warning(self, "扩大搜索失败", message)
 
-    def _cancel_semantic_request(self) -> None:
-        if self._semantic_request is None:
+    def _cancel_expanded_search_request(self) -> None:
+        if self._expanded_search_request is None:
             return
-        self._cancel_request(self._semantic_request)
-        self._semantic_request = None
-        if hasattr(self, "semantic_button"):
-            self.semantic_button.setEnabled(True)
-            self.semantic_button.setText("语义搜索")
+        self._cancel_request(self._expanded_search_request)
+        self._expanded_search_request = None
+        if hasattr(self, "expanded_search_button"):
+            self.expanded_search_button.setEnabled(True)
+            self.expanded_search_button.setText("扩大搜索")
 
     def _ai_succeeded(
         self,
@@ -2671,42 +2787,25 @@ class MainWindow(QMainWindow):
         signals: AsyncSignals,
         item_id: int,
         description: str,
-        embedding,
         expected_content_hash: str | None = None,
-        embedding_provider: str | None = None,
-        embedding_model: str | None = None,
-        embedding_revision: int | None = None,
     ) -> None:
         self._async_signals.discard(signals)
         self._finish_async_token(token)
         if self._ai_requests.get(item_id) != (token, signals):
             return
-        embedding_warning = ""
-        if isinstance(embedding, dict) and "embedding" in embedding:
-            embedding_warning = str(embedding.get("embedding_warning") or "")
-            embedding = embedding.get("embedding")
         if self._closing or self._quit_in_progress:
             self._automatic_ai_items.discard(item_id)
             return
         try:
-            embedding_kwargs = {}
-            if embedding_provider is not None or embedding_model is not None or embedding_revision is not None:
-                embedding_kwargs = {
-                    "embedding_provider": embedding_provider,
-                    "embedding_model": embedding_model,
-                    "embedding_revision": embedding_revision,
-                }
             if expected_content_hash is None:
                 saved = self.database.get_item(item_id) is not None
                 if saved:
-                    self.database.update_ai(item_id, description, embedding, **embedding_kwargs)
+                    self.database.update_ai(item_id, description)
             else:
                 saved = self.database.update_ai_if_current(
                     item_id,
                     expected_content_hash,
                     description,
-                    embedding,
-                    **embedding_kwargs,
                 )
         except Exception as exc:
             self._ai_failed(token, signals, item_id, f"AI 结果无法保存：{exc}")
@@ -2723,10 +2822,7 @@ class MainWindow(QMainWindow):
         self._refresh_after_mutation()
         if self.current_item_id == item_id:
             self.update_detail(item_id)
-        if embedding_warning:
-            self.show_error_status(f"AI 描述已生成，但向量生成失败：{embedding_warning}")
-        else:
-            self.show_status("AI 描述已生成")
+        self.show_status("AI 描述已生成")
 
     def _ai_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
         self._async_signals.discard(signals)
@@ -2832,9 +2928,9 @@ class MainWindow(QMainWindow):
             current_id = self.current_item_id
             self.detail.set_ai_busy(bool(current_id and current_id in self._ai_requests))
             self.detail.set_ocr_busy(bool(current_id and current_id in self._ocr_requests))
-            if self._semantic_request is None:
-                self.semantic_button.setEnabled(True)
-                self.semantic_button.setText("语义搜索")
+            if self._expanded_search_request is None:
+                self.expanded_search_button.setEnabled(True)
+                self.expanded_search_button.setText("扩大搜索")
             self._schedule_cancelled_request_cleanup(cancelled_request_tokens)
             return False
 
@@ -2892,10 +2988,10 @@ class MainWindow(QMainWindow):
                 return abort(monitoring_was_active)
             setattr(self, attribute, None)
         self.backup_timer.stop()
-        semantic_request = self._semantic_request
-        self._cancel_request(semantic_request)
-        if semantic_request is not None:
-            cancelled_request_tokens.add(semantic_request[0])
+        expanded_search_request = self._expanded_search_request
+        self._cancel_request(expanded_search_request)
+        if expanded_search_request is not None:
+            cancelled_request_tokens.add(expanded_search_request[0])
         for request in list(self._ai_requests.values()):
             self._cancel_request(request)
             cancelled_request_tokens.add(request[0])
@@ -2913,9 +3009,9 @@ class MainWindow(QMainWindow):
             remaining(), require_bounded=True, process_events=False
         ):
             return abort(monitoring_was_active)
-        self._semantic_request = None
-        self.semantic_button.setEnabled(True)
-        self.semantic_button.setText("语义搜索")
+        self._expanded_search_request = None
+        self.expanded_search_button.setEnabled(True)
+        self.expanded_search_button.setText("扩大搜索")
         self._ai_requests.clear()
         self._ocr_requests.clear()
         self._copy_request = None
@@ -3003,10 +3099,10 @@ class MainWindow(QMainWindow):
         self._cancel_request(self._backup_request)
         self._backup_request = None
         cancelled_request_tokens: set[object] = set()
-        semantic_request = self._semantic_request
-        self._cancel_request(semantic_request)
-        if semantic_request is not None:
-            cancelled_request_tokens.add(semantic_request[0])
+        expanded_search_request = self._expanded_search_request
+        self._cancel_request(expanded_search_request)
+        if expanded_search_request is not None:
+            cancelled_request_tokens.add(expanded_search_request[0])
         for request in list(self._ai_requests.values()):
             self._cancel_request(request)
             cancelled_request_tokens.add(request[0])
@@ -3034,9 +3130,9 @@ class MainWindow(QMainWindow):
                 "AI、OCR 或图片处理任务仍在结束。ClipSave 暂时不会退出，请稍后再次退出。",
             )
             return False
-        self._semantic_request = None
-        self.semantic_button.setEnabled(True)
-        self.semantic_button.setText("语义搜索")
+        self._expanded_search_request = None
+        self.expanded_search_button.setEnabled(True)
+        self.expanded_search_button.setText("扩大搜索")
         self._ai_requests.clear()
         self._ocr_requests.clear()
         self._copy_request = None

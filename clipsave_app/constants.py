@@ -40,7 +40,7 @@ def _configured_local_root() -> Path:
 
 
 APP_NAME = "ClipSave"
-APP_VERSION = "0.3.5"
+APP_VERSION = "1.0.0"
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
 LOCAL_ROOT = _configured_local_root()
 DATA_DIR = LOCAL_ROOT / "Data"
@@ -61,7 +61,6 @@ MAX_IMAGE_PIXELS = 100_000_000
 MAX_CLIPBOARD_TEXT_BYTES = 4 * 1024 * 1024
 MAX_CLIPBOARD_IMAGE_BYTES = 256 * 1024 * 1024
 MAX_AI_RESPONSE_BYTES = 8 * 1024 * 1024
-MAX_EMBEDDING_DIMENSIONS = 65_536
 
 TYPE_LABELS = {
     "image": "图片",

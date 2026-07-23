@@ -13,7 +13,7 @@ ClipSave is a local-first Windows clipboard library for automatically saving, br
 - OpenAI-compatible vision OCR with searchable recognized text
 - Collapsible navigation, an optional detail panel, and Windows acrylic surfaces
 - System-tray resident mode, single-instance protection, and the global `Ctrl+Alt+V` wake-up shortcut
-- Optional OpenAI-compatible image descriptions and semantic search
+- Optional OpenAI-compatible image descriptions and on-demand AI-expanded local search
 
 ## Download
 
@@ -42,7 +42,9 @@ Online AI is a separate, explicit feature. It runs only after the user configure
 
 ### Configure Image AI
 
-In **Settings**, enter the provider Base URL and vision model name; enter an API key only when the provider requires authentication. The **automatic OCR** and **automatic image description** switches are independent and disabled by default. When enabled, each newly captured or imported image is processed in the background. OCR sends the fixed prompt `ocr this`; image descriptions use ClipSave's built-in retrieval-oriented prompt and can optionally be embedded for semantic search.
+In **Settings**, enter the provider Base URL and vision model name; enter an API key only when the provider requires authentication. The **automatic OCR** and **automatic image description** switches are independent and disabled by default. When enabled, each newly captured or imported image is processed in the background. OCR sends the fixed prompt `ocr this`, while image descriptions use ClipSave's built-in retrieval-oriented prompt.
+
+When ordinary local search is too narrow, **Expand Search** sends only the current search phrase to the configured model. The returned synonyms and related expressions are combined with OR and matched locally against titles, content, tags, notes, OCR text, and AI descriptions. ClipSave does not send library records to the model for expanded search and does not require an embedding model or vector index.
 
 New installations start with automatic capture paused. Existing valid settings preserve the previous capture state; if the settings file is damaged, ClipSave resumes in the paused state.
 

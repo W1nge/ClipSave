@@ -11,6 +11,8 @@ from PySide6.QtGui import QGuiApplication
 WM_NCCALCSIZE = 0x0083
 WM_NCACTIVATE = 0x0086
 WM_GETMINMAXINFO = 0x0024
+WM_WINDOWPOSCHANGED = 0x0047
+WM_DPICHANGED = 0x02E0
 WS_THICKFRAME = 0x00040000
 GWL_STYLE = -16
 
@@ -192,6 +194,53 @@ def restore_native_window(hwnd: int) -> bool:
         _user32().ShowWindow(hwnd, SW_RESTORE)
         return True
     except (AttributeError, OSError, ValueError):
+        return False
+
+
+def synchronize_maximized_work_area(hwnd: int) -> bool:
+    """Realign a moved maximized window to its new monitor's physical work area."""
+    if not is_windows_qt_platform() or not hwnd:
+        return False
+    try:
+        user32 = _user32()
+        if not user32.IsZoomed(hwnd):
+            return False
+        monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return False
+        width = info.rcWork.right - info.rcWork.left
+        height = info.rcWork.bottom - info.rcWork.top
+        if width <= 0 or height <= 0:
+            return False
+
+        current = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(current)):
+            return False
+        current_bounds = (current.left, current.top, current.right, current.bottom)
+        target_bounds = (
+            info.rcWork.left,
+            info.rcWork.top,
+            info.rcWork.right,
+            info.rcWork.bottom,
+        )
+        if current_bounds == target_bounds:
+            return True
+
+        flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+        return bool(
+            user32.SetWindowPos(
+                hwnd,
+                None,
+                info.rcWork.left,
+                info.rcWork.top,
+                width,
+                height,
+                flags,
+            )
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
         return False
 
 

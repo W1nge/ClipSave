@@ -16,11 +16,24 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from clipsave_app.app import create_app_icon
+from clipsave_app.bulk_checkpoint import load_checkpoint
 from clipsave_app.database import ImportFileResult, LibraryDatabase
 from clipsave_app.main_window import AsyncSignals, MainWindow
 from clipsave_app.settings import Settings
-from clipsave_app.widgets import DateDialog, DraggableBar, MarkdownDialog, SettingsDialog, Sidebar
-from clipsave_app.windows_frame import MINMAXINFO, WM_GETMINMAXINFO, WM_NCACTIVATE
+from clipsave_app.widgets import (
+    DateDialog,
+    DraggableBar,
+    MarkdownDialog,
+    SettingsDialog,
+    Sidebar,
+    TextDialog,
+)
+from clipsave_app.windows_frame import (
+    MINMAXINFO,
+    WM_GETMINMAXINFO,
+    WM_NCACTIVATE,
+    WM_WINDOWPOSCHANGED,
+)
 
 
 class MainWindowTests(unittest.TestCase):
@@ -133,6 +146,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(dialog.dark_theme_switch.isEnabled())
         self.assertFalse(dialog.auto_ocr.isChecked())
         self.assertFalse(dialog.auto_description.isChecked())
+        self.assertFalse(hasattr(dialog, "embedding_model"))
         self.assertEqual(dialog.auto_ocr.text(), "图片自动 OCR")
         self.assertEqual(dialog.auto_description.text(), "图片自动生成描述")
         self.assertEqual(dialog.bulk_image_button.text(), "一键 OCR 并生成全部图片描述")
@@ -220,11 +234,12 @@ class MainWindowTests(unittest.TestCase):
         with patch(
             "clipsave_app.main_window.QMessageBox.question",
             return_value=QMessageBox.StandardButton.Yes,
-        ):
+        ), patch.object(self.window, "start_bulk_image_processing") as start_bulk:
             self.window._confirm_bulk_image_processing(dialog)
         self.assertTrue(dialog.bulk_processing_confirmed)
-        self.assertEqual(dialog.result(), 1)
+        self.assertEqual(dialog.result(), 0)
         self.assertEqual(self.settings.get("ai_base_url"), "http://localhost/v1")
+        start_bulk.assert_called_once_with()
         dialog.close()
 
     def test_bulk_image_processing_runs_ocr_then_description_serially(self):
@@ -239,7 +254,6 @@ class MainWindowTests(unittest.TestCase):
             {
                 "ai_base_url": "http://localhost/v1",
                 "ai_vision_model": "vision",
-                "ai_embedding_model": "",
             }
         )
 
@@ -249,10 +263,7 @@ class MainWindowTests(unittest.TestCase):
         ) as ocr, patch(
             "clipsave_app.main_window.AIService.describe_image",
             side_effect=["first description", "second description"],
-        ) as describe, patch(
-            "clipsave_app.main_window.AIService.embed",
-            return_value=None,
-        ) as embed:
+        ) as describe:
             self.window.start_bulk_image_processing()
             worker = start_task.call_args.args[1]
             worker(threading.Event())
@@ -260,7 +271,6 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertEqual(ocr.call_count, 2)
         self.assertEqual(describe.call_count, 2)
-        embed.assert_not_called()
         self.assertIsNone(self.window._bulk_image_request)
         for item_id, expected_ocr, expected_description in zip(
             image_ids,
@@ -271,10 +281,10 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(item["ocr_text"], expected_ocr)
             self.assertEqual(item["ai_description"], expected_description)
 
-    def test_bulk_image_processing_continues_after_embedding_endpoint_failure(self):
+    def test_bulk_image_processing_resumes_at_description_after_service_failure(self):
         image_ids = []
         for index, color in enumerate(("red", "blue"), 1):
-            path = Path(self.temp.name) / f"bulk-embedding-{index}.png"
+            path = Path(self.temp.name) / f"resume-{index}.png"
             image = QImage(8, 8, QImage.Format.Format_RGB32)
             image.fill(QColor(color))
             self.assertTrue(image.save(str(path), "PNG"))
@@ -283,43 +293,95 @@ class MainWindowTests(unittest.TestCase):
             {
                 "ai_base_url": "http://localhost/v1",
                 "ai_vision_model": "vision",
-                "ai_embedding_model": "unsupported-embedding",
             }
         )
 
         with patch.object(self.window, "_start_async_task") as start_task, patch(
             "clipsave_app.main_window.AIService.ocr_image",
-            side_effect=["first OCR", "second OCR"],
-        ) as ocr, patch(
+            return_value="first OCR",
+        ) as first_ocr, patch(
             "clipsave_app.main_window.AIService.describe_image",
-            side_effect=["first description", "second description"],
-        ) as describe, patch(
-            "clipsave_app.main_window.AIService.embed",
-            side_effect=RuntimeError("embedding endpoint returned 404"),
-        ) as embed, patch(
+            side_effect=RuntimeError("AI 服务返回 429"),
+        ) as first_describe, patch(
             "clipsave_app.main_window.QMessageBox.warning"
-        ) as warning:
+        ):
             self.window.start_bulk_image_processing()
-            worker = start_task.call_args.args[1]
-            worker(threading.Event())
+            start_task.call_args.args[1](threading.Event())
             self.app.processEvents()
 
-        self.assertEqual(ocr.call_count, 2)
-        self.assertEqual(describe.call_count, 2)
-        embed.assert_called_once()
-        self.assertIsNone(self.window._bulk_image_request)
-        self.assertEqual(warning.call_count, 1)
-        self.assertEqual(warning.call_args.args[1], "向量生成已跳过")
-        for item_id, expected_description in zip(
-            image_ids,
-            ("first description", "second description"),
-        ):
-            item = self.database.get_item(item_id)
-            self.assertEqual(item["ai_description"], expected_description)
-            self.assertIsNone(item["embedding"])
+        checkpoint = load_checkpoint(self.window._bulk_image_checkpoint_path)
+        self.assertEqual(checkpoint.stage, "description")
+        self.assertEqual(checkpoint.next_index, 0)
+        first_ocr.assert_called_once()
+        first_describe.assert_called_once()
+        self.assertTrue(self.window.bulk_image_progress_snapshot()["resumable"])
 
-    def test_manual_description_is_saved_when_embedding_endpoint_fails(self):
-        path = Path(self.temp.name) / "manual-embedding-failure.png"
+        with patch.object(self.window, "_start_async_task") as start_task, patch(
+            "clipsave_app.main_window.AIService.ocr_image",
+            return_value="second OCR",
+        ) as resumed_ocr, patch(
+            "clipsave_app.main_window.AIService.describe_image",
+            side_effect=["first description", "second description"],
+        ) as resumed_describe:
+            self.window.start_bulk_image_processing()
+            start_task.call_args.args[1](threading.Event())
+            self.app.processEvents()
+
+        resumed_ocr.assert_called_once()
+        self.assertEqual(resumed_describe.call_count, 2)
+        self.assertIsNone(load_checkpoint(self.window._bulk_image_checkpoint_path))
+        self.assertEqual(self.database.get_item(image_ids[0])["ocr_text"], "first OCR")
+        self.assertEqual(
+            self.database.get_item(image_ids[0])["ai_description"],
+            "first description",
+        )
+        self.assertEqual(self.database.get_item(image_ids[1])["ocr_text"], "second OCR")
+
+    def test_settings_shows_resumable_bulk_image_progress(self):
+        self.window._bulk_image_progress_state = {
+            "active": False,
+            "resumable": True,
+            "processed": 7,
+            "total": 20,
+            "phase": "已暂停，可继续处理",
+            "error": "AI 服务返回 429",
+        }
+
+        dialog = SettingsDialog(self.settings, self.window)
+        dialog._refresh_bulk_progress()
+
+        self.assertEqual(dialog.bulk_progress.value(), 7)
+        self.assertEqual(dialog.bulk_progress.maximum(), 20)
+        self.assertEqual(dialog.bulk_image_button.text(), "继续 OCR 与描述")
+        self.assertIn("7/20", dialog.bulk_progress_label.text().replace(",", ""))
+        dialog.close()
+
+    def test_bulk_image_start_failure_leaves_resumable_progress(self):
+        image_path = Path(self.temp.name) / "bulk-start-failure.png"
+        image = QImage(8, 8, QImage.Format.Format_RGB32)
+        image.fill(QColor("white"))
+        self.assertTrue(image.save(str(image_path), "PNG"))
+        self.database.add_image(image_path)
+        self.settings.data.update(
+            {
+                "ai_base_url": "http://localhost/v1",
+                "ai_vision_model": "vision",
+            }
+        )
+
+        with patch.object(
+            self.window, "_start_async_task", side_effect=RuntimeError("thread unavailable")
+        ), patch("clipsave_app.main_window.QMessageBox.warning"):
+            self.window.start_bulk_image_processing()
+
+        state = self.window.bulk_image_progress_snapshot()
+        self.assertFalse(state["active"])
+        self.assertTrue(state["resumable"])
+        self.assertEqual(state["processed"], 0)
+        self.assertIn("thread unavailable", state["error"])
+
+    def test_manual_description_is_saved_without_a_second_ai_request(self):
+        path = Path(self.temp.name) / "manual-description.png"
         image = QImage(8, 8, QImage.Format.Format_RGB32)
         image.fill(QColor("white"))
         self.assertTrue(image.save(str(path), "PNG"))
@@ -328,17 +390,13 @@ class MainWindowTests(unittest.TestCase):
             {
                 "ai_base_url": "http://localhost/v1",
                 "ai_vision_model": "vision",
-                "ai_embedding_model": "unsupported-embedding",
             }
         )
 
         with patch.object(self.window, "_start_bounded_task") as start_task, patch(
             "clipsave_app.main_window.AIService.describe_image",
             return_value="saved description",
-        ), patch(
-            "clipsave_app.main_window.AIService.embed",
-            side_effect=RuntimeError("embedding endpoint returned 404"),
-        ), patch.object(self.window, "show_error_status") as status:
+        ) as describe, patch.object(self.window, "show_status") as status:
             self.assertTrue(self.window.generate_ai_description(item_id))
             worker = start_task.call_args.args[1]
             worker(threading.Event())
@@ -348,8 +406,9 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(item["ai_description"], "saved description")
         self.assertIsNone(item["embedding"])
         self.assertNotIn(item_id, self.window._ai_requests)
+        describe.assert_called_once()
         status.assert_called_once()
-        self.assertIn("向量生成失败", status.call_args.args[0])
+        self.assertEqual(status.call_args.args[0], "AI 描述已生成")
 
     def test_detail_splitter_resizes_the_visible_panel(self):
         item_id = self.window.current_items[0]["id"]
@@ -357,10 +416,15 @@ class MainWindowTests(unittest.TestCase):
         self.window.toggle_detail()
         self.app.processEvents()
 
-        self.assertEqual(self.window.content_splitter.handleWidth(), 8)
+        self.assertEqual(self.window.content_splitter.handleWidth(), 1)
         self.assertEqual(
             self.window.content_splitter.handle(1).cursor().shape(),
             Qt.CursorShape.SizeHorCursor,
+        )
+        self.assertEqual(self.window.detail.verticalScrollBar().width(), 8)
+        self.assertEqual(
+            self.window.detail.verticalScrollBar().objectName(),
+            "AutoHideScrollBar",
         )
         initial_width = self.window.detail.width()
         target_width = 460
@@ -526,6 +590,34 @@ class MainWindowTests(unittest.TestCase):
             message.lParam,
             (1200, 660),
         )
+
+    def test_windows_monitor_move_schedules_one_maximized_bounds_sync(self):
+        message = wintypes.MSG()
+        message.hWnd = int(self.window.winId())
+        message.message = WM_WINDOWPOSCHANGED
+
+        with patch.object(
+            self.window, "_schedule_maximized_bounds_sync"
+        ) as schedule, patch(
+            "PySide6.QtWidgets.QMainWindow.nativeEvent", return_value=(False, 0)
+        ):
+            self.window.nativeEvent(
+                b"windows_generic_MSG", ctypes.addressof(message)
+            )
+
+        schedule.assert_called_once_with()
+
+    def test_maximized_bounds_sync_uses_native_physical_work_area(self):
+        with patch(
+            "clipsave_app.main_window.is_windows_qt_platform", return_value=True
+        ), patch(
+            "clipsave_app.main_window.synchronize_maximized_work_area"
+        ) as synchronize:
+            self.window._maximized_bounds_sync_pending = True
+            self.window._synchronize_maximized_bounds()
+
+        self.assertFalse(self.window._maximized_bounds_sync_pending)
+        synchronize.assert_called_once_with(int(self.window.winId()))
 
     def test_toggle_maximized_uses_native_restore_for_aero_snap(self):
         with patch(
@@ -710,7 +802,7 @@ class MainWindowTests(unittest.TestCase):
         self.app.processEvents()
         controls = [
             self.window.search,
-            self.window.semantic_button,
+            self.window.expanded_search_button,
             self.window.sort_button,
             self.window.grid_button,
             self.window.list_button,
@@ -801,14 +893,15 @@ class MainWindowTests(unittest.TestCase):
         show_confirmation.assert_called_once_with()
         self.assertIsNone(self.window._copy_request)
 
-    def test_capture_refresh_preserves_semantic_results_and_error_tooltip(self):
-        self.window._semantic_results_active = True
-        with patch.object(self.window, "_refresh_navigation_metadata") as refresh_metadata, patch.object(
-            self.window, "refresh_library"
-        ) as refresh_library:
+    def test_capture_refresh_preserves_expanded_search_and_error_tooltip(self):
+        self.window.search.setText("missing phrase")
+        self.window.search_timer.stop()
+        self.window._expanded_search_query = "missing phrase"
+        self.window._expanded_search_terms = ("first",)
+        with patch.object(self.window, "refresh_library") as refresh_library:
             self.window.on_captured(1)
-        refresh_metadata.assert_called_once_with()
-        refresh_library.assert_not_called()
+        refresh_library.assert_called_once_with()
+        self.assertTrue(self.window._expanded_search_active())
 
         old_generation = self.window._status_generation
         self.window.show_error_status("backup unavailable")
@@ -876,26 +969,50 @@ class MainWindowTests(unittest.TestCase):
         notify.assert_not_called()
         show_error.assert_called_once()
 
-    def test_empty_semantic_search_uses_fluent_information_dialog(self):
+    def test_empty_expanded_search_uses_fluent_information_dialog(self):
         with patch("clipsave_app.main_window.QMessageBox.information") as information:
-            self.window.semantic_search()
+            self.window.expand_search()
 
         information.assert_called_once_with(
             self.window,
-            "语义搜索",
-            "先输入要查找的画面或含义。",
+            "扩大搜索",
+            "先输入要扩大查找范围的搜索词。",
         )
 
-    def test_favorite_mutation_preserves_semantic_result_order(self):
+    def test_expanded_search_uses_or_terms_and_preserves_current_sort(self):
+        second_id = self.database.add_text("Cloudflare error dialog")
+        self.window.search.setText("找不到的蓝色报错窗口")
+        self.window.search_timer.stop()
+        self.settings.data.update(
+            {"ai_base_url": "http://localhost/v1", "ai_vision_model": "vision"}
+        )
+
+        with patch.object(self.window, "_start_bounded_task") as start_task, patch(
+            "clipsave_app.main_window.AIService.expand_search_query",
+            return_value=["找不到的蓝色报错窗口", "first", "error dialog"],
+        ):
+            self.window.expand_search()
+            worker = start_task.call_args.args[1]
+            worker(threading.Event())
+            self.app.processEvents()
+
+        self.assertTrue(self.window._expanded_search_active())
+        self.assertEqual(
+            [item["id"] for item in self.window.current_items],
+            [second_id, self.database.query_items(query="first")[0]["id"]],
+        )
+        self.assertIn("已扩大搜索", self.window.result_count.text())
+
+    def test_favorite_mutation_preserves_expanded_search_terms(self):
         item_id = self.window.current_items[0]["id"]
         self.window.search.setText("query that is not in the item")
         self.window.search_timer.stop()
-        self.window._semantic_ordered_ids = [item_id]
-        self.window._semantic_results_active = True
+        self.window._expanded_search_query = "query that is not in the item"
+        self.window._expanded_search_terms = ("first clipboard",)
 
         self.window.set_favorite(item_id, True)
 
-        self.assertTrue(self.window._semantic_results_active)
+        self.assertTrue(self.window._expanded_search_active())
         self.assertEqual([item["id"] for item in self.window.current_items], [item_id])
 
     def test_filter_clears_hidden_selection_and_only_refreshes_visible_view(self):
@@ -950,30 +1067,30 @@ class MainWindowTests(unittest.TestCase):
         active_token, active_signals = object(), AsyncSignals()
         self.window._ai_requests[first_id] = (active_token, active_signals)
         self.window._async_signals.update((stale_signals, active_signals))
-        self.window._ai_succeeded(stale_token, stale_signals, first_id, "stale description", [1.0])
+        self.window._ai_succeeded(stale_token, stale_signals, first_id, "stale description")
         self.assertEqual(self.database.get_item(first_id)["ai_description"], "")
         self.assertEqual(self.window.detail.current_item["id"], second_id)
 
         token, signals = object(), AsyncSignals()
         self.window._ai_requests[first_id] = (token, signals)
         self.window._async_signals.add(signals)
-        semantic_ids = [item["id"] for item in self.window.current_items]
-        self.window.search.setText("nonmatching semantic query")
+        expanded_ids = [item["id"] for item in self.window.current_items]
+        self.window.search.setText("nonmatching expanded query")
         self.window.search_timer.stop()
-        self.window._semantic_ordered_ids = semantic_ids
-        self.window._semantic_results_active = True
-        self.window._ai_succeeded(token, signals, first_id, "stored description", [1.0])
+        self.window._expanded_search_query = "nonmatching expanded query"
+        self.window._expanded_search_terms = ("first", "second")
+        self.window._ai_succeeded(token, signals, first_id, "stored description")
         self.assertEqual(self.database.get_item(first_id)["ai_description"], "stored description")
         self.assertEqual(self.window.detail.current_item["id"], second_id)
-        self.assertTrue(self.window._semantic_results_active)
-        self.assertEqual([item["id"] for item in self.window.current_items], semantic_ids)
+        self.assertTrue(self.window._expanded_search_active())
+        self.assertEqual([item["id"] for item in self.window.current_items], expanded_ids)
 
         previous_ids = [item["id"] for item in self.window.current_items]
         old_token, old_signals = object(), AsyncSignals()
         new_token, new_signals = object(), AsyncSignals()
-        self.window._semantic_request = (new_token, new_signals)
+        self.window._expanded_search_request = (new_token, new_signals)
         self.window._async_signals.update((old_signals, new_signals))
-        self.window._semantic_succeeded(old_token, old_signals, "", -1, "", [])
+        self.window._expanded_search_succeeded(old_token, old_signals, "", ["stale"])
         self.assertEqual([item["id"] for item in self.window.current_items], previous_ids)
 
     def test_ai_result_is_discarded_when_item_hash_changes(self):
@@ -996,7 +1113,6 @@ class MainWindowTests(unittest.TestCase):
             signals,
             item_id,
             "stale description",
-            [1.0],
             expected_hash,
         )
 
@@ -1516,12 +1632,12 @@ class MainWindowTests(unittest.TestCase):
         self.assertIs(self.window._ai_requests[item_id], ai_request)
         self.assertIs(self.window._ocr_requests[item_id], ocr_request)
 
-    def test_quit_late_failure_restores_completed_semantic_button(self):
+    def test_quit_late_failure_restores_completed_expanded_search_button(self):
         token = object()
         signals = AsyncSignals()
-        self.window._semantic_request = (token, signals)
-        self.window.semantic_button.setEnabled(False)
-        self.window.semantic_button.setText("搜索中…")
+        self.window._expanded_search_request = (token, signals)
+        self.window.expanded_search_button.setEnabled(False)
+        self.window.expanded_search_button.setText("扩展中…")
 
         with patch.object(
             self.window, "_cancel_and_wait_for_async_tasks", return_value=True
@@ -1530,9 +1646,9 @@ class MainWindowTests(unittest.TestCase):
         ), patch("clipsave_app.main_window.QMessageBox.warning"):
             self.assertFalse(self.window.quit_application())
 
-        self.assertIsNone(self.window._semantic_request)
-        self.assertTrue(self.window.semantic_button.isEnabled())
-        self.assertEqual(self.window.semantic_button.text(), "语义搜索")
+        self.assertIsNone(self.window._expanded_search_request)
+        self.assertTrue(self.window.expanded_search_button.isEnabled())
+        self.assertEqual(self.window.expanded_search_button.text(), "扩大搜索")
 
     def test_file_actions_report_errors_without_escaping_event_handlers(self):
         image_path = Path(self.temp.name) / "missing.png"
@@ -1721,6 +1837,7 @@ class MainWindowTests(unittest.TestCase):
             DateDialog(self.database.days(), self.window),
             SettingsDialog(self.settings, self.window),
             MarkdownDialog("Example", "# content", None, self.window),
+            TextDialog("Copied text", "content", self.window),
         ]
         for dialog in dialogs:
             with patch.object(dialog, "exec", return_value=0):
@@ -1731,6 +1848,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.findChildren(DateDialog), [])
         self.assertEqual(self.window.findChildren(SettingsDialog), [])
         self.assertEqual(self.window.findChildren(MarkdownDialog), [])
+        self.assertEqual(self.window.findChildren(TextDialog), [])
 
     def test_notes_and_ocr_changes_refresh_active_text_search(self):
         text_id = self.database.add_text("searchable")
@@ -1916,7 +2034,7 @@ class MainWindowTests(unittest.TestCase):
         signals = AsyncSignals()
         self.window._ai_requests[item_id] = (token, signals)
 
-        self.window._ai_succeeded(token, signals, item_id, "description", [0.1])
+        self.window._ai_succeeded(token, signals, item_id, "description")
 
         self.assertIsNone(self.window.current_item_id)
         self.assertIsNone(self.window.detail.current_item)
@@ -1937,7 +2055,7 @@ class MainWindowTests(unittest.TestCase):
         signals = AsyncSignals()
         self.window._ai_requests[item_id] = (token, signals)
 
-        self.window._ai_succeeded(token, signals, item_id, "description", [0.1])
+        self.window._ai_succeeded(token, signals, item_id, "description")
 
         self.assertEqual(self.database.get_item(item_id)["notes"], "new note")
         self.assertEqual(self.window.detail.notes.toPlainText(), "new note")
@@ -2016,19 +2134,19 @@ class MainWindowTests(unittest.TestCase):
         with self.window._async_tasks_lock:
             self.assertNotIn(token, self.window._bounded_tasks)
 
-    def test_session_abort_restores_semantic_button_after_completed_cancel(self):
+    def test_session_abort_restores_expanded_search_button_after_completed_cancel(self):
         token = object()
         signals = AsyncSignals()
-        self.window._semantic_request = (token, signals)
-        self.window.semantic_button.setEnabled(False)
-        self.window.semantic_button.setText("搜索中…")
+        self.window._expanded_search_request = (token, signals)
+        self.window.expanded_search_button.setEnabled(False)
+        self.window.expanded_search_button.setText("扩展中…")
 
         with patch.object(self.window.clipboard_service, "shutdown", return_value=False):
             self.assertFalse(self.window.quit_application_for_session_end(0.2))
 
-        self.assertIsNone(self.window._semantic_request)
-        self.assertTrue(self.window.semantic_button.isEnabled())
-        self.assertEqual(self.window.semantic_button.text(), "语义搜索")
+        self.assertIsNone(self.window._expanded_search_request)
+        self.assertTrue(self.window.expanded_search_button.isEnabled())
+        self.assertEqual(self.window.expanded_search_button.text(), "扩大搜索")
 
     def test_session_note_shutdown_does_not_synchronously_read_database(self):
         item_id = self.window.current_items[0]["id"]

@@ -20,7 +20,7 @@ QFrame#WindowTitleBar { background: rgba(255, 255, 255, 204); border: 0; }
 QWidget#Sidebar { background: rgba(255, 255, 255, 204); border: 0; }
 QScrollArea#SidebarClassificationScroll, QScrollArea#SidebarClassificationScroll > QWidget > QWidget { background: transparent; border: 0; }
 QWidget#ContentSurface { background: transparent; }
-QWidget#DetailPanel { background: #f6f6f6; border-left: 1px solid rgba(115, 129, 150, 44); }
+QWidget#DetailPanel { background: #f6f6f6; border: 0; }
 QFrame#TopBar { background: rgba(255, 255, 255, 204); border-bottom: 1px solid rgba(115,129,150,38); }
 QFrame#LibraryHeader { background: #f6f6f6; }
 QStackedWidget#ViewStack { background: #f6f6f6; }
@@ -31,6 +31,14 @@ QFrame#TagChip { background: rgba(236,240,246,210); border-radius: 6px; }
 QLabel#Muted { color: #6f7b8d; }
 QLabel#SectionTitle { font-size: 15px; font-weight: 600; color: #273247; }
 QLabel#Title { font-size: 17px; font-weight: 600; }
+QWidget#SettingsSectionHeader { min-height: 24px; background: transparent; }
+QLabel#SettingsSectionIcon { background: transparent; }
+QLabel#SettingsCaption { color: #6f7b8d; font-size: 12px; }
+QLabel#SettingsPath { color: #273247; font-size: 12px; }
+QFrame#SettingsDivider, QFrame#SettingsColumnDivider { background: rgba(105,121,145,42); border: 0; }
+QWidget#SettingsColumn, QWidget#SettingsField { background: transparent; }
+QProgressBar#BulkImageProgress { min-height: 8px; max-height: 8px; background: #e1e6ed; border: 0; border-radius: 0; text-align: center; color: transparent; }
+QProgressBar#BulkImageProgress::chunk { background: #2f7df6; border-radius: 0; }
 QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     background: #ffffff;
     border: 1px solid rgba(99,115,139,55);
@@ -91,8 +99,8 @@ QMenu::item { padding: 7px 26px 7px 12px; border-radius: 4px; }
 QMenu::item:selected { background: #e9f2ff; }
 QToolTip { background: #1f2937; color: white; border: 0; padding: 5px; }
 QSplitter::handle { background: transparent; width: 1px; }
-QSplitter#ContentSplitter::handle { background: #f6f6f6; width: 8px; }
-QSplitter#ContentSplitter::handle:hover { background: rgba(47,125,246,80); }
+QSplitter#ContentSplitter::handle { background: rgba(115,129,150,44); width: 1px; }
+QSplitter#ContentSplitter::handle:hover { background: #2f7df6; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: rgba(87,101,122,80); border-radius: 4px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -127,7 +135,7 @@ QFrame#WindowTitleBar { background: rgba(32,32,32,204); border: 0; }
 QWidget#Sidebar { background: rgba(32,32,32,204); border: 0; }
 QScrollArea#SidebarClassificationScroll, QScrollArea#SidebarClassificationScroll > QWidget > QWidget { background: transparent; border: 0; }
 QWidget#ContentSurface { background: transparent; }
-QWidget#DetailPanel { background: #202020; border-left: 1px solid #3c3c3c; }
+QWidget#DetailPanel { background: #202020; border: 0; }
 QWidget#DetailPanelContent { background: #202020; }
 QFrame#TopBar { background: rgba(32,32,32,204); border-bottom: 1px solid #3c3c3c; }
 QFrame#LibraryHeader { background: #202020; }
@@ -139,6 +147,14 @@ QFrame#TagChip { background: #353535; border-radius: 6px; }
 QLabel#Muted { color: #a7adb7; }
 QLabel#SectionTitle { font-size: 15px; font-weight: 600; color: #f2f2f2; }
 QLabel#Title { font-size: 17px; font-weight: 600; color: #ffffff; }
+QWidget#SettingsSectionHeader { min-height: 24px; background: transparent; }
+QLabel#SettingsSectionIcon { background: transparent; }
+QLabel#SettingsCaption { color: #a7adb7; font-size: 12px; }
+QLabel#SettingsPath { color: #f2f2f2; font-size: 12px; }
+QFrame#SettingsDivider, QFrame#SettingsColumnDivider { background: #3c3c3c; border: 0; }
+QWidget#SettingsColumn, QWidget#SettingsField { background: transparent; }
+QProgressBar#BulkImageProgress { min-height: 8px; max-height: 8px; background: #3a3a3a; border: 0; border-radius: 0; text-align: center; color: transparent; }
+QProgressBar#BulkImageProgress::chunk { background: #4da3ff; border-radius: 0; }
 QLabel#DetailPreview { background: #303030; border-radius: 6px; }
 QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     background: #292929;
@@ -193,8 +209,8 @@ QMenu::item { padding: 7px 26px 7px 12px; border-radius: 4px; }
 QMenu::item:selected { background: #365a80; }
 QToolTip { background: #f2f2f2; color: #202020; border: 0; padding: 5px; }
 QSplitter::handle { background: transparent; width: 1px; }
-QSplitter#ContentSplitter::handle { background: #202020; width: 8px; }
-QSplitter#ContentSplitter::handle:hover { background: rgba(77,163,255,90); }
+QSplitter#ContentSplitter::handle { background: #3c3c3c; width: 1px; }
+QSplitter#ContentSplitter::handle:hover { background: #4da3ff; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #666666; border-radius: 4px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
