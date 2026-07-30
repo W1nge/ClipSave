@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.1.0 - 2026-07-30
+
+- Rebuilt sidebar and detail-panel transitions around measured start/end geometry, linear high-refresh progress, stable layering and reversible animation transactions.
+- Added cached, monotonic card reflow for every visible row while keeping card headers, text size, image aspect ratio and unrelated controls stable.
+- Unified static and animated plain-text layout, preserving explicit line breaks while allowing URLs, paths, email addresses and other machine-readable spans to wrap one character at a time.
+- Kept detail content fixed during its horizontal reveal and removed splitter minimum-size feedback that caused one-frame jumps.
+- Strengthened OCR transcription instructions, filtered model reasoning from visible results and added high-reasoning search expansion with automatic compatibility fallback.
+
 ## 1.0.0 - 2026-07-23
 
 - Replaced embedding-based semantic search with on-demand AI query expansion. Expanded terms are OR-matched locally without uploading library records or requiring a vector model.

@@ -15,6 +15,7 @@ from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+import clipsave_app.widgets as widgets_module
 from clipsave_app.app import create_app_icon
 from clipsave_app.bulk_checkpoint import load_checkpoint
 from clipsave_app.database import ImportFileResult, LibraryDatabase
@@ -34,6 +35,18 @@ from clipsave_app.windows_frame import (
     WM_NCACTIVATE,
     WM_WINDOWPOSCHANGED,
 )
+
+
+def wait_for(predicate, timeout: float = 2.0) -> bool:
+    app = QApplication.instance()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        QTest.qWait(10)
+    app.processEvents()
+    return bool(predicate())
 
 
 class MainWindowTests(unittest.TestCase):
@@ -666,18 +679,466 @@ class MainWindowTests(unittest.TestCase):
 
         constrain.assert_not_called()
 
-    def test_sidebar_animation_suspends_grid_and_table_repaints(self):
+    def test_sidebar_animation_suspends_grid_but_keeps_table_responsive(self):
         with patch.object(self.window.grid, "set_layout_updates_suspended") as grid, patch.object(
-            self.window.table, "setUpdatesEnabled"
-        ) as table_updates, patch.object(self.window.table.viewport(), "update") as viewport_update:
+            self.window.table, "set_layout_updates_suspended"
+        ) as table:
             self.window._begin_sidebar_animation()
             self.window._end_sidebar_animation()
 
         self.assertEqual([call.args for call in grid.call_args_list], [(True,), (False,)])
+        table.assert_not_called()
+
+    def test_sidebar_progress_drives_outer_layout_and_grid_overlay_in_order(self):
+        calls = []
+        with patch.object(
+            self.window.grid,
+            "begin_sidebar_transition",
+            side_effect=lambda *_args: calls.append("begin"),
+        ), patch.object(
+            self.window.grid,
+            "set_layout_updates_suspended",
+            side_effect=lambda value: calls.append(f"layout:{value}"),
+        ), patch.object(
+            self.window.grid,
+            "set_sidebar_transition_progress",
+            side_effect=lambda _value: calls.append("progress"),
+        ), patch.object(
+            self.window.grid,
+            "finish_sidebar_transition",
+            side_effect=lambda: calls.append("finish"),
+        ), patch.object(
+            self.window.table,
+            "set_layout_updates_suspended",
+        ), patch.object(
+            self.window._body_layout,
+            "activate",
+            side_effect=lambda: calls.append("activate"),
+        ):
+            self.window._begin_sidebar_animation()
+            self.window._update_sidebar_animation(0.5)
+            self.window._end_sidebar_animation()
+
         self.assertEqual(
-            [call.args for call in table_updates.call_args_list], [(False,), (True,)]
+            calls,
+            [
+                "layout:True",
+                "begin",
+                "activate",
+                "progress",
+                "activate",
+                "layout:False",
+                "finish",
+            ],
         )
-        viewport_update.assert_called_once_with()
+
+    def test_detail_panel_animation_is_linear_and_drives_grid_overlay(self):
+        item_id = self.window.current_items[0]["id"]
+        self.window.select_item(item_id)
+        self.assertFalse(self.window.detail.isVisible())
+        self.window.toggle_detail()
+        self.window._detail_animation_timer.stop()
+        overlay = self.window.grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+        self.assertTrue(self.window._detail_animation_active)
+        self.assertTrue(self.window.detail._width_transition_active)
+        self.assertLessEqual(
+            self.window._detail_animation_timer.interval(),
+            34,
+        )
+
+        widths = []
+        content_widths = []
+        content_heights = []
+        preview_geometries = []
+        meta_geometries = []
+        card_rects = []
+        card = overlay.cards[0]
+        for progress in (0.0, 0.25, 0.5, 0.75, 1.0):
+            self.window._set_detail_animation_progress(progress)
+            self.app.processEvents()
+            widths.append(self.window.detail.width())
+            content_widths.append(self.window.detail.content_widget.width())
+            content_heights.append(self.window.detail.content_widget.height())
+            preview_geometries.append(self.window.detail.preview_stack.geometry())
+            meta_geometries.append(self.window.detail.meta.geometry())
+            card_rects.append(overlay.card_rect(card.row))
+
+        self.assertEqual(widths, sorted(widths))
+        self.assertGreater(len(set(widths)), 3)
+        self.assertEqual(
+            widths,
+            [
+                round(self.window._detail_animation_target_width * progress)
+                for progress in (0.0, 0.25, 0.5, 0.75, 1.0)
+            ],
+        )
+        self.assertEqual(len(set(content_widths)), 1)
+        self.assertEqual(len(set(content_heights)), 1)
+        self.assertEqual(len(set(preview_geometries)), 1)
+        self.assertEqual(len(set(meta_geometries)), 1)
+        self.assertTrue(self.window.detail._width_transition_layout_frozen)
+        for progress, actual in zip(
+            (0.0, 0.25, 0.5, 0.75, 1.0),
+            card_rects,
+        ):
+            self.assertEqual(
+                actual,
+                widgets_module._interpolate_rect(
+                    card.expanded_rect,
+                    card.collapsed_rect,
+                    progress,
+                ),
+            )
+
+        endpoint_rects = {
+            transition_card.row: transition_card.collapsed_rect.toRect()
+            for transition_card in overlay.cards
+        }
+        fixed_content_width = content_widths[-1]
+        self.window._finish_detail_animation()
+        self.app.processEvents()
+        self.assertFalse(self.window._detail_animation_active)
+        self.assertFalse(self.window.detail._width_transition_active)
+        self.assertFalse(self.window.detail._width_transition_layout_frozen)
+        self.assertTrue(self.window.detail.isVisible())
+        self.assertEqual(
+            self.window.detail.content_widget.width(),
+            fixed_content_width,
+            (
+                f"animated_detail={widths[-1]}, "
+                f"final_detail={self.window.detail.width()}, "
+                f"splitter={self.window.content_splitter.sizes()}"
+            ),
+        )
+        for row, expected in endpoint_rects.items():
+            self.assertEqual(
+                self.window.grid.visualRect(
+                    self.window.grid.model().index(row, 0)
+                ),
+                expected,
+            )
+
+    def test_detail_panel_rapid_reversal_reuses_one_animation_transaction(self):
+        item_id = self.window.current_items[0]["id"]
+        self.window.select_item(item_id)
+        with patch.object(
+            self.window.grid,
+            "set_layout_updates_suspended",
+            wraps=self.window.grid.set_layout_updates_suspended,
+        ) as layout_updates:
+            self.window.toggle_detail()
+            self.window._detail_animation_timer.stop()
+            self.window._set_detail_animation_progress(0.65)
+            width_before_reverse = self.window.detail.width()
+
+            self.window.hide_detail()
+            self.window._detail_animation_timer.stop()
+            self.assertTrue(self.window._detail_animation_active)
+            self.assertEqual(
+                self.window._detail_animation_start_progress,
+                0.65,
+            )
+            self.window._set_detail_animation_progress(0.35)
+            self.assertLess(self.window.detail.width(), width_before_reverse)
+
+            self.window.toggle_detail()
+            self.window._detail_animation_timer.stop()
+            self.assertTrue(self.window._detail_animation_active)
+            self.assertEqual(
+                self.window._detail_animation_start_progress,
+                0.35,
+            )
+            self.window._finish_detail_animation()
+
+        self.assertEqual(
+            [call.args for call in layout_updates.call_args_list],
+            [(True,), (False,)],
+        )
+        self.assertTrue(self.window.detail.isVisible())
+
+    def test_detail_animation_many_cards_matches_real_layout_at_both_endpoints(self):
+        for index in range(24):
+            self.database.add_text(
+                f"detail animation card {index} "
+                + ("continuous layout content " * 8)
+            )
+        self.window.refresh_library()
+        self.app.processEvents()
+        hidden_columns = self.window.grid.columns
+        item_id = self.window.current_items[0]["id"]
+        self.window.select_item(item_id)
+        self.window.toggle_detail()
+        self.window._detail_animation_timer.stop()
+        opening = self.window.grid._sidebar_transition_overlay
+        self.assertIsNotNone(opening)
+        self.assertEqual(opening.expanded_columns, hidden_columns)
+        self.assertEqual(self.window.content_splitter.sizes()[1], 0)
+
+        opening_endpoints = {
+            card.row: card.collapsed_rect.toRect()
+            for card in opening.cards
+        }
+        self.window._finish_detail_animation()
+        self.app.processEvents()
+        self.assertEqual(
+            self.window.grid.columns,
+            opening.collapsed_columns,
+        )
+        for row, expected in opening_endpoints.items():
+            self.assertEqual(
+                self.window.grid.visualRect(
+                    self.window.grid.model().index(row, 0)
+                ),
+                expected,
+            )
+
+        shown_columns = self.window.grid.columns
+        self.window.hide_detail()
+        self.window._detail_animation_timer.stop()
+        closing = self.window.grid._sidebar_transition_overlay
+        self.assertIsNotNone(closing)
+        self.assertEqual(closing.collapsed_columns, shown_columns)
+        closing_endpoints = {
+            card.row: card.expanded_rect.toRect()
+            for card in closing.cards
+        }
+        self.window._finish_detail_animation()
+        self.app.processEvents()
+        self.assertFalse(self.window.detail.isVisible())
+        self.assertEqual(self.window.grid.columns, hidden_columns)
+        for row, expected in closing_endpoints.items():
+            self.assertEqual(
+                self.window.grid.visualRect(
+                    self.window.grid.model().index(row, 0)
+                ),
+                expected,
+            )
+
+    def test_detail_animation_uses_discrete_text_states_without_frame_rerender(self):
+        for index in range(24):
+            self.database.add_text(
+                f"detail text cache {index} "
+                + (
+                    "文字只在换行和可见字符真正变化时生成新排版状态，"
+                    "其余动画帧必须复用原字号缓存。"
+                )
+                * 8
+            )
+        self.window.refresh_library()
+        self.app.processEvents()
+        self.window.select_item(self.window.current_items[0]["id"])
+
+        with patch.object(
+            self.window.grid.delegate,
+            "render_transition_preview",
+            wraps=self.window.grid.delegate.render_transition_preview,
+        ) as render_preview:
+            self.window.toggle_detail()
+            self.window._detail_animation_timer.stop()
+            overlay = self.window.grid._sidebar_transition_overlay
+            self.assertIsNotNone(overlay)
+            state_count = sum(
+                len(card.preview_states) for card in overlay.cards
+            )
+            self.assertGreater(state_count, len(overlay.cards))
+            self.assertEqual(render_preview.call_count, state_count)
+
+            rendered_at_start = render_preview.call_count
+            for progress in (0.1, 0.25, 0.5, 0.75, 0.9, 1.0):
+                self.window._set_detail_animation_progress(progress)
+                self.window.grid.viewport().repaint()
+            self.assertEqual(
+                render_preview.call_count,
+                rendered_at_start,
+            )
+
+        self.window._finish_detail_animation()
+        with patch.object(
+            self.window.grid.delegate,
+            "_paint_preview_content",
+            wraps=self.window.grid.delegate._paint_preview_content,
+        ) as paint_content:
+            self.window.hide_detail()
+            self.window._detail_animation_timer.stop()
+        self.assertEqual(paint_content.call_count, 0)
+        self.window._finish_detail_animation()
+
+    def test_rapid_sidebar_toggles_commit_layout_and_setting_once(self):
+        with patch.object(
+            self.window.grid, "set_layout_updates_suspended"
+        ) as grid_layout, patch.object(
+            self.window.table, "set_layout_updates_suspended"
+        ) as table_layout, patch.object(
+            self.window, "_save_setting"
+        ) as save_setting:
+            self.window.sidebar.set_collapsed(True)
+            QTest.qWait(35)
+            self.window.sidebar.set_collapsed(False)
+            QTest.qWait(35)
+            self.window.sidebar.set_collapsed(True)
+
+            self.assertTrue(
+                wait_for(lambda: not self.window.sidebar._width_animation_active)
+            )
+            self.assertTrue(wait_for(lambda: save_setting.call_count == 1))
+
+        self.assertEqual(
+            [call.args for call in grid_layout.call_args_list], [(True,), (False,)]
+        )
+        table_layout.assert_not_called()
+        save_setting.assert_called_once_with("sidebar_collapsed", True)
+
+    def test_sidebar_animation_moves_real_page_geometry_monotonically(self):
+        samples = []
+        self.window.sidebar.width_animation_progress.connect(
+            lambda progress: samples.append(
+                (
+                    progress,
+                    self.window.sidebar.width(),
+                    self.window.sidebar.minimumWidth(),
+                    self.window.sidebar.maximumWidth(),
+                    self.window.top_bar.width(),
+                    self.window.library_header.width(),
+                    self.window.grid.viewport().width(),
+                )
+            )
+        )
+
+        self.window.sidebar.set_collapsed(True)
+        self.assertTrue(
+            wait_for(lambda: not self.window.sidebar._width_animation_active)
+        )
+
+        self.assertGreaterEqual(len(samples), 8)
+        sidebar_widths = [sample[1] for sample in samples]
+        self.assertTrue(
+            all(
+                left >= right
+                for left, right in zip(
+                    sidebar_widths,
+                    sidebar_widths[1:],
+                )
+            )
+        )
+        self.assertGreater(len(set(sidebar_widths)), 6)
+        for _progress, width, minimum, maximum, *_page_geometry in samples:
+            self.assertEqual((width, minimum, maximum), (width, width, width))
+        for geometry_index in (4, 5, 6):
+            values = [sample[geometry_index] for sample in samples]
+            self.assertTrue(
+                all(left <= right for left, right in zip(values, values[1:]))
+            )
+            self.assertGreater(len(set(values)), 6)
+
+    def test_list_content_column_follows_sidebar_width_monotonically(self):
+        self.window.set_view_mode("list")
+        self.app.processEvents()
+        widths = []
+
+        self.window.sidebar.set_collapsed(True)
+        deadline = time.monotonic() + 1.0
+        while (
+            self.window.sidebar._width_animation_active
+            and time.monotonic() < deadline
+        ):
+            self.app.processEvents()
+            widths.append(self.window.table.columnWidth(0))
+            QTest.qWait(5)
+        self.app.processEvents()
+        widths.append(self.window.table.columnWidth(0))
+
+        distinct = list(dict.fromkeys(widths))
+        self.assertGreater(len(distinct), 6)
+        self.assertTrue(
+            all(left <= right for left, right in zip(distinct, distinct[1:]))
+        )
+
+    def test_sidebar_toggle_does_not_reload_library_models(self):
+        with patch.object(self.window, "refresh_items") as refresh_items, patch.object(
+            self.window, "refresh_library"
+        ) as refresh_library, patch.object(
+            self.database, "query_items"
+        ) as query_items, patch.object(
+            self.window.grid, "set_items"
+        ) as grid_set_items, patch.object(
+            self.window.table, "set_items"
+        ) as table_set_items:
+            self.window.sidebar.set_collapsed(True)
+            self.assertTrue(
+                wait_for(lambda: not self.window.sidebar._width_animation_active)
+            )
+
+        refresh_items.assert_not_called()
+        refresh_library.assert_not_called()
+        query_items.assert_not_called()
+        grid_set_items.assert_not_called()
+        table_set_items.assert_not_called()
+
+    def test_sidebar_button_and_ctrl_b_use_the_same_animation_path(self):
+        self.window.sidebar.collapse_button.click()
+        self.assertTrue(
+            wait_for(lambda: not self.window.sidebar._width_animation_active)
+        )
+        self.assertTrue(self.window.sidebar.collapsed)
+
+        QTest.keyClick(
+            self.window,
+            Qt.Key.Key_B,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        self.assertTrue(
+            wait_for(lambda: not self.window.sidebar._width_animation_active)
+        )
+        self.assertFalse(self.window.sidebar.collapsed)
+
+    def test_startup_collapsed_state_does_not_write_setting_again(self):
+        root = Path(self.temp.name) / "collapsed-startup"
+        database = LibraryDatabase(root / "test.db")
+        settings = Settings(root / "settings.json")
+        settings.set("monitoring", False)
+        settings.set("sidebar_collapsed", True)
+        startup_window = None
+        try:
+            with patch.object(settings, "set", wraps=settings.set) as save_setting:
+                startup_window = MainWindow(
+                    database,
+                    settings,
+                    create_app_icon(),
+                    scan_on_start=False,
+                )
+                startup_window.show()
+                self.app.processEvents()
+
+            self.assertTrue(startup_window.sidebar.collapsed)
+            self.assertFalse(startup_window._sidebar_setting_timer.isActive())
+            self.assertIsNone(startup_window._pending_sidebar_collapsed)
+            self.assertNotIn(
+                "sidebar_collapsed",
+                [call.args[0] for call in save_setting.call_args_list],
+            )
+        finally:
+            if startup_window is not None:
+                startup_window.force_quit = True
+                startup_window.close()
+            database.close()
+
+    def test_quit_paths_flush_pending_sidebar_state(self):
+        for quit_method, args, expected in (
+            (self.window.quit_application, (), False),
+            (self.window.quit_application_for_session_end, (1.0,), True),
+        ):
+            self.window._pending_sidebar_collapsed = True
+            self.window._sidebar_setting_timer.start()
+            self.window._closing = True
+            try:
+                with patch.object(self.window, "_save_setting") as save_setting:
+                    self.assertEqual(quit_method(*args), expected)
+                save_setting.assert_called_once_with("sidebar_collapsed", True)
+                self.assertFalse(self.window._sidebar_setting_timer.isActive())
+                self.assertIsNone(self.window._pending_sidebar_collapsed)
+            finally:
+                self.window._closing = False
 
     def test_windows_resize_hit_test_only_uses_narrow_l_shaped_edges(self):
         hit = self.window._windows_resize_hit_test
@@ -1715,8 +2176,9 @@ class MainWindowTests(unittest.TestCase):
             QTest.mouseClick(
                 self.window.grid.viewport(), Qt.MouseButton.RightButton, pos=point
             )
-            self.app.processEvents()
-            self.assertFalse(self.window.detail.isVisible())
+            self.assertTrue(
+                wait_for(lambda: not self.window.detail.isVisible())
+            )
         finally:
             QApplication.setDoubleClickInterval(previous_interval)
 

@@ -42,9 +42,9 @@ Online AI is a separate, explicit feature. It runs only after the user configure
 
 ### Configure Image AI
 
-In **Settings**, enter the provider Base URL and vision model name; enter an API key only when the provider requires authentication. The **automatic OCR** and **automatic image description** switches are independent and disabled by default. When enabled, each newly captured or imported image is processed in the background. OCR sends the fixed prompt `ocr this`, while image descriptions use ClipSave's built-in retrieval-oriented prompt.
+In **Settings**, enter the provider Base URL and vision model name; enter an API key only when the provider requires authentication. The **automatic OCR** and **automatic image description** switches are independent and disabled by default. When enabled, each newly captured or imported image is processed in the background. OCR uses ClipSave's strict transcription prompt, while image descriptions use the built-in retrieval-oriented prompt.
 
-When ordinary local search is too narrow, **Expand Search** sends only the current search phrase to the configured model. The returned synonyms and related expressions are combined with OR and matched locally against titles, content, tags, notes, OCR text, and AI descriptions. ClipSave does not send library records to the model for expanded search and does not require an embedding model or vector index.
+When ordinary local search is too narrow, **Expand Search** sends only the current search phrase to the configured model. It requests high reasoning effort when the service supports the OpenAI-style parameter and automatically retries without that parameter when the service rejects it. The returned synonyms and related expressions are combined with OR and matched locally against titles, content, tags, notes, OCR text, and AI descriptions. ClipSave does not send library records to the model for expanded search and does not require an embedding model or vector index.
 
 New installations start with automatic capture paused. Existing valid settings preserve the previous capture state; if the settings file is damaged, ClipSave resumes in the paused state.
 
