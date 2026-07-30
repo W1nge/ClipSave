@@ -1,3 +1,4 @@
+import gc
 import os
 import sqlite3
 import tempfile
@@ -9,7 +10,17 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QByteArray, QEvent, QPoint, QPointF, QPropertyAnimation, QRect, QSize, QThread, Qt, QUrl
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QPoint,
+    QPointF,
+    QRect,
+    QSize,
+    QThread,
+    Qt,
+    QUrl,
+)
 from PySide6.QtGui import QColor, QEnterEvent, QImage, QPainter, QPixmap, QTextDocument, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -21,6 +32,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QStyle,
     QStyleOptionViewItem,
+    QHeaderView,
+    QListView,
     QTableWidget,
     QTableWidgetItem,
     QWidget,
@@ -122,6 +135,8 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
     def tearDown(self):
         _THUMBNAIL_CACHE.clear()
+        gc.collect()
+        self.app.processEvents()
         self.temp.cleanup()
 
     def test_thumbnail_decode_runs_off_ui_thread_and_pixmap_cache_runs_on_ui_thread(self):
@@ -1016,6 +1031,39 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertFalse(panel.add_tag_button.isEnabled())
         panel.close()
 
+    def test_detail_image_preview_reuses_one_source_and_scales_every_width(self):
+        panel = DetailPanel()
+        panel.resize(340, 640)
+        panel.show()
+        self.app.processEvents()
+        source = QPixmap(800, 400)
+        source.fill(QColor("#21a8fb"))
+        panel._set_image_preview(source)
+        source_key = panel.image_preview.pixmap().cacheKey()
+
+        widths = []
+        centers = []
+        for width in range(120, 321, 20):
+            panel.image_preview.resize(width, 190)
+            target = panel.image_preview.image_target_rect()
+            widths.append(round(target.width(), 3))
+            centers.append(target.center())
+            panel.image_preview.repaint()
+            self.assertEqual(
+                panel.image_preview.pixmap().cacheKey(),
+                source_key,
+            )
+
+        self.assertEqual(widths, sorted(widths))
+        self.assertEqual(len(set(widths)), len(widths))
+        self.assertTrue(
+            all(
+                center == QPointF(width / 2.0, 95.0)
+                for center, width in zip(centers, range(120, 321, 20))
+            )
+        )
+        panel.close()
+
     def test_detail_tags_offer_more_entry_without_losing_hidden_tags(self):
         panel = DetailPanel()
         item = {
@@ -1101,12 +1149,15 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertEqual(panel.title.toolTip(), item["title"])
         self.assertEqual(panel.meta.toolTip(), item["path"])
         self.assertLessEqual(panel.content_widget.width(), panel.viewport().width())
-        self.assertLessEqual(panel.image_preview.pixmap().width(), panel.image_preview.width())
+        self.assertLessEqual(
+            panel.image_preview.image_target_rect().width(),
+            panel.image_preview.width(),
+        )
         self.assertEqual(panel.horizontalScrollBar().maximum(), 0)
         panel.resize(280, 640)
         self.assertTrue(
             wait_for(
-                lambda: panel.image_preview.pixmap().width()
+                lambda: panel.image_preview.image_target_rect().width()
                 <= panel.image_preview.width()
             )
         )
@@ -1305,6 +1356,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
     def test_sidebar_reuses_one_animation_without_expand_width_jump(self):
         sidebar = Sidebar()
+        animation_timer = sidebar._animation_timer
         started = []
         finished = []
         sidebar.width_animation_started.connect(lambda: started.append(True))
@@ -1313,30 +1365,897 @@ class ThumbnailPixmapTests(unittest.TestCase):
         sidebar.set_collapsed(False, animate=True)
 
         self.assertEqual(sidebar.minimumWidth(), 72)
-        self.assertEqual(len(sidebar.findChildren(QPropertyAnimation)), 1)
-        self.assertTrue(wait_for(lambda: sidebar.minimumWidth() == 200))
+        self.assertIs(sidebar._animation_timer, animation_timer)
+        self.assertEqual(
+            sidebar._animation_timer.timerType(),
+            Qt.TimerType.PreciseTimer,
+        )
+        self.assertTrue(wait_for(lambda: sidebar.minimumWidth() == 242))
         self.assertEqual(started, [True])
         self.assertEqual(finished, [True])
         sidebar.set_collapsed(True, animate=True)
-        self.assertEqual(len(sidebar.findChildren(QPropertyAnimation)), 1)
+        self.assertIs(sidebar._animation_timer, animation_timer)
+        sidebar.close()
+
+    def test_sidebar_rapid_reversals_share_one_animation_transaction(self):
+        sidebar = Sidebar()
+        sidebar.resize(242, 700)
+        sidebar.show()
+        self.app.processEvents()
+        started = []
+        finished = []
+        collapsed = []
+        sidebar.width_animation_started.connect(lambda: started.append(True))
+        sidebar.width_animation_finished.connect(lambda: finished.append(True))
+        sidebar.collapsed_changed.connect(collapsed.append)
+
+        sidebar.set_collapsed(True)
+        sidebar.set_collapsed(True)
+        QTest.qWait(35)
+        sidebar.set_collapsed(False)
+        QTest.qWait(35)
+        sidebar.set_collapsed(True)
+
+        self.assertTrue(wait_for(lambda: not sidebar._width_animation_active))
+        self.assertEqual(started, [True])
+        self.assertEqual(finished, [True])
+        self.assertEqual(collapsed, [True, False, True])
+        self.assertEqual(sidebar.maximumWidth(), 72)
+        sidebar.close()
+
+    def test_sidebar_progress_and_real_width_are_linear_in_both_directions(self):
+        sidebar = Sidebar()
+        sidebar.resize(Sidebar.EXPANDED_WIDTH, 700)
+        sidebar.show()
+        self.app.processEvents()
+        samples = []
+        sidebar.width_animation_progress.connect(
+            lambda progress: samples.append(
+                (
+                    progress,
+                    sidebar.width(),
+                    sidebar.minimumWidth(),
+                    sidebar.maximumWidth(),
+                )
+            )
+        )
+
+        sidebar.set_collapsed(True)
+        self.assertTrue(wait_for(lambda: not sidebar._width_animation_active))
+        collapsed_samples = list(samples)
+        self.assertGreaterEqual(len(collapsed_samples), 8)
+        collapsed_progress = [sample[0] for sample in collapsed_samples]
+        collapsed_widths = [sample[1] for sample in collapsed_samples]
+        self.assertTrue(
+            all(left < right for left, right in zip(collapsed_progress, collapsed_progress[1:]))
+        )
+        self.assertTrue(
+            all(
+                left >= right
+                for left, right in zip(
+                    collapsed_widths,
+                    collapsed_widths[1:],
+                )
+            )
+        )
+        self.assertGreaterEqual(len(set(collapsed_widths)), 8)
+        self.assertTrue(
+            all(width == minimum == maximum for _p, width, minimum, maximum in collapsed_samples)
+        )
+        self.assertAlmostEqual(collapsed_progress[-1], 1.0)
+        self.assertEqual(collapsed_widths[-1], Sidebar.COLLAPSED_WIDTH)
+
+        samples.clear()
+        sidebar.set_collapsed(False)
+        self.assertTrue(wait_for(lambda: not sidebar._width_animation_active))
+        expanded_samples = list(samples)
+        self.assertGreaterEqual(len(expanded_samples), 8)
+        expanded_progress = [sample[0] for sample in expanded_samples]
+        expanded_widths = [sample[1] for sample in expanded_samples]
+        self.assertTrue(
+            all(left > right for left, right in zip(expanded_progress, expanded_progress[1:]))
+        )
+        self.assertTrue(
+            all(
+                left <= right
+                for left, right in zip(
+                    expanded_widths,
+                    expanded_widths[1:],
+                )
+            )
+        )
+        self.assertGreaterEqual(len(set(expanded_widths)), 8)
+        self.assertTrue(
+            all(width == minimum == maximum for _p, width, minimum, maximum in expanded_samples)
+        )
+        self.assertAlmostEqual(expanded_progress[-1], 0.0)
+        self.assertEqual(expanded_widths[-1], Sidebar.EXPANDED_WIDTH)
+        sidebar.close()
+
+    def test_sidebar_uses_active_display_refresh_rate_for_one_precise_clock(self):
+        sidebar = Sidebar()
+        sidebar.show()
+        self.app.processEvents()
+        samples = []
+        sidebar.width_animation_progress.connect(samples.append)
+
+        with patch.object(sidebar, "_display_refresh_rate", return_value=120.0):
+            sidebar.set_collapsed(True)
+            self.assertEqual(sidebar.animation_refresh_rate, 120.0)
+            self.assertEqual(sidebar.animation_frame_interval_ms, 8)
+            self.assertTrue(
+                wait_for(lambda: not sidebar._width_animation_active)
+            )
+
+        self.assertGreaterEqual(len(samples), 16)
+        self.assertTrue(
+            all(left < right for left, right in zip(samples, samples[1:]))
+        )
+        sidebar.close()
+
+    def test_sidebar_keeps_expanded_content_laid_out_until_collapse_finishes(self):
+        sidebar = Sidebar()
+        sidebar.set_primary({"all": 2})
+        sidebar.show()
+        self.app.processEvents()
+
+        sidebar.set_collapsed(True)
+        self.assertTrue(sidebar._width_animation_active)
+        self.assertTrue(sidebar.collection_heading.isVisible())
+        self.assertNotEqual(sidebar.nav_buttons["all"].text(), "")
+        self.assertEqual(
+            sidebar._animation_run_duration_ms,
+            Sidebar.ANIMATION_DURATION_MS,
+        )
+        self.assertGreaterEqual(sidebar.animation_refresh_rate, 30.0)
+        self.assertGreater(sidebar.animation_frame_interval_ms, 0)
+
+        self.assertTrue(wait_for(lambda: not sidebar._width_animation_active))
+        self.assertFalse(sidebar.collection_heading.isVisible())
+        self.assertEqual(sidebar.nav_buttons["all"].text(), "")
+        sidebar.close()
+
+    def test_sidebar_nonanimated_change_finishes_an_active_animation(self):
+        sidebar = Sidebar()
+        sidebar.resize(242, 700)
+        sidebar.show()
+        self.app.processEvents()
+        started = []
+        finished = []
+        sidebar.width_animation_started.connect(lambda: started.append(True))
+        sidebar.width_animation_finished.connect(lambda: finished.append(True))
+
+        sidebar.set_collapsed(True)
+        QTest.qWait(35)
+        sidebar.set_collapsed(False, animate=False)
+
+        self.assertFalse(sidebar._width_animation_active)
+        self.assertFalse(sidebar._animation_timer.isActive())
+        self.assertEqual(sidebar.maximumWidth(), 242)
+        self.assertEqual(sidebar.minimumWidth(), 242)
+        self.assertEqual(started, [True])
+        self.assertEqual(finished, [True])
         sidebar.close()
 
     def test_grid_defers_layout_recalculation_during_sidebar_animation(self):
         grid = AssetGrid()
         grid.resize(600, 400)
+        grid.set_items(asset_records(1))
         grid.show()
         self.app.processEvents()
+        grid._thumbnail_refresh_timer.start()
+        initial_generation = grid._thumbnail_generation
+        key = widgets_module._ThumbnailCacheKey("pending", 1, 1)
 
-        with patch.object(grid, "_update_grid_size") as update_grid_size:
+        with patch.object(grid, "_update_grid_size") as update_grid_size, patch.object(
+            grid._thumbnail_loader,
+            "cancel_queued",
+            wraps=grid._thumbnail_loader.cancel_queued,
+        ) as cancel_queued, patch.object(
+            grid._thumbnail_loader, "request"
+        ) as request_thumbnail, patch.object(
+            grid.viewport(), "update"
+        ) as viewport_update, patch(
+            "clipsave_app.widgets._cached_thumbnail",
+            return_value=(key, None, False),
+        ):
             grid.set_layout_updates_suspended(True)
+            self.assertEqual(grid.resizeMode(), QListView.ResizeMode.Fixed)
+            self.assertFalse(grid._thumbnail_refresh_timer.isActive())
             grid.resize(760, 400)
+            grid.resize(680, 400)
+            grid.resize(820, 400)
             self.app.processEvents()
             update_grid_size.assert_not_called()
+            self.assertTrue(grid._layout_update_pending)
+            self.assertIsNone(
+                grid.thumbnail_for_index(
+                    grid.model().index(0, 0), Path("pending.png")
+                )
+            )
+            request_thumbnail.assert_not_called()
 
             grid.set_layout_updates_suspended(False)
             update_grid_size.assert_called_once_with()
+            self.assertEqual(grid.resizeMode(), QListView.ResizeMode.Adjust)
+            self.assertFalse(grid._thumbnail_refresh_timer.isActive())
+            self.assertEqual(grid._thumbnail_generation, initial_generation + 2)
+            self.assertEqual(cancel_queued.call_count, 2)
+            viewport_update.assert_called_once_with()
 
         grid.close()
+
+    def test_grid_animates_four_to_five_columns_from_shared_progress(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(20))
+        grid.show()
+        self.app.processEvents()
+
+        self.assertEqual(grid.columns, 4)
+        self.assertTrue(
+            grid.begin_sidebar_transition(
+                Sidebar.EXPANDED_WIDTH,
+                0.0,
+            )
+        )
+        overlay = grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+        self.assertEqual(overlay.expanded_columns, 4)
+        self.assertEqual(overlay.collapsed_columns, 5)
+        self.assertEqual(overlay.elevated_rows, [4, 9, 14, 19])
+        self.assertEqual(overlay.paint_order_rows[-4:], [4, 9, 14, 19])
+        first_start = overlay.card_rect(0)
+        fifth_start = overlay.card_rect(4)
+        self.assertGreater(fifth_start.top(), first_start.top())
+
+        start_rects = {card.row: card.expanded_rect for card in overlay.cards}
+        end_rects = {card.row: card.collapsed_rect for card in overlay.cards}
+
+        with patch.object(
+            grid.delegate,
+            "paint_transition_card",
+            wraps=grid.delegate.paint_transition_card,
+        ) as repaint_card:
+            grid.set_layout_updates_suspended(True)
+            grid.resize(grid.width() + 170, grid.height())
+            self.app.processEvents()
+            grid.set_sidebar_transition_progress(0.5)
+            self.app.processEvents()
+            grid.viewport().repaint()
+            fifth_middle = overlay.card_rect(4)
+            self.assertGreater(fifth_middle.left(), fifth_start.left())
+            self.assertGreater(fifth_middle.top(), first_start.top())
+            self.assertGreaterEqual(repaint_card.call_count, len(overlay.cards))
+
+            for row in start_rects:
+                actual = overlay.card_rect(row)
+                expected = widgets_module._interpolate_rect(
+                    start_rects[row],
+                    end_rects[row],
+                    0.5,
+                )
+                self.assertEqual(actual, expected)
+                if start_rects[row] != end_rects[row]:
+                    self.assertNotEqual(actual, start_rects[row])
+                    self.assertNotEqual(actual, end_rects[row])
+
+            grid.set_sidebar_transition_progress(1.0)
+            fifth_end = overlay.card_rect(4)
+            self.assertEqual(fifth_end.top(), first_start.top())
+            self.assertGreater(fifth_end.left(), overlay.card_rect(3).left())
+
+            grid.set_layout_updates_suspended(False)
+            grid.finish_sidebar_transition()
+            self.app.processEvents()
+
+        self.assertFalse(grid._sidebar_transition_active)
+        self.assertIsNone(grid._sidebar_transition_overlay)
+        self.assertEqual(grid.columns, 5)
+        for row, end_rect in end_rects.items():
+            self.assertEqual(
+                grid.visualRect(grid.model().index(row, 0)),
+                end_rect.toRect(),
+            )
+        grid.close()
+
+    def test_grid_detail_transition_five_to_four_keeps_fourth_card_in_first_row(self):
+        grid = AssetGrid()
+        grid.resize(1360, 700)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(20))
+        grid.show()
+        self.app.processEvents()
+
+        self.assertTrue(
+            grid.begin_viewport_width_transition(
+                1320,
+                980,
+                0.0,
+            )
+        )
+        overlay = grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+        self.assertEqual(overlay.expanded_columns, 5)
+        self.assertEqual(overlay.collapsed_columns, 4)
+        fourth = overlay._cards_by_row[3]
+        fifth = overlay._cards_by_row[4]
+        self.assertEqual(
+            fourth.expanded_rect.top(),
+            fourth.collapsed_rect.top(),
+        )
+        self.assertLess(
+            fifth.expanded_rect.top(),
+            fifth.collapsed_rect.top(),
+        )
+
+        fourth_tops = []
+        for progress in (0.0, 0.25, 0.5, 0.75, 1.0):
+            grid.set_sidebar_transition_progress(progress)
+            fourth_tops.append(overlay.card_rect(3).top())
+        self.assertEqual(len(set(fourth_tops)), 1)
+
+        grid.finish_sidebar_transition()
+        grid.close()
+
+    def test_grid_transition_caches_preview_once_and_only_composites_each_frame(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_preview_loading_enabled(False)
+        records = asset_records(20)
+        for record in records:
+            record["content"] = (
+                "每一行文字只在排版真正改变时重新生成缓存，"
+                "其余动画帧保持原始字号和像素密度。"
+            ) * 8
+        grid.set_items(records)
+        grid.show()
+        self.app.processEvents()
+
+        with patch.object(
+            grid.delegate,
+            "render_transition_preview",
+            wraps=grid.delegate.render_transition_preview,
+        ) as render_preview:
+            self.assertTrue(
+                grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0)
+            )
+            overlay = grid._sidebar_transition_overlay
+            self.assertIsNotNone(overlay)
+            cache_render_count = render_preview.call_count
+            state_count = sum(len(card.preview_states) for card in overlay.cards)
+            self.assertEqual(cache_render_count, state_count)
+            self.assertGreater(state_count, len(overlay.cards))
+            self.assertLess(
+                state_count,
+                len(overlay.cards) * overlay.preview_frame_count,
+            )
+
+            for progress in (0.25, 0.5, 0.75):
+                grid.set_sidebar_transition_progress(progress)
+                grid.viewport().repaint()
+
+            self.assertEqual(render_preview.call_count, cache_render_count)
+
+        grid.finish_sidebar_transition()
+        grid.close()
+
+    def test_grid_hiding_releases_transition_pixmap_caches(self):
+        grid = AssetGrid()
+        grid.resize(900, 600)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(8))
+        grid.show()
+        self.app.processEvents()
+
+        self.assertTrue(
+            grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0)
+        )
+        self.assertTrue(grid.delegate._transition_preview_caches)
+        self.assertTrue(grid.delegate._transition_layout_signatures)
+
+        grid.close()
+        self.app.processEvents()
+        self.assertFalse(grid.delegate._transition_preview_caches)
+        self.assertFalse(grid.delegate._transition_layout_signatures)
+
+    def test_grid_transition_text_states_are_monotonic_and_reused_in_reverse(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_preview_loading_enabled(False)
+        records = asset_records(1)
+        records[0]["content"] = (
+            "这是用于验证离散排版缓存的长文本内容，宽度变化时只允许增加"
+            "新的排版状态，不允许文字先放大再缩小。"
+        ) * 12
+        grid.set_items(records)
+        grid.show()
+        self.app.processEvents()
+
+        self.assertTrue(
+            grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0)
+        )
+        overlay = grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+        card = overlay.cards[0]
+        self.assertGreater(len(card.preview_states), 1)
+        self.assertLess(len(card.preview_states), overlay.preview_frame_count)
+        self.assertEqual(card.preview_samples, sorted(card.preview_samples))
+
+        forward = [
+            overlay.preview_cache(card, frame / (overlay.preview_frame_count - 1))
+            for frame in range(overlay.preview_frame_count)
+        ]
+        reverse = [
+            overlay.preview_cache(card, frame / (overlay.preview_frame_count - 1))
+            for frame in reversed(range(overlay.preview_frame_count))
+        ]
+        self.assertEqual(
+            [cache.cacheKey() for cache in forward],
+            [cache.cacheKey() for cache in reversed(reverse)],
+        )
+
+        cards = [
+            widgets_module._GridTransitionCard(
+                row=card.row,
+                expanded_rect=card.expanded_rect,
+                collapsed_rect=card.collapsed_rect,
+            )
+        ]
+        with patch.object(
+            grid.delegate,
+            "_paint_preview_content",
+            wraps=grid.delegate._paint_preview_content,
+        ) as paint_content:
+            repeated = widgets_module._AssetGridTransitionOverlay(
+                grid,
+                cards,
+                expanded_columns=overlay.expanded_columns,
+                collapsed_columns=overlay.collapsed_columns,
+                initial_progress=1.0,
+            )
+        self.assertEqual(paint_content.call_count, 0)
+        self.assertEqual(
+            [state.signature for state in repeated.cards[0].preview_states],
+            [state.signature for state in card.preview_states],
+        )
+
+        grid.finish_sidebar_transition()
+        grid.close()
+
+    def test_machine_text_wraps_anywhere_without_changing_natural_language(self):
+        anywhere = widgets_module.QTextOption.WrapMode.WrapAnywhere
+        word_boundary = (
+            widgets_module.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+        )
+        for value in (
+            "https://linux.do/t/topic/2675814",
+            "www.example.com/a/long/path",
+            "name@example.com",
+            r"C:\Program Files\ClipSave\ClipSave.exe",
+            "/home/user/a-long-file-name.txt",
+            "src/clipsave_app/widgets.py",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "0123456789abcdef0123456789abcdef",
+            "ZXhhbXBsZS1lbmNvZGVkLXZhbHVlLw==",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    widgets_module.AssetGridDelegate._plain_text_wrap_mode(
+                        value
+                    ),
+                    anywhere,
+                )
+
+        for value in (
+            "This is an ordinary English sentence.",
+            "state-of-the-art animation",
+            "这是一句普通的中文。",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    widgets_module.AssetGridDelegate._plain_text_wrap_mode(
+                        value
+                    ),
+                    word_boundary,
+                )
+
+    def test_url_transition_moves_at_most_one_character_at_each_wrap_threshold(self):
+        content = "https://linux.do/t/topic/2675814"
+        font = self.app.font()
+        first_line_lengths = [
+            widgets_module.AssetGridDelegate._plain_text_layout_signature(
+                content,
+                width,
+                180,
+                font,
+            )[0][1]
+            for width in range(140, 281)
+        ]
+        self.assertTrue(
+            all(
+                next_length - length in (0, 1)
+                for length, next_length in zip(
+                    first_line_lengths,
+                    first_line_lengths[1:],
+                )
+            )
+        )
+        self.assertGreater(
+            len(set(first_line_lengths)),
+            2,
+        )
+
+    def test_embedded_url_gets_character_breaks_without_splitting_surrounding_words(self):
+        url = "https://nofluff.example/nofluff.txt"
+        content = f"Read this ordinary sentence: {url} and keep words readable."
+        transformed, original_boundaries = (
+            widgets_module.AssetGridDelegate._plain_text_layout_source(
+                content
+            )
+        )
+        self.assertEqual(transformed.replace("\u200b", ""), content)
+        self.assertEqual(original_boundaries[-1], len(content))
+        self.assertEqual(transformed.count("\u200b"), len(url))
+        self.assertTrue(
+            transformed.startswith("Read this ordinary sentence: ")
+        )
+        self.assertTrue(transformed.endswith(" and keep words readable."))
+
+        line_content = f"Link:\n{url}"
+        url_start = line_content.index(url)
+        first_url_line_lengths = []
+        for width in range(140, 281):
+            signature = (
+                widgets_module.AssetGridDelegate._plain_text_layout_signature(
+                    line_content,
+                    width,
+                    180,
+                    self.app.font(),
+                )
+            )
+            first_url_line_lengths.append(
+                next(
+                    length
+                    for start, length in signature
+                    if start == url_start
+                )
+            )
+        self.assertTrue(
+            all(
+                next_length - length in (0, 1)
+                for length, next_length in zip(
+                    first_url_line_lengths,
+                    first_url_line_lengths[1:],
+                )
+            )
+        )
+        self.assertGreater(len(set(first_url_line_lengths)), 2)
+
+    def test_mixed_label_and_long_machine_token_use_the_shared_wrapping_layout(self):
+        content = "account label\nABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        font = self.app.font()
+        signature = (
+            widgets_module.AssetGridDelegate._plain_text_layout_signature(
+                content,
+                180,
+                180,
+                font,
+            )
+        )
+        self.assertEqual(
+            "".join(content[start : start + length] for start, length in signature),
+            content,
+        )
+        token_start = content.index("\n") + 1
+        self.assertGreater(
+            sum(start >= token_start for start, _length in signature),
+            1,
+        )
+
+        grid = AssetGrid()
+        records = asset_records(1)
+        records[0]["content"] = content
+        grid.set_items(records)
+        index = grid.model().index(0, 0)
+        image = QImage(220, 180, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        with patch.object(
+            grid.delegate,
+            "_draw_plain_text_preview",
+            wraps=grid.delegate._draw_plain_text_preview,
+        ) as draw_plain_text:
+            grid.delegate._paint_preview_content(
+                painter,
+                QRect(0, 0, 220, 180),
+                index,
+                records[0],
+                False,
+                font,
+            )
+        painter.end()
+        draw_plain_text.assert_called_once()
+        grid.close()
+
+    def test_transition_preview_cache_uses_the_exact_view_font(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        font = grid.font()
+        font.setFamily("Arial")
+        font.setPixelSize(23)
+        grid.setFont(font)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(1))
+        grid.show()
+        self.app.processEvents()
+
+        index = grid.model().index(0, 0)
+        rendered_fonts = []
+        original_paint_content = grid.delegate._paint_preview_content
+
+        def record_rendered_font(*args):
+            original_paint_content(*args)
+            rendered_fonts.append(args[0].font().toString())
+
+        with patch.object(
+            grid.delegate,
+            "_paint_preview_content",
+            side_effect=record_rendered_font,
+        ) as paint_content:
+            preview = grid.delegate.render_transition_preview(
+                index,
+                QSize(245, widgets_module.AssetGridDelegate.card_height + 12),
+            )
+
+        self.assertIsNotNone(preview)
+        self.assertEqual(paint_content.call_count, 1)
+        self.assertEqual(rendered_fonts, [font.toString()])
+
+        grid.close()
+
+    def test_transition_text_cache_is_clipped_to_the_text_content_insets(self):
+        preview = QRect(20, 30, 240, 180)
+        self.assertEqual(
+            widgets_module.AssetGridDelegate.transition_preview_clip(
+                preview,
+                "text",
+            ),
+            preview.adjusted(10, 9, -10, -9),
+        )
+        self.assertEqual(
+            widgets_module.AssetGridDelegate.transition_preview_clip(
+                preview,
+                "markdown",
+            ),
+            preview.adjusted(10, 9, -10, -9),
+        )
+        self.assertEqual(
+            widgets_module.AssetGridDelegate.transition_preview_clip(
+                preview,
+                "image",
+            ),
+            preview,
+        )
+
+    def test_transition_image_uses_one_max_cache_and_scales_every_frame(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_items(asset_records(1, kind="image", path="preview.png"))
+        grid.show()
+        self.app.processEvents()
+        source = QPixmap(800, 400)
+        source.fill(QColor("#4da3ff"))
+
+        with patch.object(
+            grid,
+            "thumbnail_for_index",
+            return_value=source,
+        ) as thumbnail, patch.object(
+            grid.delegate,
+            "render_transition_preview",
+            wraps=grid.delegate.render_transition_preview,
+        ) as render_preview:
+            self.assertTrue(
+                grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0)
+            )
+
+        overlay = grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+        card = overlay.cards[0]
+        self.assertEqual(len(card.preview_states), 1)
+        self.assertEqual(render_preview.call_count, 1)
+        self.assertEqual(thumbnail.call_count, 1)
+        cache = card.preview_states[0].cache
+        self.assertIsNotNone(cache)
+
+        widths = []
+        centers = []
+        for frame in range(overlay.preview_frame_count):
+            progress = frame / (overlay.preview_frame_count - 1)
+            cell = widgets_module._grid_transition_rect(card, progress).toRect()
+            preview = grid.delegate.preview_rect(cell)
+            target = grid.delegate.transition_image_target(preview, cache)
+            widths.append(round(target.width(), 3))
+            centers.append(target.center())
+
+        self.assertGreater(len(set(widths)), 5)
+        self.assertTrue(
+            widths == sorted(widths) or widths == sorted(widths, reverse=True)
+        )
+        for frame, center in enumerate(centers):
+            progress = frame / (overlay.preview_frame_count - 1)
+            cell = widgets_module._grid_transition_rect(card, progress).toRect()
+            self.assertEqual(center, grid.delegate.preview_rect(cell).center())
+
+        grid.finish_sidebar_transition()
+        grid.close()
+
+    def test_grid_transition_elevated_card_wins_paint_and_hit_order(self):
+        grid = AssetGrid()
+        grid.resize(600, 400)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(2))
+        grid.show()
+        self.app.processEvents()
+        shared_rect = widgets_module.QRectF(0.0, 0.0, 240.0, 252.0)
+        cards = [
+            widgets_module._GridTransitionCard(
+                row=0,
+                expanded_rect=shared_rect,
+                collapsed_rect=shared_rect,
+            ),
+            widgets_module._GridTransitionCard(
+                row=1,
+                expanded_rect=shared_rect,
+                collapsed_rect=shared_rect,
+                elevated=True,
+            ),
+        ]
+
+        with patch.object(
+            grid.delegate,
+            "render_transition_preview",
+            return_value=None,
+        ):
+            overlay = widgets_module._AssetGridTransitionOverlay(
+                grid,
+                cards,
+                expanded_columns=4,
+                collapsed_columns=5,
+            )
+
+        self.assertEqual(overlay.paint_order_rows, [0, 1])
+        self.assertEqual(overlay.index_at(QPoint(100, 100)).row(), 1)
+        grid.close()
+
+    def test_grid_transition_elevates_every_added_column_card_both_directions(self):
+        expected = [4, 9, 14, 19]
+        self.assertEqual(
+            [
+                row
+                for row in range(20)
+                if widgets_module._grid_transition_card_elevated(row, 4, 5)
+            ],
+            expected,
+        )
+        self.assertEqual(
+            [
+                row
+                for row in range(20)
+                if widgets_module._grid_transition_card_elevated(row, 5, 4)
+            ],
+            expected,
+        )
+
+    def test_grid_defers_item_model_changes_until_transition_finishes(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(20))
+        grid.show()
+        self.app.processEvents()
+        self.assertTrue(
+            grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0)
+        )
+
+        replacement = asset_records(3)
+        grid.set_items(replacement, replacement[1]["id"])
+        self.assertEqual(grid.model().rowCount(), 20)
+        self.assertIsNotNone(grid._pending_items_update)
+
+        grid.finish_sidebar_transition()
+        self.assertEqual(grid.model().rowCount(), 3)
+        self.assertIsNone(grid._pending_items_update)
+        self.assertEqual(grid.selected_id, replacement[1]["id"])
+        grid.close()
+
+    def test_grid_transition_header_elements_keep_size_and_linear_anchors(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(20))
+        grid.show()
+        self.app.processEvents()
+        self.assertTrue(
+            grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0)
+        )
+        overlay = grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+
+        header_samples = []
+        for progress in (0.0, 0.25, 0.5, 0.75, 1.0):
+            grid.set_sidebar_transition_progress(progress)
+            cell = overlay.card_rect(4).toRect()
+            card = grid.delegate.card_rect(cell)
+            kind = grid.delegate.kind_rect(cell)
+            time_rect = grid.delegate.time_rect(cell)
+            favorite = grid.delegate.favorite_rect(cell)
+            header_samples.append((card, kind, time_rect, favorite))
+
+        self.assertEqual(
+            {(kind.width(), kind.height()) for _card, kind, _time, _favorite in header_samples},
+            {(90, 24)},
+        )
+        self.assertEqual(
+            {(time_rect.width(), time_rect.height()) for _card, _kind, time_rect, _favorite in header_samples},
+            {(54, 24)},
+        )
+        self.assertEqual(
+            {(favorite.width(), favorite.height()) for _card, _kind, _time, favorite in header_samples},
+            {(24, 24)},
+        )
+        self.assertEqual(
+            {kind.left() - card.left() for card, kind, _time, _favorite in header_samples},
+            {10},
+        )
+        self.assertEqual(
+            {card.right() - time_rect.right() for card, _kind, time_rect, _favorite in header_samples},
+            {49},
+        )
+        self.assertEqual(
+            {card.right() - favorite.right() for card, _kind, _time, favorite in header_samples},
+            {8},
+        )
+        for element_index in (1, 2, 3):
+            x_positions = [sample[element_index].x() for sample in header_samples]
+            self.assertTrue(
+                all(left <= right for left, right in zip(x_positions, x_positions[1:]))
+                or all(left >= right for left, right in zip(x_positions, x_positions[1:]))
+            )
+            y_positions = [sample[element_index].y() for sample in header_samples]
+            self.assertTrue(
+                all(left <= right for left, right in zip(y_positions, y_positions[1:]))
+                or all(left >= right for left, right in zip(y_positions, y_positions[1:]))
+            )
+        grid.close()
+
+    def test_table_freezes_stretch_column_during_sidebar_animation(self):
+        table = AssetTable()
+        table.resize(820, 400)
+        table.show()
+        self.app.processEvents()
+        header = table.horizontalHeader()
+        initial_width = table.columnWidth(0)
+        self.assertEqual(header.sectionResizeMode(0), QHeaderView.ResizeMode.Stretch)
+
+        with patch.object(table.viewport(), "update") as viewport_update:
+            table.set_layout_updates_suspended(True)
+            self.assertEqual(
+                header.sectionResizeMode(0), QHeaderView.ResizeMode.Fixed
+            )
+            table.resize(1040, 400)
+            self.app.processEvents()
+            self.assertEqual(table.columnWidth(0), initial_width)
+
+            table.set_layout_updates_suspended(False)
+            self.assertEqual(
+                header.sectionResizeMode(0), QHeaderView.ResizeMode.Stretch
+            )
+            viewport_update.assert_called_once_with()
+
+        table.close()
 
     def test_large_markdown_uses_plain_text_instead_of_blocking_rich_parse(self):
         content = "# heading\n" + ("x" * (MAX_RICH_MARKDOWN_BYTES + 1))

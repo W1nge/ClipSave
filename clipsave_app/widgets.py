@@ -2,22 +2,26 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import (
     QByteArray,
     QEasingCurve,
     QEvent,
+    QElapsedTimer,
     QItemSelectionModel,
     QModelIndex,
     QObject,
     QPoint,
+    QPointF,
     QRect,
     QRectF,
     QRunnable,
     QSize,
+    QSizeF,
     Qt,
     QPropertyAnimation,
     QThreadPool,
@@ -30,6 +34,7 @@ from PySide6.QtGui import (
     QAbstractTextDocumentLayout,
     QColor,
     QFont,
+    QFontMetricsF,
     QIcon,
     QImage,
     QImageReader,
@@ -37,6 +42,9 @@ from PySide6.QtGui import (
     QPalette,
     QPen,
     QPixmap,
+    QRegion,
+    QTextLayout,
+    QTextOption,
     QTextDocument,
     QWheelEvent,
 )
@@ -77,6 +85,19 @@ from PySide6.QtWidgets import (
 from .constants import TYPE_LABELS
 from .item_models import AssetItemModel, format_local_timestamp, normalized_thumbnail_path
 from lucide import _render_icon
+
+
+_MACHINE_TEXT_SPAN_RE = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9+.-]*://|www\.)"
+    r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+"
+    r"|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+    r"|(?:[A-Za-z]:[\\/]|\\\\)[^\s\r\n]+"
+    r"|(?:\.{0,2}/|~/|/)?(?:[A-Za-z0-9._-]+[\\/])+[A-Za-z0-9._-]+"
+    r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|[0-9a-fA-F]{20,}"
+    r"|[A-Za-z0-9_+/=-]{20,}"
+)
 
 
 GLYPHS = {
@@ -1284,6 +1305,10 @@ class NavButton(QPushButton):
 
 class Sidebar(QWidget):
     BRAND_AREA_HEIGHT = 54
+    EXPANDED_WIDTH = 242
+    COLLAPSED_WIDTH = 72
+    ANIMATION_DURATION_MS = 190
+    MAX_ANIMATION_REFRESH_RATE = 240.0
     navigation_requested = Signal(str, object)
     add_collection_requested = Signal()
     add_tag_requested = Signal()
@@ -1292,14 +1317,14 @@ class Sidebar(QWidget):
     settings_requested = Signal()
     collapsed_changed = Signal(bool)
     width_animation_started = Signal()
+    width_animation_progress = Signal(float)
     width_animation_finished = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("Sidebar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setMinimumWidth(72)
-        self.setMaximumWidth(242)
+        self.setFixedWidth(self.EXPANDED_WIDTH)
         self.collapsed = False
         self.nav_buttons: dict[str, NavButton] = {}
         self.collection_buttons: list[NavButton] = []
@@ -1312,11 +1337,16 @@ class Sidebar(QWidget):
         self._tags_expanded = False
         self.tags_more_button: NavButton | None = None
         self.footer_buttons: list[NavButton] = []
-        self.animation = QPropertyAnimation(self, b"maximumWidth", self)
-        self.animation.setDuration(190)
-        self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.animation.finished.connect(self._finish_width_animation)
+        self._animation_timer = QTimer(self)
+        self._animation_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._animation_timer.timeout.connect(self._advance_width_animation)
+        self._animation_elapsed = QElapsedTimer()
+        self._animation_start_progress = 0.0
+        self._animation_end_progress = 0.0
+        self._animation_run_duration_ms = self.ANIMATION_DURATION_MS
+        self._animation_refresh_rate = 60.0
         self._width_animation_active = False
+        self._collapse_progress = 0.0
         self.layout_root = QVBoxLayout(self)
         self.layout_root.setContentsMargins(10, 72, 10, 12)
         self.layout_root.setSpacing(4)
@@ -1518,36 +1548,115 @@ class Sidebar(QWidget):
             button.set_active(button.key == key)
 
     def set_collapsed(self, value: bool, animate: bool = True) -> None:
+        value = bool(value)
+        if value == self.collapsed:
+            if not animate:
+                self._animation_timer.stop()
+                self._set_collapse_progress(1.0 if value else 0.0)
+                self._finish_width_animation()
+            return
         self.collapsed = value
+        # Expanded content is revealed while it is still clipped by the narrow
+        # sidebar. Collapsing content remains laid out until the final frame so
+        # child size hints cannot alter the outer width trajectory.
+        if not value:
+            self._apply_collapsed_content(False)
+        start = self._collapse_progress
+        end = 1.0 if value else 0.0
+        self._animation_timer.stop()
+        if animate:
+            if not self._width_animation_active:
+                self._width_animation_active = True
+                self.width_animation_started.emit()
+            self._start_width_animation(start, end)
+        else:
+            self._set_collapse_progress(end)
+            self._finish_width_animation()
+        self.collapsed_changed.emit(value)
+
+    @property
+    def collapse_progress(self) -> float:
+        return self._collapse_progress
+
+    @property
+    def animation_refresh_rate(self) -> float:
+        return self._animation_refresh_rate
+
+    @property
+    def animation_frame_interval_ms(self) -> int:
+        return self._animation_timer.interval()
+
+    def _display_refresh_rate(self) -> float:
+        screen = self.screen()
+        refresh_rate = float(screen.refreshRate()) if screen is not None else 60.0
+        if refresh_rate < 30.0:
+            refresh_rate = 60.0
+        return min(self.MAX_ANIMATION_REFRESH_RATE, refresh_rate)
+
+    def _start_width_animation(self, start: float, end: float) -> None:
+        self._animation_start_progress = float(start)
+        self._animation_end_progress = float(end)
+        self._animation_run_duration_ms = self.ANIMATION_DURATION_MS
+        self._animation_refresh_rate = self._display_refresh_rate()
+        self._animation_timer.setInterval(
+            max(1, round(1000.0 / self._animation_refresh_rate))
+        )
+        self._animation_elapsed.start()
+        self._animation_timer.start()
+
+    def _advance_width_animation(self) -> None:
+        if not self._width_animation_active:
+            self._animation_timer.stop()
+            return
+        elapsed_ms = self._animation_elapsed.nsecsElapsed() / 1_000_000.0
+        fraction = min(1.0, elapsed_ms / self._animation_run_duration_ms)
+        progress = self._animation_start_progress + (
+            self._animation_end_progress - self._animation_start_progress
+        ) * fraction
+        self._set_collapse_progress(progress)
+        if fraction >= 1.0:
+            self._finish_width_animation()
+
+    def _set_collapse_progress(self, progress: float) -> None:
+        progress = max(0.0, min(1.0, progress))
+        width = round(
+            self.EXPANDED_WIDTH
+            + (self.COLLAPSED_WIDTH - self.EXPANDED_WIDTH) * progress
+        )
+        width_changed = self.width() != width or self.minimumWidth() != width
+        progress_changed = abs(progress - self._collapse_progress) >= 1e-6
+        self._collapse_progress = progress
+        if width_changed:
+            self.setFixedWidth(width)
+        endpoint = progress <= 0.0 or progress >= 1.0
+        if progress_changed and (width_changed or endpoint):
+            self.width_animation_progress.emit(progress)
+
+    def _apply_collapsed_content(self, value: bool) -> None:
         self.collapse_button.label = "展开侧栏" if value else "收起侧栏"
         self.collapse_button.glyph = "panel-left-open" if value else "panel-left-close"
         self.collapse_button.set_collapsed(value)
         self.collection_heading.setVisible(not value)
         self.tag_heading.setVisible(not value)
-        for button in [*self.nav_buttons.values(), *self.collection_buttons, *self.tag_buttons, *self.footer_buttons]:
+        for button in [
+            *self.nav_buttons.values(),
+            *self.collection_buttons,
+            *self.tag_buttons,
+            *self.footer_buttons,
+        ]:
             button.set_collapsed(value)
-        for button in [*self.collection_delete_buttons.values(), *self.tag_delete_buttons.values()]:
+        for button in [
+            *self.collection_delete_buttons.values(),
+            *self.tag_delete_buttons.values(),
+        ]:
             button.setVisible(not value)
         for row in [*self.collection_rows.values(), *self.tag_rows.values()]:
             row.layout().setContentsMargins(0, 0, 0 if value else 4, 0)
-        start = self.width()
-        end = 72 if value else 242
-        self.animation.stop()
-        self.setMinimumWidth(72)
-        if animate:
-            self._width_animation_active = True
-            self.width_animation_started.emit()
-            self.animation.setStartValue(start)
-            self.animation.setEndValue(end)
-            self.animation.start()
-        else:
-            self.setMaximumWidth(end)
-            self._finish_width_animation()
-        self.collapsed_changed.emit(value)
 
     def _finish_width_animation(self) -> None:
-        self.setMaximumWidth(72 if self.collapsed else 242)
-        self.setMinimumWidth(72 if self.collapsed else 200)
+        self._animation_timer.stop()
+        self._set_collapse_progress(1.0 if self.collapsed else 0.0)
+        self._apply_collapsed_content(self.collapsed)
         if self._width_animation_active:
             self._width_animation_active = False
             self.width_animation_finished.emit()
@@ -1579,6 +1688,16 @@ class AssetGridDelegate(QStyledItemDelegate):
         self.favorite_on = lucide_icon("star", "#f4a100", 18, "#f4a100").pixmap(18, 18)
         self.favorite_off = lucide_icon("star", "#f4a100", 18).pixmap(18, 18)
         self._markdown_documents: OrderedDict[tuple[object, ...], QTextDocument] = OrderedDict()
+        self._transition_preview_caches: OrderedDict[
+            tuple[object, ...], QPixmap
+        ] = OrderedDict()
+        self._transition_layout_signatures: OrderedDict[
+            tuple[object, ...], tuple[object, ...]
+        ] = OrderedDict()
+
+    def clear_transition_caches(self) -> None:
+        self._transition_preview_caches.clear()
+        self._transition_layout_signatures.clear()
 
     def sizeHint(self, option, index) -> QSize:
         return self.view.gridSize()
@@ -1589,6 +1708,14 @@ class AssetGridDelegate(QStyledItemDelegate):
 
     def preview_rect(self, rect: QRect) -> QRect:
         return self.card_rect(rect).adjusted(10, 42, -10, -10)
+
+    def kind_rect(self, rect: QRect) -> QRect:
+        card = self.card_rect(rect)
+        return QRect(card.left() + 10, card.top() + 10, 90, 24)
+
+    def time_rect(self, rect: QRect) -> QRect:
+        card = self.card_rect(rect)
+        return QRect(card.right() - 102, card.top() + 10, 54, 24)
 
     def favorite_rect(self, rect: QRect) -> QRect:
         card = self.card_rect(rect)
@@ -1639,47 +1766,291 @@ class AssetGridDelegate(QStyledItemDelegate):
         painter.restore()
 
     def paint(self, painter, option, index) -> None:
-        record = index.data(AssetItemModel.ItemRole)
-        if record is None:
+        if getattr(self.view, "_sidebar_transition_active", False):
             return
-        card = self.card_rect(option.rect)
-        selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        dark = dark_theme_active()
-        painter.setPen(QPen(QColor("#4da3ff") if selected else QColor("#4a4a4a" if dark else "#dfe4eb"), 1))
-        painter.setBrush(QColor("#26384d") if selected and dark else QColor("#eef4ff") if selected else QColor("#292929" if dark else "#ffffff"))
-        painter.drawRoundedRect(card, 6, 6)
+        self.paint_transition_card(painter, option, index)
 
-        muted = QColor("#a7adb7" if dark else "#7a8699")
-        left = card.left() + 10
-        right = card.right() - 10
-        kind = TYPE_LABELS.get(record["kind"], record["kind"])
-        painter.setPen(muted)
-        painter.drawText(QRect(left, card.top() + 10, 90, 24), Qt.AlignmentFlag.AlignVCenter, kind)
-        created_at = format_local_timestamp(record["created_at"])
-        time_text = created_at[11:16] if len(created_at) >= 16 else ""
-        painter.drawText(
-            QRect(right - 92, card.top() + 10, 54, 24),
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            time_text,
-        )
-        favorite = self.favorite_on if record["favorite"] else self.favorite_off
-        favorite_target = self.favorite_rect(option.rect)
-        painter.drawPixmap(
-            favorite_target.left() + 3,
-            favorite_target.top() + 3,
-            favorite,
-        )
+    @staticmethod
+    def _preview_background_color(record, dark: bool) -> QColor:
+        if dark:
+            return QColor("#303030" if record["kind"] == "image" else "#262626")
+        return QColor("#edf1f7") if record["kind"] == "image" else QColor("#f7f9fc")
 
-        preview = self.preview_rect(option.rect)
+    def _paint_preview_background(
+        self,
+        painter: QPainter,
+        preview: QRect,
+        record,
+        dark: bool,
+    ) -> None:
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(
-            QColor("#303030" if record["kind"] == "image" else "#262626")
-            if dark
-            else QColor("#edf1f7") if record["kind"] == "image" else QColor("#f7f9fc")
-        )
+        painter.setBrush(self._preview_background_color(record, dark))
         painter.drawRoundedRect(preview, 5, 5)
+
+    @staticmethod
+    def _plain_text_wrap_mode(content: str) -> QTextOption.WrapMode:
+        value = content.strip()
+        if not value:
+            return QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+        machine_text = (
+            re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*://\S+", value)
+            or re.fullmatch(r"www\.\S+", value, re.IGNORECASE)
+            or re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value)
+            or re.fullmatch(r"(?:[A-Za-z]:[\\/]|\\\\|/|\./|\.\./|~/).+", value)
+            or re.fullmatch(r"\S*[\\/]\S*", value)
+            or re.fullmatch(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                value,
+            )
+            or re.fullmatch(r"[0-9a-fA-F]{20,}", value)
+            or re.fullmatch(r"[A-Za-z0-9_+/=-]{20,}", value)
+            or re.fullmatch(
+                r"(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]{2,}(?:/\S*)?",
+                value,
+            )
+        )
+        if machine_text:
+            return QTextOption.WrapMode.WrapAnywhere
+        return QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+
+    @staticmethod
+    def _plain_text_layout_source(
+        content: str,
+    ) -> tuple[str, tuple[int, ...]]:
+        source = content[:330]
+        if (
+            AssetGridDelegate._plain_text_wrap_mode(source)
+            == QTextOption.WrapMode.WrapAnywhere
+        ):
+            return source, tuple(range(len(source) + 1))
+        machine_positions = [False] * len(source)
+        for match in _MACHINE_TEXT_SPAN_RE.finditer(source):
+            machine_positions[match.start() : match.end()] = [True] * (
+                match.end() - match.start()
+            )
+        if not any(machine_positions):
+            return source, tuple(range(len(source) + 1))
+        transformed: list[str] = []
+        original_boundaries = [0]
+        for index, character in enumerate(source):
+            transformed.append(character)
+            original_boundaries.append(index + 1)
+            if machine_positions[index]:
+                transformed.append("\u200b")
+                original_boundaries.append(index + 1)
+        return "".join(transformed), tuple(original_boundaries)
+
+    @staticmethod
+    def _plain_text_layout(
+        content: str,
+        width: int,
+        height: int,
+        font: QFont,
+    ) -> tuple[list[QTextLayout], tuple[tuple[int, int], ...]]:
+        source, original_boundaries = (
+            AssetGridDelegate._plain_text_layout_source(content)
+        )
+        layouts: list[QTextLayout] = []
+        lines: list[tuple[int, int]] = []
+        transformed_offset = 0
+        y = 0.0
+        segments = source.splitlines(keepends=True) or [source]
+        for segment in segments:
+            if y >= max(1, height):
+                break
+            newline_length = len(segment) - len(segment.rstrip("\r\n"))
+            paragraph = (
+                segment[:-newline_length] if newline_length else segment
+            )
+            layout = QTextLayout(paragraph, font)
+            option = QTextOption()
+            option.setWrapMode(
+                AssetGridDelegate._plain_text_wrap_mode(content)
+            )
+            layout.setTextOption(option)
+            layout.beginLayout()
+            paragraph_line_indexes: list[int] = []
+            completed = False
+            while y < max(1, height):
+                line = layout.createLine()
+                if not line.isValid():
+                    completed = True
+                    break
+                line.setLineWidth(max(1, width))
+                line.setPosition(QPointF(0.0, y))
+                transformed_start = (
+                    transformed_offset + line.textStart()
+                )
+                transformed_end = transformed_start + line.textLength()
+                original_start = original_boundaries[transformed_start]
+                original_end = original_boundaries[transformed_end]
+                paragraph_line_indexes.append(len(lines))
+                lines.append(
+                    (original_start, original_end - original_start)
+                )
+                y += line.height()
+            layout.endLayout()
+            layouts.append(layout)
+            if not paragraph:
+                y += QFontMetricsF(font).height()
+                completed = True
+            if completed and newline_length:
+                newline_start = transformed_offset + len(paragraph)
+                newline_end = newline_start + newline_length
+                original_newline_length = (
+                    original_boundaries[newline_end]
+                    - original_boundaries[newline_start]
+                )
+                if paragraph_line_indexes:
+                    line_index = paragraph_line_indexes[-1]
+                    start, length = lines[line_index]
+                    lines[line_index] = (
+                        start,
+                        length + original_newline_length,
+                    )
+                else:
+                    lines.append(
+                        (
+                            original_boundaries[newline_start],
+                            original_newline_length,
+                        )
+                    )
+            transformed_offset += len(segment)
+        return layouts, tuple(lines)
+
+    @staticmethod
+    def _plain_text_layout_signature(
+        content: str,
+        width: int,
+        height: int,
+        font: QFont,
+    ) -> tuple[tuple[int, int], ...]:
+        _layouts, lines = AssetGridDelegate._plain_text_layout(
+            content,
+            width,
+            height,
+            font,
+        )
+        return lines
+
+    @staticmethod
+    def _draw_plain_text_preview(
+        painter: QPainter,
+        rect: QRect,
+        content: str,
+        font: QFont,
+    ) -> None:
+        layouts, _lines = AssetGridDelegate._plain_text_layout(
+            content,
+            max(1, rect.width()),
+            max(1, rect.height()),
+            font,
+        )
+        painter.save()
+        painter.setClipRect(rect)
+        for layout in layouts:
+            layout.draw(painter, QPointF(rect.left(), rect.top()))
+        painter.restore()
+
+    def _markdown_layout_signature(
+        self,
+        content: str,
+        width: int,
+        height: int,
+        dark: bool,
+        font: QFont,
+    ) -> tuple[tuple[int, int], ...]:
+        document = self._markdown_document(content, width, dark, font)
+        document.documentLayout().documentSize()
+        lines: list[tuple[int, int]] = []
+        block = document.begin()
+        while block.isValid():
+            layout = block.layout()
+            block_top = layout.position().y()
+            for line_index in range(layout.lineCount()):
+                line = layout.lineAt(line_index)
+                if block_top + line.y() >= height:
+                    return tuple(lines)
+                lines.append(
+                    (
+                        block.position() + line.textStart(),
+                        line.textLength(),
+                    )
+                )
+            block = block.next()
+        return tuple(lines)
+
+    def transition_layout_signature(
+        self,
+        index: QModelIndex,
+        cell_size: QSize,
+    ) -> tuple[object, ...]:
+        record = index.data(AssetItemModel.ItemRole)
+        if record is None or cell_size.isEmpty():
+            return ("empty",)
+        preview = self.preview_rect(
+            QRect(0, 0, cell_size.width(), cell_size.height())
+        )
+        content_rect = preview.adjusted(10, 9, -10, -9)
+        kind = str(record["kind"])
+        if kind == "image":
+            return (
+                "image",
+                max(1, content_rect.width()),
+                max(1, content_rect.height()),
+            )
+        content = str(record["content"] or "").strip() or str(record["title"])
+        dark = dark_theme_active()
+        font = self.view.font()
+        cache_key = (
+            kind,
+            content[:2000] if kind == "markdown" else content[:330],
+            max(1, content_rect.width()),
+            max(1, content_rect.height()),
+            dark,
+            font.toString(),
+        )
+        cached = self._transition_layout_signatures.pop(cache_key, None)
+        if cached is not None:
+            self._transition_layout_signatures[cache_key] = cached
+            return cached
+        if kind == "markdown":
+            signature = (
+                "markdown",
+                self._markdown_layout_signature(
+                    content,
+                    max(1, content_rect.width()),
+                    max(1, content_rect.height()),
+                    dark,
+                    font,
+                ),
+            )
+        else:
+            signature = (
+                "text",
+                self._plain_text_layout_signature(
+                    content,
+                    max(1, content_rect.width()),
+                    max(1, content_rect.height()),
+                    font,
+                ),
+            )
+        self._transition_layout_signatures[cache_key] = signature
+        while len(self._transition_layout_signatures) > 2048:
+            self._transition_layout_signatures.popitem(last=False)
+        return signature
+
+    def _paint_preview_content(
+        self,
+        painter: QPainter,
+        preview: QRect,
+        index: QModelIndex,
+        record,
+        dark: bool,
+        font: QFont,
+    ) -> None:
+        painter.setFont(font)
         path = record["path"] if record["kind"] == "image" else None
         if path and self.view.preview_loading_enabled and self.view.isVisible():
             try:
@@ -1704,16 +2075,469 @@ class AssetGridDelegate(QStyledItemDelegate):
                     preview.adjusted(10, 9, -10, -9),
                     content,
                     dark,
-                    option.font,
+                    font,
                 )
             else:
                 painter.setPen(QColor("#dedede" if dark else "#354052"))
-                painter.drawText(
+                self._draw_plain_text_preview(
+                    painter,
                     preview.adjusted(10, 9, -10, -9),
-                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
-                    content[:330],
+                    content,
+                    font,
                 )
 
+    def _paint_preview(
+        self,
+        painter: QPainter,
+        preview: QRect,
+        index: QModelIndex,
+        record,
+        dark: bool,
+        font: QFont,
+    ) -> None:
+        self._paint_preview_background(painter, preview, record, dark)
+        self._paint_preview_content(
+            painter,
+            preview,
+            index,
+            record,
+            dark,
+            font,
+        )
+
+    @staticmethod
+    def _transition_record_signature(record) -> tuple[object, ...]:
+        try:
+            content_hash = record["content_hash"]
+        except (KeyError, IndexError):
+            content_hash = None
+        return (
+            int(record["id"]),
+            str(record["kind"]),
+            hash(str(record["title"])),
+            hash(str(record["content"] or "")),
+            str(record["path"] or ""),
+            content_hash,
+        )
+
+    def render_transition_preview(
+        self,
+        index: QModelIndex,
+        cell_size: QSize,
+        layout_signature: tuple[object, ...] | None = None,
+    ) -> QPixmap | None:
+        record = index.data(AssetItemModel.ItemRole)
+        if record is None or cell_size.isEmpty():
+            return None
+        cell = QRect(0, 0, cell_size.width(), cell_size.height())
+        preview = self.preview_rect(cell)
+        if preview.isEmpty():
+            return None
+        device_pixel_ratio = max(1.0, float(self.view.devicePixelRatioF()))
+        dark = dark_theme_active()
+        font = self.view.font()
+        if layout_signature is None:
+            layout_signature = self.transition_layout_signature(index, cell_size)
+        if record["kind"] == "image":
+            cache_key = (
+                "transition-image",
+                self._transition_record_signature(record),
+                layout_signature,
+                round(device_pixel_ratio, 3),
+            )
+            cached = self._transition_preview_caches.pop(cache_key, None)
+            if cached is not None:
+                self._transition_preview_caches[cache_key] = cached
+                return cached
+            path = record["path"]
+            if not path:
+                return None
+            try:
+                content_hash = record["content_hash"]
+            except (KeyError, IndexError):
+                content_hash = None
+            source = self.view.thumbnail_for_index(index, path, content_hash)
+            if source is None or source.isNull():
+                return None
+            logical_size = preview.size() - QSize(12, 12)
+            physical_size = QSize(
+                max(1, round(logical_size.width() * device_pixel_ratio)),
+                max(1, round(logical_size.height() * device_pixel_ratio)),
+            )
+            pixmap = source.scaled(
+                physical_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            pixmap.setDevicePixelRatio(device_pixel_ratio)
+            self._transition_preview_caches[cache_key] = pixmap
+            while len(self._transition_preview_caches) > 192:
+                self._transition_preview_caches.popitem(last=False)
+            return pixmap
+        cache_key = (
+            self._transition_record_signature(record),
+            layout_signature,
+            dark,
+            font.toString(),
+            round(device_pixel_ratio, 3),
+        )
+        cached = self._transition_preview_caches.pop(cache_key, None)
+        if cached is not None:
+            self._transition_preview_caches[cache_key] = cached
+            return cached
+        pixmap = QPixmap(
+            max(1, round(preview.width() * device_pixel_ratio)),
+            max(1, round(preview.height() * device_pixel_ratio)),
+        )
+        pixmap.setDevicePixelRatio(device_pixel_ratio)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._paint_preview_content(
+            painter,
+            QRect(0, 0, preview.width(), preview.height()),
+            index,
+            record,
+            dark,
+            font,
+        )
+        painter.end()
+        self._transition_preview_caches[cache_key] = pixmap
+        while len(self._transition_preview_caches) > 192:
+            self._transition_preview_caches.popitem(last=False)
+        return pixmap
+
+    @staticmethod
+    def transition_image_target(preview: QRect, pixmap: QPixmap) -> QRectF:
+        available = QSizeF(
+            max(1, preview.width() - 12),
+            max(1, preview.height() - 12),
+        )
+        source_size = pixmap.deviceIndependentSize()
+        if source_size.isEmpty():
+            return QRectF()
+        target_size = source_size.scaled(
+            available,
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+        return QRectF(
+            preview.center().x() - target_size.width() / 2.0,
+            preview.center().y() - target_size.height() / 2.0,
+            target_size.width(),
+            target_size.height(),
+        )
+
+    @staticmethod
+    def transition_preview_clip(preview: QRect, kind: str) -> QRect:
+        if kind == "image":
+            return preview
+        return preview.adjusted(10, 9, -10, -9)
+
+    def paint_transition_card(
+        self,
+        painter,
+        option,
+        index,
+        preview_cache: QPixmap | None = None,
+    ) -> None:
+        record = index.data(AssetItemModel.ItemRole)
+        if record is None:
+            return
+        card = self.card_rect(option.rect)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setFont(option.font)
+        dark = dark_theme_active()
+        painter.setPen(QPen(QColor("#4da3ff") if selected else QColor("#4a4a4a" if dark else "#dfe4eb"), 1))
+        painter.setBrush(QColor("#26384d") if selected and dark else QColor("#eef4ff") if selected else QColor("#292929" if dark else "#ffffff"))
+        painter.drawRoundedRect(card, 6, 6)
+
+        muted = QColor("#a7adb7" if dark else "#7a8699")
+        kind = TYPE_LABELS.get(record["kind"], record["kind"])
+        painter.setPen(muted)
+        painter.drawText(
+            self.kind_rect(option.rect),
+            Qt.AlignmentFlag.AlignVCenter,
+            kind,
+        )
+        created_at = format_local_timestamp(record["created_at"])
+        time_text = created_at[11:16] if len(created_at) >= 16 else ""
+        painter.drawText(
+            self.time_rect(option.rect),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            time_text,
+        )
+        favorite = self.favorite_on if record["favorite"] else self.favorite_off
+        favorite_target = self.favorite_rect(option.rect)
+        painter.drawPixmap(
+            favorite_target.left() + 3,
+            favorite_target.top() + 3,
+            favorite,
+        )
+
+        preview = self.preview_rect(option.rect)
+        self._paint_preview_background(painter, preview, record, dark)
+        if preview_cache is not None and not preview_cache.isNull():
+            painter.save()
+            painter.setClipRect(
+                self.transition_preview_clip(preview, record["kind"])
+            )
+            if record["kind"] == "image":
+                target = self.transition_image_target(preview, preview_cache)
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                painter.drawPixmap(
+                    target,
+                    preview_cache,
+                    QRectF(preview_cache.rect()),
+                )
+            else:
+                painter.drawPixmap(preview.topLeft(), preview_cache)
+            painter.restore()
+        else:
+            self._paint_preview_content(
+                painter,
+                preview,
+                index,
+                record,
+                dark,
+                option.font,
+            )
+
+        painter.restore()
+
+
+@dataclass(slots=True)
+class _GridTransitionPreviewState:
+    signature: tuple[object, ...]
+    cache: QPixmap | None
+
+
+@dataclass(slots=True)
+class _GridTransitionCard:
+    row: int
+    expanded_rect: QRectF
+    collapsed_rect: QRectF
+    elevated: bool = False
+    preview_states: list[_GridTransitionPreviewState] = field(default_factory=list)
+    preview_samples: list[int] = field(default_factory=list)
+
+
+def _interpolate_rect(start: QRectF, end: QRectF, progress: float) -> QRectF:
+    return QRectF(
+        start.x() + (end.x() - start.x()) * progress,
+        start.y() + (end.y() - start.y()) * progress,
+        start.width() + (end.width() - start.width()) * progress,
+        start.height() + (end.height() - start.height()) * progress,
+    )
+
+
+def _grid_transition_rect(card: _GridTransitionCard, progress: float) -> QRectF:
+    return _interpolate_rect(card.expanded_rect, card.collapsed_rect, progress)
+
+
+def _grid_transition_card_elevated(
+    row: int,
+    expanded_columns: int,
+    collapsed_columns: int,
+) -> bool:
+    if expanded_columns == collapsed_columns:
+        return False
+    if collapsed_columns > expanded_columns:
+        return row % collapsed_columns >= expanded_columns
+    return row % expanded_columns >= collapsed_columns
+
+
+class _AssetGridTransitionOverlay:
+    def __init__(
+        self,
+        view: QListView,
+        cards: list[_GridTransitionCard],
+        expanded_columns: int,
+        collapsed_columns: int,
+        initial_progress: float = 0.0,
+    ):
+        self.view = view
+        self.cards = cards
+        self.expanded_columns = expanded_columns
+        self.collapsed_columns = collapsed_columns
+        self.progress = max(0.0, min(1.0, float(initial_progress)))
+        screen = view.screen()
+        refresh_rate = float(screen.refreshRate()) if screen is not None else 60.0
+        if refresh_rate <= 0:
+            refresh_rate = 60.0
+        refresh_rate = min(Sidebar.MAX_ANIMATION_REFRESH_RATE, refresh_rate)
+        self.preview_frame_count = max(
+            2,
+            round(Sidebar.ANIMATION_DURATION_MS * refresh_rate / 1000.0) + 1,
+        )
+        self._cards_by_row = {card.row: card for card in cards}
+        self._paint_cards = [
+            *(card for card in cards if not card.elevated),
+            *(card for card in cards if card.elevated),
+        ]
+        self._prepare_preview_caches()
+
+    @property
+    def paint_order_rows(self) -> list[int]:
+        return [card.row for card in self._paint_cards]
+
+    @property
+    def elevated_rows(self) -> list[int]:
+        return [card.row for card in self._paint_cards if card.elevated]
+
+    def _prepare_preview_caches(self) -> None:
+        for card in self.cards:
+            index = self.view.model().index(card.row, 0)
+            if not index.isValid():
+                continue
+            record = index.data(AssetItemModel.ItemRole)
+            if record is None:
+                continue
+            state_by_signature: dict[tuple[object, ...], int] = {}
+            if record["kind"] == "image":
+                sample_progresses = [
+                    max(
+                        (0.0, 1.0),
+                        key=lambda value: (
+                            _grid_transition_rect(card, value).width()
+                            * _grid_transition_rect(card, value).height()
+                        ),
+                    )
+                ]
+            else:
+                sample_progresses = [
+                    frame / (self.preview_frame_count - 1)
+                    for frame in range(self.preview_frame_count)
+                ]
+            for sample_progress in sample_progresses:
+                target = _grid_transition_rect(card, sample_progress)
+                cell_size = QSize(
+                    max(1, round(target.width())),
+                    max(1, round(target.height())),
+                )
+                signature = self.view.delegate.transition_layout_signature(
+                    index,
+                    cell_size,
+                )
+                state_index = state_by_signature.get(signature)
+                if state_index is None:
+                    state_index = len(card.preview_states)
+                    state_by_signature[signature] = state_index
+                    card.preview_states.append(
+                        _GridTransitionPreviewState(
+                            signature,
+                            self.view.delegate.render_transition_preview(
+                                index,
+                                cell_size,
+                                signature,
+                            ),
+                        )
+                    )
+                card.preview_samples.append(state_index)
+
+            if record["kind"] == "image":
+                card.preview_samples *= self.preview_frame_count
+
+    def preview_state_index(
+        self,
+        card: _GridTransitionCard,
+        progress: float | None = None,
+    ) -> int:
+        if not card.preview_samples:
+            return -1
+        value = self.progress if progress is None else progress
+        sample = round(
+            max(0.0, min(1.0, float(value)))
+            * (len(card.preview_samples) - 1)
+        )
+        return card.preview_samples[sample]
+
+    def preview_cache(
+        self,
+        card: _GridTransitionCard,
+        progress: float | None = None,
+    ) -> QPixmap | None:
+        state_index = self.preview_state_index(card, progress)
+        if state_index < 0:
+            return None
+        return card.preview_states[state_index].cache
+
+    def set_progress(self, progress: float) -> QRegion:
+        progress = max(0.0, min(1.0, float(progress)))
+        if abs(progress - self.progress) < 1e-6:
+            return QRegion()
+        previous = self.progress
+        self.progress = progress
+        dirty = QRegion()
+        for card in self.cards:
+            dirty |= QRegion(
+                _grid_transition_rect(card, previous)
+                .toAlignedRect()
+                .adjusted(-2, -2, 2, 2)
+            )
+            dirty |= QRegion(
+                _grid_transition_rect(card, progress)
+                .toAlignedRect()
+                .adjusted(-2, -2, 2, 2)
+            )
+        return dirty
+
+    def card_rect(self, row: int) -> QRectF | None:
+        card = self._cards_by_row.get(row)
+        return None if card is None else _grid_transition_rect(card, self.progress)
+
+    def index_at(self, point: QPoint) -> QModelIndex:
+        point_f = QPointF(point)
+        for card in reversed(self._paint_cards):
+            if _grid_transition_rect(card, self.progress).contains(point_f):
+                return self.view.model().index(card.row, 0)
+        return QModelIndex()
+
+    def paint(self, painter: QPainter, rect: QRect) -> None:
+        painter.fillRect(
+            rect,
+            QColor("#202020" if dark_theme_active() else "#f6f6f6"),
+        )
+        painter.setClipRect(rect)
+        for card in self._paint_cards:
+            self._draw_card(
+                painter,
+                card,
+                _grid_transition_rect(card, self.progress),
+            )
+
+    def _draw_card(
+        self,
+        painter: QPainter,
+        card: _GridTransitionCard,
+        target: QRectF,
+    ) -> None:
+        index = self.view.model().index(card.row, 0)
+        if not index.isValid():
+            return
+        option = QStyleOptionViewItem()
+        self.view.initViewItemOption(option)
+        option.rect = QRect(
+            0,
+            0,
+            max(1, round(target.width())),
+            max(1, round(target.height())),
+        )
+        option.widget = self.view
+        option.state |= QStyle.StateFlag.State_Active | QStyle.StateFlag.State_Enabled
+        if self.view.selectionModel().isSelected(index):
+            option.state |= QStyle.StateFlag.State_Selected
+        else:
+            option.state &= ~QStyle.StateFlag.State_Selected
+        painter.save()
+        painter.translate(target.x(), target.y())
+        self.view.delegate.paint_transition_card(
+            painter,
+            option,
+            index,
+            self.preview_cache(card),
+        )
         painter.restore()
 
 
@@ -1817,6 +2641,9 @@ class AssetGrid(QListView):
         self.setViewportMargins(14, 48, 14, 18)
         self.setSpacing(0)
         self.setObjectName("AssetGrid")
+        self._sidebar_transition_active = False
+        self._sidebar_transition_overlay: _AssetGridTransitionOverlay | None = None
+        self._pending_items_update: tuple[list, int | None] | None = None
         self._asset_model = AssetItemModel(self)
         self.setModel(self._asset_model)
         self.delegate = AssetGridDelegate(self)
@@ -1828,10 +2655,13 @@ class AssetGrid(QListView):
         self.rebuild_pending = False
         self._layout_updates_suspended = False
         self._layout_update_pending = False
+        self._layout_resize_mode = None
         self._thumbnail_generation = 0
         self._thumbnail_loader = _ThumbnailDecodeQueue(self)
         self._thumbnail_loader.decoded.connect(self._thumbnail_decoded)
-        self._thumbnail_loader.capacity_available.connect(self.viewport().update)
+        self._thumbnail_loader.capacity_available.connect(
+            self._thumbnail_capacity_available
+        )
         self._thumbnail_refresh_timer = QTimer(self)
         self._thumbnail_refresh_timer.setSingleShot(True)
         self._thumbnail_refresh_timer.setInterval(50)
@@ -1848,6 +2678,13 @@ class AssetGrid(QListView):
         self._update_grid_size()
 
     def set_items(self, items, selected_id: int | None = None) -> None:
+        if self._sidebar_transition_active:
+            self._pending_items_update = (list(items), selected_id)
+            return
+        self._apply_items_now(items, selected_id)
+
+    def _apply_items_now(self, items, selected_id: int | None = None) -> None:
+        self._clear_sidebar_transition(repaint=False)
         self._right_click.cancel()
         self._left_click.cancel()
         self._thumbnail_refresh_timer.stop()
@@ -1874,23 +2711,222 @@ class AssetGrid(QListView):
         event.setAccepted(scaled_event.isAccepted())
 
     def set_layout_updates_suspended(self, suspended: bool) -> None:
+        suspended = bool(suspended)
         if suspended == self._layout_updates_suspended:
             return
-        self._layout_updates_suspended = suspended
-        if not suspended and self._layout_update_pending:
+        if suspended:
+            self._layout_updates_suspended = True
             self._layout_update_pending = False
-            self._update_grid_size()
-            self._thumbnail_refresh_timer.start()
-            self.viewport().update()
+            self._layout_resize_mode = self.resizeMode()
+            self._thumbnail_refresh_timer.stop()
+            self._thumbnail_generation += 1
+            self._thumbnail_loader.cancel_queued()
+            self.setResizeMode(QListView.ResizeMode.Fixed)
+            return
 
-    def _update_grid_size(self) -> None:
-        available = max(210, self.viewport().width())
+        self._thumbnail_refresh_timer.stop()
+        self._thumbnail_generation += 1
+        self._thumbnail_loader.cancel_queued()
+        resize_mode = (
+            self._layout_resize_mode
+            if self._layout_resize_mode is not None
+            else QListView.ResizeMode.Adjust
+        )
+        self.setResizeMode(resize_mode)
+        self._layout_resize_mode = None
+        self._layout_update_pending = False
+        self._update_grid_size()
+        self._layout_updates_suspended = False
+        self.viewport().update()
+
+    @staticmethod
+    def _layout_for_viewport_width(width: int) -> tuple[int, QSize]:
+        available = max(210, int(width))
         columns = max(1, available // 245)
         gap = 12
         layout_width = max(210, available - 1)
         card_width = max(210, (layout_width - columns * gap) // columns)
+        return columns, QSize(
+            card_width + gap,
+            AssetGridDelegate.card_height + gap,
+        )
+
+    def _update_grid_size(self) -> None:
+        available = max(210, self.viewport().width())
+        columns, grid_size = self._layout_for_viewport_width(available)
         self.columns = columns
-        self.setGridSize(QSize(card_width + gap, AssetGridDelegate.card_height + gap))
+        self.setGridSize(grid_size)
+
+    @staticmethod
+    def _transition_cell_rect(
+        row: int,
+        columns: int,
+        grid_size: QSize,
+        scroll_offset: int,
+    ) -> QRectF:
+        layout_row, column = divmod(row, columns)
+        return QRectF(
+            column * grid_size.width(),
+            layout_row * grid_size.height() - scroll_offset,
+            grid_size.width(),
+            grid_size.height(),
+        )
+
+    def _transition_rows(
+        self,
+        columns: int,
+        grid_size: QSize,
+        scroll_offset: int,
+    ) -> range:
+        count = self._asset_model.rowCount()
+        if count <= 0:
+            return range(0)
+        first_layout_row = max(0, scroll_offset // grid_size.height() - 1)
+        last_layout_row = (
+            scroll_offset + self.viewport().height()
+        ) // grid_size.height() + 1
+        return range(
+            min(count, first_layout_row * columns),
+            min(count, (last_layout_row + 1) * columns),
+        )
+
+    def begin_sidebar_transition(
+        self,
+        current_sidebar_width: int,
+        progress: float,
+        expanded_sidebar_width: int = Sidebar.EXPANDED_WIDTH,
+        collapsed_sidebar_width: int = Sidebar.COLLAPSED_WIDTH,
+    ) -> bool:
+        self._clear_sidebar_transition(repaint=False)
+        if (
+            not self.isVisible()
+            or self._asset_model.rowCount() <= 0
+            or self.viewport().width() <= 0
+            or self.viewport().height() <= 0
+        ):
+            return False
+
+        current_sidebar_width = max(
+            collapsed_sidebar_width,
+            min(expanded_sidebar_width, int(current_sidebar_width)),
+        )
+        current_width = self.viewport().width()
+        expanded_width = max(
+            1,
+            current_width
+            - (expanded_sidebar_width - current_sidebar_width),
+        )
+        collapsed_width = max(
+            1,
+            current_width
+            + (current_sidebar_width - collapsed_sidebar_width),
+        )
+        return self.begin_viewport_width_transition(
+            expanded_width,
+            collapsed_width,
+            progress,
+        )
+
+    def begin_viewport_width_transition(
+        self,
+        start_viewport_width: int,
+        end_viewport_width: int,
+        progress: float = 0.0,
+    ) -> bool:
+        self._clear_sidebar_transition(repaint=False)
+        if (
+            not self.isVisible()
+            or self._asset_model.rowCount() <= 0
+            or self.viewport().width() <= 0
+            or self.viewport().height() <= 0
+        ):
+            return False
+        start_columns, start_size = self._layout_for_viewport_width(
+            max(1, int(start_viewport_width))
+        )
+        end_columns, end_size = self._layout_for_viewport_width(
+            max(1, int(end_viewport_width))
+        )
+        scroll_offset = self.verticalScrollBar().value()
+        rows = sorted(
+            set(
+                self._transition_rows(
+                    start_columns,
+                    start_size,
+                    scroll_offset,
+                )
+            )
+            | set(
+                self._transition_rows(
+                    end_columns,
+                    end_size,
+                    scroll_offset,
+                )
+            )
+        )
+        if not rows:
+            return False
+
+        cards = [
+            _GridTransitionCard(
+                row=row,
+                expanded_rect=self._transition_cell_rect(
+                    row,
+                    start_columns,
+                    start_size,
+                    scroll_offset,
+                ),
+                collapsed_rect=self._transition_cell_rect(
+                    row,
+                    end_columns,
+                    end_size,
+                    scroll_offset,
+                ),
+                elevated=_grid_transition_card_elevated(
+                    row,
+                    start_columns,
+                    end_columns,
+                ),
+            )
+            for row in rows
+        ]
+        overlay = _AssetGridTransitionOverlay(
+            self,
+            cards,
+            start_columns,
+            end_columns,
+            progress,
+        )
+        self._sidebar_transition_overlay = overlay
+        self._sidebar_transition_active = True
+        return True
+
+    def set_sidebar_transition_progress(self, progress: float) -> None:
+        overlay = self._sidebar_transition_overlay
+        if not self._sidebar_transition_active or overlay is None:
+            return
+        dirty = overlay.set_progress(progress)
+        if not dirty.isEmpty():
+            self.viewport().update(dirty)
+
+    def finish_sidebar_transition(self) -> None:
+        self._clear_sidebar_transition(repaint=True)
+        self._apply_pending_items_update()
+
+    def _apply_pending_items_update(self) -> None:
+        pending = self._pending_items_update
+        self._pending_items_update = None
+        if pending is not None:
+            self._apply_items_now(*pending)
+
+    def _clear_sidebar_transition(self, repaint: bool) -> None:
+        overlay = self._sidebar_transition_overlay
+        if overlay is None and not self._sidebar_transition_active:
+            return
+        self._sidebar_transition_active = False
+        self._sidebar_transition_overlay = None
+        if repaint and self.viewport().isVisible():
+            self.viewport().repaint()
 
     def set_preview_loading_enabled(self, enabled: bool) -> None:
         if enabled == self.preview_loading_enabled:
@@ -1898,10 +2934,13 @@ class AssetGrid(QListView):
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
         self.preview_loading_enabled = enabled
-        if enabled and self.isVisible():
+        if enabled and self.isVisible() and not self._layout_updates_suspended:
             self.viewport().update()
 
     def hideEvent(self, event) -> None:
+        self._clear_sidebar_transition(repaint=False)
+        self.delegate.clear_transition_caches()
+        self._apply_pending_items_update()
         self._right_click.cancel()
         self._left_click.cancel()
         self._thumbnail_refresh_timer.stop()
@@ -1913,11 +2952,16 @@ class AssetGrid(QListView):
         super().showEvent(event)
         if self.rebuild_pending:
             self.rebuild_pending = False
-            self._update_grid_size()
-        if self.preview_loading_enabled:
+            if self._layout_updates_suspended:
+                self._layout_update_pending = True
+            else:
+                self._update_grid_size()
+        if self.preview_loading_enabled and not self._layout_updates_suspended:
             self.viewport().update()
 
     def closeEvent(self, event) -> None:
+        self._clear_sidebar_transition(repaint=False)
+        self._apply_pending_items_update()
         self._right_click.cancel()
         self._left_click.cancel()
         self._thumbnail_refresh_timer.stop()
@@ -1936,7 +2980,11 @@ class AssetGrid(QListView):
 
     def resume_thumbnail_loader(self) -> None:
         self._thumbnail_loader.resume()
-        if self.preview_loading_enabled and self.isVisible():
+        if (
+            self.preview_loading_enabled
+            and self.isVisible()
+            and not self._layout_updates_suspended
+        ):
             self.viewport().update()
 
     def thumbnail_for_index(
@@ -1948,6 +2996,7 @@ class AssetGrid(QListView):
         if (
             key is None
             or not self.preview_loading_enabled
+            or self._layout_updates_suspended
             or not self.isVisible()
             or not index.isValid()
             or not self.visualRect(index).intersects(self.viewport().rect())
@@ -1968,20 +3017,31 @@ class AssetGrid(QListView):
         self._asset_model.notify_thumbnail_changed(key.path, model_generation)
 
     def _thumbnail_viewport_changed(self, _value: int) -> None:
+        if self._layout_updates_suspended:
+            return
         self._thumbnail_refresh_timer.start()
 
     def _refresh_thumbnail_generation(self) -> None:
+        if self._layout_updates_suspended:
+            return
         self._thumbnail_generation += 1
         self._thumbnail_loader.cancel_queued()
         self.viewport().update()
 
+    def _thumbnail_capacity_available(self) -> None:
+        if not self._layout_updates_suspended:
+            self.viewport().update()
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if self._asset_model.rowCount() == 0:
-            painter = QPainter(self.viewport())
+        painter = QPainter(self.viewport())
+        overlay = self._sidebar_transition_overlay
+        if self._sidebar_transition_active and overlay is not None:
+            overlay.paint(painter, self.viewport().rect())
+        elif self._asset_model.rowCount() == 0:
             painter.setPen(QColor("#a7adb7" if dark_theme_active() else "#7a8699"))
             painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, "没有找到符合条件的内容")
-            painter.end()
+        painter.end()
 
     def clear_selection(self) -> None:
         self.selected_id = None
@@ -2036,6 +3096,27 @@ class AssetGrid(QListView):
         if record is not None:
             self.item_activated.emit(int(record["id"]))
 
+    def _visual_index_at(self, point: QPoint) -> QModelIndex:
+        overlay = self._sidebar_transition_overlay
+        if self._sidebar_transition_active and overlay is not None:
+            return overlay.index_at(point)
+        return self.indexAt(point)
+
+    def _visual_rect_for_index(self, index: QModelIndex) -> QRect:
+        overlay = self._sidebar_transition_overlay
+        if (
+            self._sidebar_transition_active
+            and overlay is not None
+            and index.isValid()
+        ):
+            rect = overlay.card_rect(index.row())
+            if rect is not None:
+                return rect.toRect()
+        return self.visualRect(index)
+
+    def _favorite_rect_for_index(self, index: QModelIndex) -> QRect:
+        return self.delegate.favorite_rect(self._visual_rect_for_index(index))
+
     def mousePressEvent(self, event) -> None:
         point = event.position().toPoint()
         if event.button() == Qt.MouseButton.LeftButton:
@@ -2054,9 +3135,17 @@ class AssetGrid(QListView):
         else:
             self._right_click.cancel()
         if event.button() == Qt.MouseButton.LeftButton:
-            index = self.indexAt(point)
-            if index.isValid() and self.delegate.favorite_rect(self.visualRect(index)).contains(point):
+            index = self._visual_index_at(point)
+            if index.isValid() and self._favorite_rect_for_index(index).contains(point):
                 self._favorite_press_row = index.row()
+                event.accept()
+                return
+            if self._sidebar_transition_active and index.isValid():
+                self.selectionModel().select(
+                    index,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect,
+                )
+                self.setCurrentIndex(index)
                 event.accept()
                 return
         self._favorite_press_row = -1
@@ -2073,17 +3162,25 @@ class AssetGrid(QListView):
                 event.accept()
                 return
         if self._favorite_press_row >= 0 and event.button() == Qt.MouseButton.LeftButton:
-            index = self.indexAt(event.position().toPoint())
+            index = self._visual_index_at(event.position().toPoint())
             pressed_row = self._favorite_press_row
             self._favorite_press_row = -1
             if (
                 index.isValid()
                 and index.row() == pressed_row
-                and self.delegate.favorite_rect(self.visualRect(index)).contains(event.position().toPoint())
+                and self._favorite_rect_for_index(index).contains(
+                    event.position().toPoint()
+                )
             ):
                 record = index.data(AssetItemModel.ItemRole)
                 self.select_item(int(record["id"]))
                 self.favorite_requested.emit(int(record["id"]), not bool(record["favorite"]))
+            event.accept()
+            return
+        if (
+            self._sidebar_transition_active
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -2093,8 +3190,12 @@ class AssetGrid(QListView):
         if event.button() == Qt.MouseButton.RightButton:
             event.accept()
             return
-        index = self.indexAt(point)
-        if event.button() == Qt.MouseButton.LeftButton and index.isValid() and self.delegate.favorite_rect(self.visualRect(index)).contains(point):
+        index = self._visual_index_at(point)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and index.isValid()
+            and self._favorite_rect_for_index(index).contains(point)
+        ):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
@@ -2102,17 +3203,21 @@ class AssetGrid(QListView):
             if self._left_click.double_click(triple_click_id):
                 event.accept()
                 return
+            if self._sidebar_transition_active and index.isValid():
+                self._index_activated(index)
+                event.accept()
+                return
         super().mouseDoubleClickEvent(event)
 
     def _item_id_at(self, point: QPoint) -> int | None:
-        index = self.indexAt(point)
+        index = self._visual_index_at(point)
         if not index.isValid():
             return None
         record = index.data(AssetItemModel.ItemRole)
         return None if record is None else int(record["id"])
 
     def _image_id_at(self, point: QPoint) -> int | None:
-        index = self.indexAt(point)
+        index = self._visual_index_at(point)
         if not index.isValid():
             return None
         record = index.data(AssetItemModel.ItemRole)
@@ -2121,7 +3226,7 @@ class AssetGrid(QListView):
         return int(record["id"])
 
     def _triple_click_id_at(self, point: QPoint) -> int | None:
-        index = self.indexAt(point)
+        index = self._visual_index_at(point)
         if not index.isValid():
             return None
         record = index.data(AssetItemModel.ItemRole)
@@ -2217,11 +3322,39 @@ class AssetTable(QTableView):
         self._favorite_press_row = -1
         self._right_click = _ItemRightClickGesture(self)
         self._left_click = _ItemTripleClickGesture(self)
+        self._layout_updates_suspended = False
+        self._content_column_resize_mode = None
+        self._content_column_width = 0
 
     def wheelEvent(self, event) -> None:
         scaled_event = _half_speed_wheel_event(event, self._wheel_remainder)
         super().wheelEvent(scaled_event)
         event.setAccepted(scaled_event.isAccepted())
+
+    def set_layout_updates_suspended(self, suspended: bool) -> None:
+        suspended = bool(suspended)
+        if suspended == self._layout_updates_suspended:
+            return
+        header = self.horizontalHeader()
+        if suspended:
+            self._layout_updates_suspended = True
+            self._content_column_resize_mode = header.sectionResizeMode(0)
+            self._content_column_width = self.columnWidth(0)
+            header.setSectionResizeMode(0, header.ResizeMode.Fixed)
+            self.setColumnWidth(0, self._content_column_width)
+            return
+
+        resize_mode = (
+            self._content_column_resize_mode
+            if self._content_column_resize_mode is not None
+            else header.ResizeMode.Stretch
+        )
+        header.setSectionResizeMode(0, resize_mode)
+        if resize_mode == header.ResizeMode.Fixed:
+            self.setColumnWidth(0, self._content_column_width)
+        self._content_column_resize_mode = None
+        self._layout_updates_suspended = False
+        self.viewport().update()
 
     def set_items(self, items, selected_id: int | None = None) -> None:
         self._right_click.cancel()
@@ -2433,6 +3566,62 @@ def _wrap_detail_text(value: object, interval: int = 24) -> str:
     return str(value)
 
 
+class _DetailImagePreview(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._source_pixmap = QPixmap()
+
+    def set_source_pixmap(self, pixmap: QPixmap | None) -> None:
+        self._source_pixmap = (
+            QPixmap(pixmap)
+            if pixmap is not None and not pixmap.isNull()
+            else QPixmap()
+        )
+        super().clear()
+        self.update()
+
+    def clear(self) -> None:
+        self._source_pixmap = QPixmap()
+        super().clear()
+        self.update()
+
+    def pixmap(self) -> QPixmap:
+        return self._source_pixmap
+
+    def image_target_rect(self) -> QRectF:
+        if self._source_pixmap.isNull():
+            return QRectF()
+        available = QSizeF(
+            max(1, self.width()),
+            max(1, min(230, self.height())),
+        )
+        source_size = self._source_pixmap.deviceIndependentSize()
+        target_size = source_size.scaled(
+            available,
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+        return QRectF(
+            (self.width() - target_size.width()) / 2.0,
+            (self.height() - target_size.height()) / 2.0,
+            target_size.width(),
+            target_size.height(),
+        )
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._source_pixmap.isNull():
+            return
+        target = self.image_target_rect()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawPixmap(
+            target,
+            self._source_pixmap,
+            QRectF(self._source_pixmap.rect()),
+        )
+        painter.end()
+
+
 class DetailPanel(QScrollArea):
     close_requested = Signal()
     copy_requested = Signal(int)
@@ -2471,6 +3660,8 @@ class DetailPanel(QScrollArea):
         self._tag_names: list[str] = []
         self._tag_colors: list[str] = []
         self._tags_expanded = False
+        self._width_transition_active = False
+        self._width_transition_layout_frozen = False
         self.tags_more_button: QPushButton | None = None
         self.content_widget = QWidget()
         self.content_widget.setObjectName("DetailPanelContent")
@@ -2495,7 +3686,7 @@ class DetailPanel(QScrollArea):
         self.title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         layout.addWidget(self.title)
         self.preview_stack = QStackedWidget()
-        self.image_preview = QLabel()
+        self.image_preview = _DetailImagePreview()
         self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_preview.setMinimumHeight(190)
         self.image_preview.setMinimumWidth(0)
@@ -2600,6 +3791,75 @@ class DetailPanel(QScrollArea):
         layout.addLayout(actions)
         self.setWidget(self.content_widget)
         self.clear_item()
+
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        if self._width_transition_active:
+            return QSize(0, hint.height())
+        return hint
+
+    def _set_width_transition_layout_frozen(self, frozen: bool) -> None:
+        layout = self.content_widget.layout()
+        frozen = bool(frozen)
+        if self._width_transition_layout_frozen == frozen:
+            return
+        self._width_transition_layout_frozen = frozen
+        layout.setEnabled(not frozen)
+        if not frozen:
+            layout.activate()
+
+    def begin_width_transition(
+        self,
+        final_panel_width: int,
+        final_content_width: int | None = None,
+    ) -> None:
+        final_panel_width = max(1, int(final_panel_width))
+        self._set_width_transition_layout_frozen(False)
+        self._width_transition_active = True
+        self.setWidgetResizable(False)
+        content_width = max(
+            1,
+            int(final_content_width)
+            if final_content_width is not None
+            else final_panel_width
+            - self.verticalScrollBar().sizeHint().width(),
+        )
+        self.content_widget.setFixedWidth(content_width)
+        self.content_widget.layout().activate()
+        self.content_widget.resize(
+            content_width,
+            max(
+                self.viewport().height(),
+                self.content_widget.sizeHint().height(),
+            ),
+        )
+        self._refresh_image_preview()
+
+    def synchronize_width_transition_content(self) -> None:
+        if not self._width_transition_active:
+            return
+        content_width = max(1, self.viewport().width())
+        self.content_widget.setFixedWidth(content_width)
+        self.content_widget.layout().activate()
+        self.content_widget.resize(
+            content_width,
+            max(
+                self.viewport().height(),
+                self.content_widget.sizeHint().height(),
+            ),
+        )
+        self._set_width_transition_layout_frozen(True)
+
+    def finish_width_transition(self) -> None:
+        if not self._width_transition_active:
+            return
+        self._set_width_transition_layout_frozen(False)
+        self._width_transition_active = False
+        self.content_widget.setMinimumWidth(0)
+        self.content_widget.setMaximumWidth(16_777_215)
+        self.setWidgetResizable(True)
+        self.content_widget.updateGeometry()
+        self._refresh_image_preview()
 
     def set_collections(self, collections) -> None:
         selected = self.collection_combo.currentData()
@@ -2749,24 +4009,12 @@ class DetailPanel(QScrollArea):
         if pixmap is None or pixmap.isNull():
             return
         self._image_source_pixmap = QPixmap(pixmap)
-        self._refresh_image_preview()
+        self.image_preview.set_source_pixmap(self._image_source_pixmap)
 
     def _refresh_image_preview(self) -> None:
         if self._image_source_pixmap.isNull():
             return
-        available_width = max(
-            1,
-            min(self.image_preview.width(), self.viewport().width() - 32),
-        )
-        available_height = max(1, min(230, self.image_preview.height()))
-        self.image_preview.setPixmap(
-            self._image_source_pixmap.scaled(
-                available_width,
-                available_height,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        self.image_preview.update()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

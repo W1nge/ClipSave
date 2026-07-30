@@ -7,7 +7,7 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QElapsedTimer, QEvent, QObject, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QIcon, QImage, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -193,6 +193,26 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._quit_in_progress = False
         self._interactive_resize_active = False
+        self._sidebar_animation_active = False
+        self._detail_animation_active = False
+        self._detail_animation_target_visible = False
+        self._detail_animation_progress = 0.0
+        self._detail_animation_start_progress = 0.0
+        self._detail_animation_end_progress = 0.0
+        self._detail_animation_target_width = 340
+        self._detail_animation_timer = QTimer(self)
+        self._detail_animation_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._detail_animation_timer.timeout.connect(
+            self._advance_detail_animation
+        )
+        self._detail_animation_elapsed = QElapsedTimer()
+        self._pending_sidebar_collapsed: bool | None = None
+        self._sidebar_setting_timer = QTimer(self)
+        self._sidebar_setting_timer.setSingleShot(True)
+        self._sidebar_setting_timer.setInterval(250)
+        self._sidebar_setting_timer.timeout.connect(
+            self._flush_pending_sidebar_collapsed_setting
+        )
         self._native_resize_frame_enabled = False
         self._native_resize_frame_hwnd: int | None = None
         self._native_acrylic_hwnd: int | None = None
@@ -288,6 +308,7 @@ class MainWindow(QMainWindow):
         body_layout = QHBoxLayout(body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(0)
+        self._body_layout = body_layout
         root_layout.addWidget(body, 1)
 
         self.brand_label = BrandLabel("ClipSave", "#21a8fb", 0.86, root)
@@ -301,8 +322,9 @@ class MainWindow(QMainWindow):
         self.sidebar.delete_collection_requested.connect(self.delete_collection)
         self.sidebar.delete_tag_requested.connect(self.delete_tag)
         self.sidebar.settings_requested.connect(self.open_settings)
-        self.sidebar.collapsed_changed.connect(lambda value: self._save_setting("sidebar_collapsed", value))
+        self.sidebar.collapsed_changed.connect(self._queue_sidebar_collapsed_setting)
         self.sidebar.width_animation_started.connect(self._begin_sidebar_animation)
+        self.sidebar.width_animation_progress.connect(self._update_sidebar_animation)
         self.sidebar.width_animation_finished.connect(self._end_sidebar_animation)
         body_layout.addWidget(self.sidebar)
 
@@ -326,7 +348,7 @@ class MainWindow(QMainWindow):
         self.search.setPlaceholderText("搜索剪贴板内容、文件名、标签、OCR 或 AI 描述  (Ctrl+K)")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(560)
-        self.search.setMinimumWidth(160)
+        self.search.setMinimumWidth(120)
         self.search.textChanged.connect(self._search_text_changed)
         top_layout.addWidget(self.search, 3)
         self.expanded_search_button = QPushButton("扩大搜索")
@@ -666,16 +688,35 @@ class MainWindow(QMainWindow):
         if not self._interactive_resize_active:
             return
         self._interactive_resize_active = False
-        self.grid.set_layout_updates_suspended(False)
+        self.grid.set_layout_updates_suspended(
+            self._sidebar_animation_active or self._detail_animation_active
+        )
 
     def _begin_sidebar_animation(self) -> None:
+        if self._sidebar_animation_active:
+            return
+        if self._detail_animation_active:
+            self._finish_detail_animation()
+        self._sidebar_animation_active = True
         self.grid.set_layout_updates_suspended(True)
-        self.table.setUpdatesEnabled(False)
+        self.grid.begin_sidebar_transition(
+            self.sidebar.width(),
+            self.sidebar.collapse_progress,
+        )
+
+    def _update_sidebar_animation(self, progress: float) -> None:
+        if not self._sidebar_animation_active:
+            return
+        self._body_layout.activate()
+        self.grid.set_sidebar_transition_progress(progress)
 
     def _end_sidebar_animation(self) -> None:
-        self.grid.set_layout_updates_suspended(False)
-        self.table.setUpdatesEnabled(True)
-        self.table.viewport().update()
+        if not self._sidebar_animation_active:
+            return
+        self._sidebar_animation_active = False
+        self._body_layout.activate()
+        self.grid.set_layout_updates_suspended(self._interactive_resize_active)
+        self.grid.finish_sidebar_transition()
 
     def build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.app_icon, self)
@@ -936,40 +977,192 @@ class MainWindow(QMainWindow):
                 self.detail.set_ocr_busy(True)
 
     def toggle_detail(self) -> None:
-        if self.detail.isVisible():
+        if self._detail_animation_target_visible:
             self.hide_detail()
         else:
-            self.detail.setVisible(True)
-            self._restore_detail_splitter_size()
-            self.detail_button.setToolTip("收起详情")
             if self.current_item_id:
                 self.update_detail(self.current_item_id)
+            self._start_detail_animation(True)
 
     def show_item_detail(self, item_id: int) -> None:
-        if self.detail.isVisible() and self.current_item_id == item_id:
+        if (
+            self._detail_animation_target_visible
+            and self.current_item_id == item_id
+        ):
             self.hide_detail()
             return
         self.select_item(item_id)
         if self.current_item_id != item_id:
             return
-        if not self.detail.isVisible():
-            self.detail.setVisible(True)
-            self._restore_detail_splitter_size()
-            self.detail_button.setToolTip("收起详情")
-            self.update_detail(item_id)
+        self.update_detail(item_id)
+        self._start_detail_animation(True)
 
     def hide_detail(self) -> None:
-        self.detail.setVisible(False)
-        self.detail_button.setToolTip("显示详情")
+        self._start_detail_animation(False)
+
+    def _desired_detail_width(self) -> int:
+        total = max(
+            1,
+            self.content_splitter.width()
+            - self.content_splitter.handleWidth(),
+        )
+        desired = min(520, max(280, getattr(self, "_detail_width", 340)))
+        if total > 0:
+            desired = min(desired, max(280, total - 240))
+        return max(1, desired)
+
+    def _start_detail_animation(self, visible: bool) -> None:
+        visible = bool(visible)
+        end_progress = 1.0 if visible else 0.0
+        if (
+            not self._detail_animation_active
+            and abs(self._detail_animation_progress - end_progress) < 1e-6
+        ):
+            self._detail_animation_target_visible = visible
+            self.detail.setVisible(visible)
+            self.detail_button.setToolTip(
+                "收起详情" if visible else "显示详情"
+            )
+            return
+        if self._sidebar_animation_active:
+            self.sidebar.set_collapsed(self.sidebar.collapsed, animate=False)
+
+        self._detail_animation_target_visible = visible
+        self._detail_animation_timer.stop()
+        target_width = self._desired_detail_width()
+        self._detail_animation_target_width = target_width
+        self.detail.setMinimumWidth(0)
+        self.detail.setMaximumWidth(target_width)
+        self.content_splitter.setCollapsible(1, True)
+        self.detail.setVisible(True)
+        self._body_layout.activate()
+        pane_total = max(
+            1,
+            self.content_splitter.width()
+            - self.content_splitter.handleWidth(),
+        )
+        if pane_total > 0:
+            target_width = min(
+                target_width,
+                max(1, pane_total - 240),
+            )
+            self._detail_animation_target_width = target_width
+            self.detail.setMaximumWidth(target_width)
+        starting_transaction = not self._detail_animation_active
+        if not self._detail_animation_active:
+            self._detail_animation_active = True
+            self.grid.set_layout_updates_suspended(True)
+
+        self._apply_detail_panel_width(0)
+        hidden_viewport_width = self.grid.viewport().width()
+        self._apply_detail_panel_width(target_width)
+        shown_viewport_width = self.grid.viewport().width()
+        if starting_transaction:
+            self.detail.begin_width_transition(
+                target_width,
+                self.detail.viewport().width(),
+            )
+            self._body_layout.activate()
+            QApplication.sendPostedEvents(
+                None,
+                QEvent.Type.LayoutRequest,
+            )
+            self.detail.synchronize_width_transition_content()
+        self._apply_detail_panel_width(
+            round(target_width * self._detail_animation_progress)
+        )
+        self.grid.begin_viewport_width_transition(
+            hidden_viewport_width,
+            shown_viewport_width,
+            self._detail_animation_progress,
+        )
+        self._detail_animation_start_progress = self._detail_animation_progress
+        self._detail_animation_end_progress = end_progress
+        screen = self.screen()
+        refresh_rate = float(screen.refreshRate()) if screen is not None else 60.0
+        if refresh_rate < 30.0:
+            refresh_rate = 60.0
+        refresh_rate = min(
+            Sidebar.MAX_ANIMATION_REFRESH_RATE,
+            refresh_rate,
+        )
+        self._detail_animation_timer.setInterval(
+            max(1, round(1000.0 / refresh_rate))
+        )
+        self._detail_animation_elapsed.start()
+        self._detail_animation_timer.start()
+        self.detail_button.setToolTip(
+            "收起详情" if visible else "显示详情"
+        )
+
+    def _advance_detail_animation(self) -> None:
+        if not self._detail_animation_active:
+            self._detail_animation_timer.stop()
+            return
+        elapsed_ms = (
+            self._detail_animation_elapsed.nsecsElapsed() / 1_000_000.0
+        )
+        fraction = min(1.0, elapsed_ms / Sidebar.ANIMATION_DURATION_MS)
+        progress = self._detail_animation_start_progress + (
+            self._detail_animation_end_progress
+            - self._detail_animation_start_progress
+        ) * fraction
+        self._set_detail_animation_progress(progress)
+        if fraction >= 1.0:
+            self._finish_detail_animation()
+
+    def _set_detail_animation_progress(self, progress: float) -> None:
+        progress = max(0.0, min(1.0, float(progress)))
+        self._detail_animation_progress = progress
+        width = round(self._detail_animation_target_width * progress)
+        self._apply_detail_panel_width(width)
+        self.grid.set_sidebar_transition_progress(progress)
+
+    def _apply_detail_panel_width(self, width: int) -> None:
+        total = max(
+            1,
+            self.content_splitter.width()
+            - self.content_splitter.handleWidth(),
+        )
+        self.content_splitter.setSizes(
+            [max(0, total - width), max(0, width)]
+        )
+        self._body_layout.activate()
+
+    def _finish_detail_animation(self) -> None:
+        self._detail_animation_timer.stop()
+        endpoint = 1.0 if self._detail_animation_target_visible else 0.0
+        self._set_detail_animation_progress(endpoint)
+        self._detail_animation_active = False
+        self.grid.set_layout_updates_suspended(
+            self._interactive_resize_active
+        )
+        self.grid.finish_sidebar_transition()
+        self.detail.finish_width_transition()
+        self.detail.setMinimumWidth(280)
+        self.detail.setMaximumWidth(520)
+        if self._detail_animation_target_visible:
+            self._restore_detail_splitter_size()
+        else:
+            self.detail.setVisible(False)
+        self.content_splitter.setCollapsible(1, False)
+        self._body_layout.activate()
 
     def _detail_splitter_moved(self, _position: int, _index: int) -> None:
-        if self.detail.isVisible():
+        if self.detail.isVisible() and not self._detail_animation_active:
             self._detail_width = max(self.detail.minimumWidth(), self.detail.width())
 
     def _restore_detail_splitter_size(self) -> None:
-        if not hasattr(self, "content_splitter"):
+        if (
+            not hasattr(self, "content_splitter")
+            or self._detail_animation_active
+        ):
             return
-        total = self.content_splitter.width()
+        total = max(
+            1,
+            self.content_splitter.width()
+            - self.content_splitter.handleWidth(),
+        )
         if total <= 0:
             QTimer.singleShot(0, self._restore_detail_splitter_size)
             return
@@ -1087,6 +1280,34 @@ class MainWindow(QMainWindow):
             self.settings.set(key, value)
         except OSError as exc:
             self.show_error_status(f"设置无法保存：{exc}")
+
+    def _queue_sidebar_collapsed_setting(self, value: bool) -> None:
+        value = bool(value)
+        if self._pending_sidebar_collapsed is None and bool(
+            self.settings.get("sidebar_collapsed", False)
+        ) == value:
+            return
+        if (
+            self._pending_sidebar_collapsed == value
+            and self._sidebar_setting_timer.isActive()
+        ):
+            return
+        self._pending_sidebar_collapsed = value
+        self._sidebar_setting_timer.start()
+
+    def _flush_pending_sidebar_collapsed_setting(self, force: bool = False) -> None:
+        self._sidebar_setting_timer.stop()
+        if not force and self._sidebar_animation_active:
+            self._sidebar_setting_timer.start()
+            return
+        value = self._pending_sidebar_collapsed
+        self._pending_sidebar_collapsed = None
+        if (
+            value is None
+            or bool(self.settings.get("sidebar_collapsed", False)) == value
+        ):
+            return
+        self._save_setting("sidebar_collapsed", value)
 
     def update_monitor_button(self, active: bool) -> None:
         self.capture_status.set_active(active)
@@ -1355,10 +1576,10 @@ class MainWindow(QMainWindow):
         if self.database.get_item(item_id) is None:
             return
         self.select_item(item_id)
-        if detail_was_visible and not self.detail.isVisible():
-            self.detail.setVisible(True)
         if detail_was_visible:
             self.update_detail(item_id)
+            if not self._detail_animation_target_visible:
+                self._start_detail_animation(True)
 
     def _delete_finished(
         self, token: object, signals: AsyncSignals, item_id: int, result: object
@@ -2909,6 +3130,7 @@ class MainWindow(QMainWindow):
         )
 
     def quit_application_for_session_end(self, timeout: float) -> bool:
+        self._flush_pending_sidebar_collapsed_setting(force=True)
         if self._closing:
             return True
         if self._quit_in_progress or timeout <= 0:
@@ -3036,6 +3258,7 @@ class MainWindow(QMainWindow):
         return True
 
     def quit_application(self) -> bool:
+        self._flush_pending_sidebar_collapsed_setting(force=True)
         if self._closing or self._quit_in_progress:
             return False
         self._quit_in_progress = True

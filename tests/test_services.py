@@ -1,3 +1,4 @@
+import base64
 import json
 import io
 import os
@@ -985,6 +986,76 @@ class AIServiceTests(unittest.TestCase):
         self.assertEqual(payload["model"], "vision")
         self.assertIn("OR 搜索", payload["messages"][0]["content"])
         self.assertIn('"蓝色 报错窗口"', payload["messages"][1]["content"])
+        self.assertEqual(payload["reasoning_effort"], "high")
+        self.assertNotIn("temperature", payload)
+
+    def test_search_expansion_retries_without_unsupported_reasoning_effort(self):
+        service = AIService(
+            "http://reasoning-fallback.test/v1",
+            "credential-a",
+            "vision-reasoning-fallback",
+        )
+        service._post = Mock(
+            side_effect=[
+                services_module._AIServiceRequestError(
+                    400,
+                    '{"error":{"message":"Unsupported parameter: reasoning_effort"}}',
+                ),
+                {"choices": [{"message": {"content": '{"terms":["error dialog"]}'}}]},
+            ]
+        )
+
+        self.assertEqual(
+            service.expand_search_query("错误弹窗"),
+            ["错误弹窗", "error dialog"],
+        )
+        self.assertEqual(service._post.call_count, 2)
+        first_payload = service._post.call_args_list[0].args[1]
+        fallback_payload = service._post.call_args_list[1].args[1]
+        self.assertEqual(first_payload["reasoning_effort"], "high")
+        self.assertNotIn("reasoning_effort", fallback_payload)
+        self.assertNotIn("temperature", fallback_payload)
+
+        cached_service = AIService(
+            "http://reasoning-fallback.test/v1",
+            "credential-a",
+            "vision-reasoning-fallback",
+        )
+        cached_service._post = Mock(
+            return_value={"choices": [{"message": {"content": '{"terms":["dialog"]}'}}]}
+        )
+        self.assertEqual(
+            cached_service.expand_search_query("弹窗"),
+            ["弹窗", "dialog"],
+        )
+        cached_payload = cached_service._post.call_args.args[1]
+        self.assertNotIn("reasoning_effort", cached_payload)
+        self.assertNotIn("temperature", cached_payload)
+
+    def test_completion_parser_removes_only_leading_reasoning_content(self):
+        result = {
+            "choices": [{
+                "message": {
+                    "reasoning_content": "独立字段中的思考过程",
+                    "content": [
+                        {"type": "reasoning", "text": "结构化思考过程"},
+                        {
+                            "type": "text",
+                            "text": (
+                                "<thinking>标签思考过程</thinking>\n"
+                                "<think>第二段思考过程</think>\n"
+                                "最终答案包含字面量 <thinking>正文标签</thinking>"
+                            ),
+                        },
+                    ],
+                }
+            }]
+        }
+
+        self.assertEqual(
+            AIService._completion_text_from_response(result),
+            "最终答案包含字面量 <thinking>正文标签</thinking>",
+        )
 
     def test_search_expansion_rejects_invalid_or_empty_json(self):
         service = AIService("http://localhost/v1", "", "vision")
@@ -1125,7 +1196,14 @@ class AIServiceTests(unittest.TestCase):
         self.assertEqual(post.call_args.args[0], "/chat/completions")
         payload = post.call_args.args[1]
         self.assertEqual(payload["model"], "vision")
-        self.assertEqual(payload["messages"][0]["content"][0]["text"], "ocr this")
+        self.assertEqual(
+            payload["messages"][0]["content"][0]["text"],
+            service.OCR_PROMPT,
+        )
+        self.assertIn("只输出转写结果", service.OCR_PROMPT)
+        self.assertIn("不要翻译", service.OCR_PROMPT)
+        self.assertIn("返回空内容", service.OCR_PROMPT)
+        self.assertNotIn("temperature", payload)
         self.assertTrue(payload["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
 
     def test_ocr_image_accepts_an_empty_result_as_no_detected_text(self):
@@ -1140,6 +1218,24 @@ class AIServiceTests(unittest.TestCase):
                 return_value={"choices": [{"message": {"content": "   "}}]},
             ):
                 self.assertEqual(service.ocr_image(path), "")
+
+    def test_vision_encoding_preserves_aspect_ratio_and_does_not_upscale(self):
+        service = AIService("http://localhost/v1", "", "vision")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            large = root / "large.png"
+            small = root / "small.png"
+            PILImage.new("RGB", (320, 160), "white").save(large)
+            PILImage.new("RGB", (80, 40), "white").save(small)
+
+            with patch("clipsave_app.services.PICTURE_DIR", root):
+                large_encoded = service._encode_image(large, max_dimension=100)
+                small_encoded = service._encode_image(small, max_dimension=100)
+
+            with PILImage.open(io.BytesIO(base64.b64decode(large_encoded))) as image:
+                self.assertEqual(image.size, (100, 50))
+            with PILImage.open(io.BytesIO(base64.b64decode(small_encoded))) as image:
+                self.assertEqual(image.size, (80, 40))
 
     def test_description_prompt_is_structured_for_search_and_supports_content_parts(self):
         service = AIService("http://localhost/v1", "", "vision")
@@ -1156,6 +1252,7 @@ class AIServiceTests(unittest.TestCase):
             ) as post:
                 self.assertEqual(service.describe_image(path), "概览：一张截图")
         payload = post.call_args.args[1]
+        self.assertNotIn("temperature", payload)
         self.assertEqual(
             payload["messages"][0]["content"][0]["text"],
             service.IMAGE_DESCRIPTION_PROMPT,
