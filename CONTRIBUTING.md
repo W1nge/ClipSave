@@ -1,5 +1,7 @@
 # Contributing
 
+Windows release builds require the .NET 8 SDK in addition to the Python build environment. `build.bat` uses it to NativeAOT-compile the small Windows App SDK backdrop bridge; end users of the packaged application do not need .NET installed.
+
 ## Development setup
 
 1. Use Windows 10 or 11 with Python 3.11+.

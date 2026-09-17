@@ -43,18 +43,23 @@ from .constants import APP_NAME, LIBRARY_DIR, MAX_IMPORT_BYTES, MAX_MARKDOWN_BYT
 from .database import ImportFileResult, LibraryDatabase
 from .services import (
     AIService,
+    BackdropResult,
     ClipboardService,
     OperationCancelled,
     TaskCapacityExceeded,
     ai_ocr_task_executor,
-    apply_windows_acrylic,
+    apply_windows_backdrop,
     preflight_image_file,
+    register_windows_power_saving_notification,
+    release_windows_backdrop,
+    set_windows_backdrop_input_active,
     shutdown_ai_ocr_task_executor,
+    unregister_windows_power_saving_notification,
 )
 from .settings import Settings
 from .startup import set_start_with_windows
 from .storage import is_under_local_store, recycle_managed_file
-from .styles import DARK_STYLESHEET, LIGHT_STYLESHEET
+from .styles import stylesheet_for_theme
 from .windows_frame import (
     WM_DPICHANGED,
     WM_GETMINMAXINFO,
@@ -215,7 +220,11 @@ class MainWindow(QMainWindow):
         )
         self._native_resize_frame_enabled = False
         self._native_resize_frame_hwnd: int | None = None
-        self._native_acrylic_hwnd: int | None = None
+        self._native_backdrop_hwnd: int | None = None
+        self._native_backdrop_result: BackdropResult | None = None
+        self._power_saving_notification_hwnd: int | None = None
+        self._power_saving_notification_handle: int | None = None
+        self._material_refresh_pending = False
         self._maximized_bounds_sync_pending = False
         self._initial_position_constrained = False
         self.global_hotkey_registered: bool | None = None
@@ -226,16 +235,22 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        if os.name == "nt":
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.resize(1440, 880)
         self.setMinimumSize(800, 440)
-        self.setStyleSheet(DARK_STYLESHEET if self.dark_theme else LIGHT_STYLESHEET)
+        self.setStyleSheet(stylesheet_for_theme(self.dark_theme))
         self.build_ui()
         self.build_tray()
         self.build_shortcuts()
         self._ensure_native_resize_frame()
+        self._ensure_power_saving_notification()
         color_scheme_changed = getattr(QApplication.styleHints(), "colorSchemeChanged", None)
         if color_scheme_changed is not None:
             color_scheme_changed.connect(self._system_color_scheme_changed)
+        if app is not None:
+            app.aboutToQuit.connect(self._release_power_saving_notification)
+            app.aboutToQuit.connect(release_windows_backdrop)
 
         self.clipboard_service = ClipboardService(database, self)
         self.clipboard_service.captured.connect(self.on_captured)
@@ -254,7 +269,7 @@ class MainWindow(QMainWindow):
         self.backup_timer.timeout.connect(self._start_periodic_backup)
         self.backup_timer.start()
         QTimer.singleShot(0, self._show_database_recovery_state)
-        self._apply_native_acrylic()
+        self._apply_native_backdrop()
 
     def _desired_dark_theme(self) -> bool:
         if self.settings.get("follow_system_theme", True):
@@ -273,7 +288,7 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setProperty("darkTheme", dark)
-        self.setStyleSheet(DARK_STYLESHEET if dark else LIGHT_STYLESHEET)
+        self._sync_surface_style(dark=dark)
         for button in self.findChildren(IconButton):
             button.refresh_theme()
         self.window_title_bar.update_maximize_state(self._window_is_maximized())
@@ -283,7 +298,10 @@ class MainWindow(QMainWindow):
         self.detail.ocr_button.setIcon(lucide_icon("scan-text"))
         self.grid.viewport().update()
         self.table.viewport().update()
-        QTimer.singleShot(0, lambda: apply_windows_acrylic(self, dark))
+        QTimer.singleShot(
+            0,
+            lambda: self._apply_native_backdrop(force=True, dark=dark),
+        )
 
     def build_ui(self) -> None:
         self.search_timer = QTimer(self)
@@ -509,14 +527,77 @@ class MainWindow(QMainWindow):
         if not self.resize_handles:
             self._install_resize_handles(self.centralWidget())
 
-    def _apply_native_acrylic(self) -> None:
+    def _apply_native_backdrop(
+        self, *, force: bool = False, dark: bool | None = None
+    ) -> None:
         if not is_windows_qt_platform():
             return
         hwnd = int(self.winId())
-        if self._native_acrylic_hwnd == hwnd:
+        if not force and self._native_backdrop_hwnd == hwnd:
             return
-        if apply_windows_acrylic(self, self.dark_theme):
-            self._native_acrylic_hwnd = hwnd
+        result = apply_windows_backdrop(
+            self,
+            self.dark_theme if dark is None else dark,
+        )
+        self._native_backdrop_result = result
+        self._sync_surface_style(result=result, dark=dark)
+        if result.success:
+            self._native_backdrop_hwnd = hwnd
+        else:
+            self._native_backdrop_hwnd = None
+
+    def _ensure_power_saving_notification(self) -> None:
+        if not is_windows_qt_platform():
+            return
+        hwnd = int(self.winId())
+        if (
+            self._power_saving_notification_handle is not None
+            and self._power_saving_notification_hwnd == hwnd
+        ):
+            return
+        self._release_power_saving_notification()
+        handle = register_windows_power_saving_notification(hwnd)
+        if handle is None:
+            return
+        self._power_saving_notification_hwnd = hwnd
+        self._power_saving_notification_handle = handle
+
+    def _release_power_saving_notification(self) -> None:
+        handle = self._power_saving_notification_handle
+        self._power_saving_notification_handle = None
+        self._power_saving_notification_hwnd = None
+        if handle is not None:
+            unregister_windows_power_saving_notification(handle)
+
+    def _sync_surface_style(
+        self,
+        *,
+        result: BackdropResult | None = None,
+        dark: bool | None = None,
+    ) -> None:
+        effective = result if result is not None else self._native_backdrop_result
+        backend = effective.backend.value if effective is not None else None
+        stylesheet = stylesheet_for_theme(
+            self.dark_theme if dark is None else dark,
+            backend=backend,
+        )
+        if self.styleSheet() != stylesheet:
+            self.setStyleSheet(stylesheet)
+
+    def _schedule_material_refresh(self) -> None:
+        if self._material_refresh_pending:
+            return
+        self._material_refresh_pending = True
+        QTimer.singleShot(0, self._refresh_material_from_system)
+
+    def _refresh_material_from_system(self) -> None:
+        self._material_refresh_pending = False
+        if self._closing or self._quit_in_progress:
+            return
+        if self.settings.get("follow_system_theme", True):
+            self.apply_theme(force=True)
+            return
+        self._apply_native_backdrop(force=True)
 
     def _update_resize_handles(self) -> None:
         if not getattr(self, "resize_handles", None):
@@ -580,6 +661,15 @@ class MainWindow(QMainWindow):
     def nativeEvent(self, event_type, message):
         if os.name == "nt" and event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
             msg = wintypes.MSG.from_address(int(message))
+            if msg.message in (0x001A, 0x031A, 0x031E):
+                # WM_SETTINGCHANGE / WM_THEMECHANGED / WM_DWMCOMPOSITIONCHANGED
+                self._schedule_material_refresh()
+            if msg.message == 0x0006:  # WM_ACTIVATE
+                set_windows_backdrop_input_active((int(msg.wParam) & 0xFFFF) != 0)
+            if msg.message == 0x0218:  # WM_POWERBROADCAST
+                # Includes PBT_APMPOWERSTATUSCHANGE and the registered
+                # GUID_POWER_SAVING_STATUS PBT_POWERSETTINGCHANGE notification.
+                self._schedule_material_refresh()
             if msg.message == WM_GETMINMAXINFO:
                 hwnd = int(msg.hWnd) or int(self.winId())
                 scale = window_dpi_scale(hwnd)
@@ -3075,7 +3165,8 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event) -> None:
         self._ensure_native_resize_frame()
-        self._apply_native_acrylic()
+        self._ensure_power_saving_notification()
+        self._apply_native_backdrop()
         super().showEvent(event)
         self.grid.set_preview_loading_enabled(self.view_stack.currentWidget() is self.grid)
         if not self._initial_position_constrained:

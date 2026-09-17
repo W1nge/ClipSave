@@ -15,6 +15,7 @@ ClipSave uses and distributes third-party software. This document records the ve
 | Pillow | 12.3.0 | HPND/Pillow license family; the 12.3.0 wheel's included license text describes it as MIT-CMU | [Pillow](https://github.com/python-pillow/Pillow) |
 | Send2Trash | 2.1.0 | BSD-3-Clause | [Send2Trash](https://github.com/arsenetar/send2trash) |
 | typing_extensions | 4.16.0 | PSF-2.0 | [typing_extensions](https://github.com/python/typing_extensions) |
+| Microsoft Windows App SDK | 1.8.260804001 | Microsoft Software License Terms | [Windows App SDK](https://github.com/microsoft/WindowsAppSDK) |
 
 Release archives include `THIRD_PARTY_LICENSES/`, containing the license and metadata files supplied by installed wheels. The bundled CPython, OpenSSL and SQLite notices and fixed-version upstream texts needed by PySide6 are included under `THIRD_PARTY_LICENSES/UPSTREAM_LICENSES/`.
 
@@ -29,6 +30,8 @@ Source retrieval information for the pinned Qt/PySide line:
 - Qt licensing texts and FAQ: [Qt licensing](https://www.qt.io/licensing/)
 
 Anyone redistributing the `ClipSave` application directory should keep this notice available with the release and verify that the exact Qt binaries in the artifact correspond to the documented source version.
+
+On Windows 10, ClipSave also bundles a minimal self-contained subset of the Microsoft Windows App SDK used by the native Acrylic backdrop bridge. Its package-supplied license text is copied into `THIRD_PARTY_LICENSES/WindowsAppSDK-1.8.260804001-LICENSE.txt` by the release build.
 
 ## Build tooling
 

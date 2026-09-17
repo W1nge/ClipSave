@@ -1,5 +1,6 @@
 import datetime as dt
 import io
+import locale
 import os
 import sqlite3
 import subprocess
@@ -1392,6 +1393,8 @@ class LibraryDatabaseTests(unittest.TestCase):
             ["cmd", "/c", "mklink", "/J", str(backup_dir), str(outside)],
             capture_output=True,
             text=True,
+            encoding=locale.getencoding(),
+            errors="replace",
             check=False,
         )
         if result.returncode != 0:

@@ -29,13 +29,16 @@ from clipsave_app.constants import (
 from clipsave_app.database import LibraryDatabase
 from clipsave_app.services import (
     AIService,
+    BackdropBackend,
+    BackdropResult,
     BoundedTaskExecutor,
     ClipboardService,
     OperationCancelled,
     TaskCapacityExceeded,
+    WindowsBackdropPolicy,
     WindowsClipboardNotifier,
     ai_ocr_task_executor,
-    apply_windows_acrylic,
+    apply_windows_backdrop,
     preflight_image_file,
     shutdown_ai_ocr_task_executor,
 )
@@ -1326,14 +1329,97 @@ class PreflightTests(unittest.TestCase):
                 preflight_image_file(path, max_pixels=100)
 
 
-class AcrylicTests(unittest.TestCase):
+class BackdropTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows effects are Windows-only")
     def test_windows_effect_api_signatures_initialize(self):
         user32, dwmapi = services_module._windows_effect_apis()
         self.assertEqual(user32.SetWindowCompositionAttribute.restype, wintypes.BOOL)
+        self.assertEqual(user32.SystemParametersInfoW.restype, wintypes.BOOL)
         self.assertEqual(dwmapi.DwmSetWindowAttribute.restype, ctypes.c_long)
 
-    def test_windows_10_uses_stable_blur_behind_for_both_themes(self):
+    def test_windows_backdrop_policy_combines_high_contrast_and_transparency(self):
+        user32 = Mock()
+
+        def system_parameters_info(_action, _size, value_pointer, _flags):
+            value = ctypes.cast(
+                value_pointer,
+                ctypes.POINTER(services_module._HighContrastW),
+            ).contents
+            value.dwFlags = 1
+            return 1
+
+        user32.SystemParametersInfoW.side_effect = system_parameters_info
+        with patch(
+            "clipsave_app.services._windows_transparency_effects_enabled",
+            return_value=False,
+        ):
+            policy = services_module._windows_backdrop_policy(user32)
+
+        self.assertEqual(policy, WindowsBackdropPolicy(True, False))
+        self.assertFalse(policy.allows_transparency)
+
+    def test_windows_backdrop_policy_reads_energy_saver_state(self):
+        user32 = Mock()
+        user32.SystemParametersInfoW.return_value = 0
+        with patch(
+            "clipsave_app.services._windows_transparency_effects_enabled",
+            return_value=True,
+        ), patch(
+            "clipsave_app.services._windows_energy_saver_enabled",
+            return_value=True,
+        ):
+            policy = services_module._windows_backdrop_policy(user32)
+
+        self.assertEqual(policy, WindowsBackdropPolicy(False, True, True))
+        self.assertTrue(policy.allows_transparency)
+        self.assertFalse(policy.allows_app_managed_backdrop)
+        self.assertFalse(policy.allows_legacy_blur)
+
+    def test_energy_saver_query_uses_system_power_status_flag(self):
+        kernel32 = Mock()
+
+        def get_power_status(status_pointer):
+            status = ctypes.cast(
+                status_pointer,
+                ctypes.POINTER(services_module._SystemPowerStatus),
+            ).contents
+            status.SystemStatusFlag = 1
+            return 1
+
+        kernel32.GetSystemPowerStatus.side_effect = get_power_status
+        with patch("clipsave_app.services._windows_power_api", return_value=kernel32):
+            self.assertTrue(services_module._windows_energy_saver_enabled())
+
+    def test_power_saving_notification_registers_expected_guid_and_unregisters(self):
+        user32 = Mock()
+        user32.RegisterPowerSettingNotification.return_value = 77
+        user32.UnregisterPowerSettingNotification.return_value = 1
+        dwmapi = Mock()
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ):
+            handle = services_module.register_windows_power_saving_notification(123)
+            released = services_module.unregister_windows_power_saving_notification(handle)
+
+        self.assertEqual(handle, 77)
+        self.assertTrue(released)
+        register_args = user32.RegisterPowerSettingNotification.call_args.args
+        self.assertEqual(register_args[0], 123)
+        self.assertEqual(register_args[2], 0)
+        guid = ctypes.cast(
+            register_args[1], ctypes.POINTER(services_module._Guid)
+        ).contents
+        self.assertEqual(guid.Data1, 0xE00958C0)
+        self.assertEqual(guid.Data2, 0xC213)
+        self.assertEqual(guid.Data3, 0x4ACE)
+        self.assertEqual(
+            bytes(guid.Data4),
+            bytes((0xAC, 0x77, 0xFE, 0xCC, 0xED, 0x2E, 0xEE, 0xA5)),
+        )
+        user32.UnregisterPowerSettingNotification.assert_called_once_with(77)
+
+    def test_windows_10_uses_windows_app_sdk_acrylic_for_both_themes(self):
         class AccentPolicy(ctypes.Structure):
             _fields_ = [
                 ("accent_state", ctypes.c_int),
@@ -1369,17 +1455,78 @@ class AcrylicTests(unittest.TestCase):
 
         with patch("clipsave_app.services.os.name", "nt"), patch(
             "clipsave_app.services.sys.getwindowsversion", return_value=version
-        ), patch("clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)):
-            self.assertTrue(apply_windows_acrylic(window, False))
-            self.assertTrue(apply_windows_acrylic(window, True))
+        ), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ), patch(
+            "clipsave_app.services._windows_backdrop_policy",
+            return_value=WindowsBackdropPolicy(False, True),
+        ), patch(
+            "clipsave_app.services.attach_windows_app_sdk_acrylic",
+            return_value=True,
+        ):
+            light = apply_windows_backdrop(window, False)
+            dark = apply_windows_backdrop(window, True)
+
+        self.assertEqual(
+            light,
+            BackdropResult(BackdropBackend.WINDOWS_APP_SDK_ACRYLIC, True),
+        )
+        self.assertEqual(
+            dark,
+            BackdropResult(BackdropBackend.WINDOWS_APP_SDK_ACRYLIC, True),
+        )
 
         self.assertEqual(
             captured,
             [
-                (19, 3, 0, 0x00FFFFFF),
-                (19, 3, 0, 0x00FFFFFF),
+                (19, 0, 0, 0),
+                (19, 0, 0, 0),
             ],
         )
+
+    def test_windows_10_acrylic_falls_back_to_legacy_blur(self):
+        captured_states = []
+
+        def set_composition(_hwnd, data_pointer):
+            data = ctypes.cast(
+                data_pointer,
+                ctypes.POINTER(services_module._WindowCompositionAttributeData),
+            ).contents
+            policy = ctypes.cast(
+                data.data,
+                ctypes.POINTER(services_module._AccentPolicy),
+            ).contents
+            captured_states.append(policy.accent_state)
+            return 0 if policy.accent_state == 4 else 1
+
+        user32 = Mock()
+        user32.SetWindowCompositionAttribute.side_effect = set_composition
+        dwmapi = Mock()
+        dwmapi.DwmSetWindowAttribute.return_value = 0
+        version = Mock(build=19044)
+        window = Mock()
+        window.winId.return_value = 123
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ), patch(
+            "clipsave_app.services._windows_backdrop_policy",
+            return_value=WindowsBackdropPolicy(False, True),
+        ), patch(
+            "clipsave_app.services.attach_windows_app_sdk_acrylic",
+            return_value=False,
+        ), patch(
+            "clipsave_app.services.windows_app_sdk_acrylic_error",
+            return_value=126,
+        ), patch(
+            "clipsave_app.services._last_windows_error", return_value=None
+        ):
+            result = apply_windows_backdrop(window, False)
+
+        self.assertEqual(result, BackdropResult(BackdropBackend.LEGACY_BLUR, True))
+        self.assertEqual(captured_states, [0, 3])
 
     def test_windows_11_22h2_uses_system_backdrop_and_checks_hresult(self):
         user32 = Mock()
@@ -1393,9 +1540,16 @@ class AcrylicTests(unittest.TestCase):
             "clipsave_app.services.sys.getwindowsversion", return_value=version
         ), patch(
             "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ), patch(
+            "clipsave_app.services._windows_backdrop_policy",
+            return_value=WindowsBackdropPolicy(False, True),
         ):
-            self.assertTrue(apply_windows_acrylic(window, True))
+            result = apply_windows_backdrop(window, True)
 
+        self.assertEqual(
+            result,
+            BackdropResult(BackdropBackend.DESKTOP_ACRYLIC, True),
+        )
         attributes = [call.args[1] for call in dwmapi.DwmSetWindowAttribute.call_args_list]
         self.assertEqual(attributes, [38, 33, 34, 20])
         user32.SetWindowCompositionAttribute.assert_not_called()
@@ -1413,10 +1567,179 @@ class AcrylicTests(unittest.TestCase):
             "clipsave_app.services.sys.getwindowsversion", return_value=version
         ), patch(
             "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ), patch(
+            "clipsave_app.services._windows_backdrop_policy",
+            return_value=WindowsBackdropPolicy(False, True),
+        ), patch(
+            "clipsave_app.services.attach_windows_app_sdk_acrylic",
+            return_value=False,
+        ), patch(
+            "clipsave_app.services.windows_app_sdk_acrylic_error",
+            return_value=None,
+        ), patch(
+            "clipsave_app.services._last_windows_error", return_value=None
         ):
-            self.assertFalse(apply_windows_acrylic(window, False))
+            result = apply_windows_backdrop(window, False)
 
+        self.assertEqual(
+            result,
+            BackdropResult(BackdropBackend.SOLID, False, native_error=-1),
+        )
+        self.assertEqual(user32.SetWindowCompositionAttribute.call_count, 2)
+
+    def test_legacy_failure_reports_last_error_over_dwm_hresult(self):
+        user32 = Mock()
+        user32.SetWindowCompositionAttribute.return_value = 0
+        dwmapi = Mock()
+        dwmapi.DwmSetWindowAttribute.return_value = -1
+        version = Mock(build=22621)
+        window = Mock()
+        window.winId.return_value = 789
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ), patch(
+            "clipsave_app.services._windows_backdrop_policy",
+            return_value=WindowsBackdropPolicy(False, True),
+        ), patch(
+            "clipsave_app.services._last_windows_error", return_value=87
+        ):
+            result = apply_windows_backdrop(window, False)
+
+        self.assertEqual(
+            result,
+            BackdropResult(BackdropBackend.SOLID, False, native_error=87),
+        )
+
+    def test_high_contrast_disables_system_and_legacy_backdrops(self):
+        class AccentPolicy(ctypes.Structure):
+            _fields_ = [
+                ("accent_state", ctypes.c_int),
+                ("accent_flags", ctypes.c_int),
+                ("gradient_color", ctypes.c_uint32),
+                ("animation_id", ctypes.c_int),
+            ]
+
+        class CompositionData(ctypes.Structure):
+            _fields_ = [
+                ("attribute", ctypes.c_int),
+                ("data", ctypes.c_void_p),
+                ("size", ctypes.c_size_t),
+            ]
+
+        accent_states = []
+
+        def set_composition(_hwnd, data_pointer):
+            data = ctypes.cast(data_pointer, ctypes.POINTER(CompositionData)).contents
+            policy = ctypes.cast(data.data, ctypes.POINTER(AccentPolicy)).contents
+            accent_states.append(policy.accent_state)
+            return 1
+
+        user32 = Mock()
+        user32.SetWindowCompositionAttribute.side_effect = set_composition
+        dwmapi = Mock()
+        dwmapi.DwmSetWindowAttribute.return_value = 0
+        version = Mock(build=22621)
+        window = Mock()
+        window.winId.return_value = 321
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ), patch(
+            "clipsave_app.services._windows_backdrop_policy",
+            return_value=WindowsBackdropPolicy(True, True),
+        ):
+            result = apply_windows_backdrop(window, False)
+
+        self.assertEqual(result, BackdropResult(BackdropBackend.SOLID, True))
+        self.assertEqual(accent_states, [0])
+        attributes = [call.args[1] for call in dwmapi.DwmSetWindowAttribute.call_args_list]
+        self.assertEqual(attributes, [38, 33, 34, 20])
+
+    def test_transparency_disabled_uses_solid_on_windows_10(self):
+        user32 = Mock()
+        user32.SetWindowCompositionAttribute.return_value = 1
+        dwmapi = Mock()
+        dwmapi.DwmSetWindowAttribute.return_value = 0
+        version = Mock(build=19044)
+        window = Mock()
+        window.winId.return_value = 654
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ), patch(
+            "clipsave_app.services._windows_backdrop_policy",
+            return_value=WindowsBackdropPolicy(False, False),
+        ):
+            result = apply_windows_backdrop(window, True)
+
+        self.assertEqual(result, BackdropResult(BackdropBackend.SOLID, True))
+        attributes = [call.args[1] for call in dwmapi.DwmSetWindowAttribute.call_args_list]
+        self.assertEqual(attributes, [33, 20])
         user32.SetWindowCompositionAttribute.assert_called_once()
+
+    def test_energy_saver_disables_legacy_blur_on_windows_10(self):
+        accent_states = []
+
+        def set_composition(_hwnd, data_pointer):
+            data = ctypes.cast(
+                data_pointer,
+                ctypes.POINTER(services_module._WindowCompositionAttributeData),
+            ).contents
+            policy = ctypes.cast(
+                data.data,
+                ctypes.POINTER(services_module._AccentPolicy),
+            ).contents
+            accent_states.append(policy.accent_state)
+            return 1
+
+        user32 = Mock()
+        user32.SetWindowCompositionAttribute.side_effect = set_composition
+        dwmapi = Mock()
+        dwmapi.DwmSetWindowAttribute.return_value = 0
+        version = Mock(build=19044)
+        window = Mock()
+        window.winId.return_value = 654
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ), patch(
+            "clipsave_app.services._windows_backdrop_policy",
+            return_value=WindowsBackdropPolicy(False, True, True),
+        ):
+            result = apply_windows_backdrop(window, True)
+
+        self.assertEqual(result, BackdropResult(BackdropBackend.SOLID, True))
+        self.assertEqual(accent_states, [0])
+
+    def test_energy_saver_keeps_windows_11_system_backdrop_eligible(self):
+        user32 = Mock()
+        dwmapi = Mock()
+        dwmapi.DwmSetWindowAttribute.return_value = 0
+        version = Mock(build=22621)
+        window = Mock()
+        window.winId.return_value = 456
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch(
+            "clipsave_app.services._windows_effect_apis", return_value=(user32, dwmapi)
+        ), patch(
+            "clipsave_app.services._windows_backdrop_policy",
+            return_value=WindowsBackdropPolicy(False, True, True),
+        ):
+            result = apply_windows_backdrop(window, True)
+
+        self.assertEqual(result, BackdropResult(BackdropBackend.DESKTOP_ACRYLIC, True))
+        user32.SetWindowCompositionAttribute.assert_not_called()
 
 
 class BoundedTaskExecutorTests(unittest.TestCase):

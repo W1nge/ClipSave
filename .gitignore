@@ -15,6 +15,8 @@ build/
 dist/
 *.spec
 ClipSave.exe
+native/windows_backdrop/bin/
+native/windows_backdrop/obj/
 
 # User data and secrets
 data/

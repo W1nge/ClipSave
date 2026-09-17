@@ -1,4 +1,5 @@
 import ctypes
+import locale
 import os
 import shutil
 import sqlite3
@@ -404,6 +405,8 @@ class StorageTests(unittest.TestCase):
                     ["cmd", "/c", "mklink", "/J", str(parent), str(outside)],
                     capture_output=True,
                     text=True,
+                    encoding=locale.getencoding(),
+                    errors="replace",
                     check=False,
                 )
                 if result.returncode != 0:
@@ -500,6 +503,8 @@ class StorageTests(unittest.TestCase):
             ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
             capture_output=True,
             text=True,
+            encoding=locale.getencoding(),
+            errors="replace",
             check=False,
         )
         if result.returncode != 0:

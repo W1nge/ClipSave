@@ -1,3 +1,4 @@
+import locale
 import os
 import re
 import subprocess
@@ -147,6 +148,12 @@ class ReleaseContractTests(unittest.TestCase):
 
         (root / "fake-python.bat").write_text(
             "@echo off\n"
+            "if \"%1\"==\"build_windows_backdrop.py\" (\n"
+            "  mkdir build\\windows_backdrop\\runtime >nul 2>nul\n"
+            "  >build\\windows_backdrop\\ClipSave.manifest echo manifest\n"
+            "  type nul > build\\windows_backdrop\\runtime\\clipsave_windows_backdrop.dll\n"
+            "  >build\\windows_backdrop\\WindowsAppSDK-LICENSE.txt echo license\n"
+            ")\n"
             "if \"%1\"==\"-m\" if \"%2\"==\"PyInstaller\" (\n"
             "  mkdir build\\release\\ClipSave\\_internal >nul 2>nul\n"
             "  type nul > build\\release\\ClipSave\\ClipSave.exe\n"
@@ -201,6 +208,8 @@ class ReleaseContractTests(unittest.TestCase):
             env=env,
             input="\n",
             text=True,
+            encoding=locale.getencoding(),
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=20,

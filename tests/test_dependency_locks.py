@@ -1,3 +1,4 @@
+import locale
 import os
 import re
 import subprocess
@@ -151,6 +152,8 @@ class DependencyLockTests(unittest.TestCase):
             env=env,
             input="\n",
             text=True,
+            encoding=locale.getencoding(),
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=20,

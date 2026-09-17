@@ -113,6 +113,49 @@ QScrollBar#AutoHideScrollBar::add-line:vertical, QScrollBar#AutoHideScrollBar::s
 """
 
 
+_LIGHT_SOLID_OVERRIDES = """
+QMainWindow, QWidget#AppRoot, QWidget#WindowBody, QWidget#ContentSurface { background: #f6f6f6; }
+QFrame#WindowTitleBar, QWidget#Sidebar, QFrame#TopBar { background: #f6f6f6; }
+"""
+
+
+_DARK_SOLID_OVERRIDES = """
+QMainWindow, QWidget#AppRoot, QWidget#WindowBody, QWidget#ContentSurface { background: #202020; }
+QFrame#WindowTitleBar, QWidget#Sidebar, QFrame#TopBar { background: #202020; }
+"""
+
+
+_ACRYLIC_TINT_ALPHA = 76  # ~30%; native Acrylic provides the material.
+_LEGACY_BLUR_TINT_ALPHA = 204  # 80%; Qt supplies most of the fallback material tint.
+
+
+def _surface_tint_alpha(backend: str | None) -> int:
+    if backend in {
+        "desktop_acrylic",
+        "windows_app_sdk_acrylic",
+    }:
+        return _ACRYLIC_TINT_ALPHA
+    return _LEGACY_BLUR_TINT_ALPHA
+
+
+def stylesheet_for_theme(dark: bool, *, backend: str | None = None) -> str:
+    base = DARK_STYLESHEET if dark else LIGHT_STYLESHEET
+    alpha = _surface_tint_alpha(backend)
+    if dark:
+        base = base.replace(
+            "rgba(32,32,32,204)",
+            f"rgba(32,32,32,{alpha})",
+        )
+    else:
+        base = base.replace(
+            "rgba(255, 255, 255, 204)",
+            f"rgba(255, 255, 255, {alpha})",
+        )
+    if backend != "solid":
+        return base
+    return base + (_DARK_SOLID_OVERRIDES if dark else _LIGHT_SOLID_OVERRIDES)
+
+
 DARK_STYLESHEET = """
 * {
     font-family: "Microsoft YaHei UI", "Segoe UI";

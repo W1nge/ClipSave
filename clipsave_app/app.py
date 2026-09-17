@@ -529,9 +529,18 @@ def main() -> int:
         smoke_status_path = smoke_ready_path.with_name(f"{smoke_ready_path.name}.status")
 
         def quit_smoke() -> None:
+            backdrop_result = getattr(window, "_native_backdrop_result", None)
+            backdrop_backend = getattr(
+                getattr(backdrop_result, "backend", None), "value", "none"
+            )
+            backdrop_success = bool(getattr(backdrop_result, "success", False))
+            backdrop_error = getattr(backdrop_result, "native_error", None)
             quit_started = window.quit_application()
             try:
                 smoke_status_path.write_text(
+                    f"backdrop_backend={backdrop_backend}\n"
+                    f"backdrop_success={backdrop_success}\n"
+                    f"backdrop_native_error={backdrop_error}\n"
                     f"quit_returned={quit_started}\nclosing={window._closing}\n"
                     f"quit_in_progress={window._quit_in_progress}\n",
                     encoding="ascii",

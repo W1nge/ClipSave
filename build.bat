@@ -74,8 +74,17 @@ if "%CLIPSAVE_OFFICIAL_BUILD%"=="1" (
 set "appDir=%~dp0build\release\ClipSave"
 set "stagedExe=%~dp0build\release\ClipSave\ClipSave.exe"
 set "versionInfo=%~dp0build\version_info.txt"
+set "backdropBuild=%~dp0build\windows_backdrop"
+set "backdropRuntime=%~dp0build\windows_backdrop\runtime"
+set "backdropManifest=%~dp0build\windows_backdrop\ClipSave.manifest"
 mkdir "%releaseDir%"
 if errorlevel 1 goto :failed
+.venv\Scripts\python.exe build_windows_backdrop.py --output "%backdropBuild%"
+if errorlevel 1 goto :failed
+if not exist "%backdropManifest%" (
+  echo ERROR: Windows backdrop build did not create the application manifest.
+  goto :missing_output
+)
 .venv\Scripts\python.exe build_version_info.py "%versionInfo%"
 if errorlevel 1 goto :failed
 
@@ -84,6 +93,7 @@ if errorlevel 1 goto :failed
   --contents-directory _internal ^
   --icon "%~dp0assets\clipsave.ico" ^
   --version-file "%versionInfo%" ^
+  --manifest "%backdropManifest%" ^
   --noupx ^
   --distpath build\release ^
   --workpath build\work ^
@@ -97,11 +107,23 @@ if not exist "%stagedExe%" (
   goto :missing_output
 )
 
+if not exist "%appDir%\_internal" mkdir "%appDir%\_internal"
+if errorlevel 1 goto :failed
+if exist "%appDir%\_internal\windows_backdrop" rmdir /s /q "%appDir%\_internal\windows_backdrop"
+xcopy /e /i /y "%backdropRuntime%" "%appDir%\_internal\windows_backdrop" >nul
+if errorlevel 1 goto :failed
+if not exist "%appDir%\_internal\windows_backdrop\clipsave_windows_backdrop.dll" (
+  echo ERROR: Windows backdrop runtime was not staged into the application directory.
+  goto :missing_output
+)
+
 copy /y "%~dp0LICENSE" "%releaseDir%\LICENSE" >nul
 if errorlevel 1 goto :failed
 copy /y "%~dp0THIRD_PARTY_NOTICES.md" "%releaseDir%\THIRD_PARTY_NOTICES.md" >nul
 if errorlevel 1 goto :failed
 .venv\Scripts\python.exe collect_third_party_licenses.py "%releaseDir%\THIRD_PARTY_LICENSES"
+if errorlevel 1 goto :failed
+copy /y "%backdropBuild%\WindowsAppSDK-LICENSE.txt" "%releaseDir%\THIRD_PARTY_LICENSES\WindowsAppSDK-1.8.260804001-LICENSE.txt" >nul
 if errorlevel 1 goto :failed
 copy /y "%~dp0README_RELEASE.md" "%releaseDir%\README.md" >nul
 if errorlevel 1 goto :failed

@@ -20,6 +20,7 @@ from clipsave_app.app import create_app_icon
 from clipsave_app.bulk_checkpoint import load_checkpoint
 from clipsave_app.database import ImportFileResult, LibraryDatabase
 from clipsave_app.main_window import AsyncSignals, MainWindow
+from clipsave_app.services import BackdropBackend, BackdropResult
 from clipsave_app.settings import Settings
 from clipsave_app.widgets import (
     DateDialog,
@@ -658,18 +659,154 @@ class MainWindowTests(unittest.TestCase):
         maximize.assert_called_once_with(int(self.window.winId()))
         show_maximized.assert_not_called()
 
-    def test_native_acrylic_retries_once_when_hidden_window_application_fails(self):
+    def test_native_backdrop_retries_once_when_hidden_window_application_fails(self):
+        failed = BackdropResult(BackdropBackend.SOLID, False)
+        applied = BackdropResult(BackdropBackend.LEGACY_BLUR, True)
         with patch("clipsave_app.main_window.is_windows_qt_platform", return_value=True), patch.object(
             self.window, "winId", return_value=123
         ), patch(
-            "clipsave_app.main_window.apply_windows_acrylic", side_effect=[False, True]
-        ) as acrylic:
-            self.window._native_acrylic_hwnd = None
-            self.window._apply_native_acrylic()
-            self.window._apply_native_acrylic()
+            "clipsave_app.main_window.apply_windows_backdrop", side_effect=[failed, applied]
+        ) as backdrop:
+            self.window._native_backdrop_hwnd = None
+            self.window._apply_native_backdrop()
+            self.window._apply_native_backdrop()
 
-        self.assertEqual(acrylic.call_count, 2)
-        self.assertEqual(self.window._native_acrylic_hwnd, 123)
+        self.assertEqual(backdrop.call_count, 2)
+        self.assertEqual(self.window._native_backdrop_hwnd, 123)
+        self.assertEqual(self.window._native_backdrop_result, applied)
+
+    def test_native_backdrop_force_failure_invalidates_cached_hwnd(self):
+        applied = BackdropResult(BackdropBackend.DESKTOP_ACRYLIC, True)
+        failed = BackdropResult(BackdropBackend.SOLID, False)
+        with patch("clipsave_app.main_window.is_windows_qt_platform", return_value=True), patch.object(
+            self.window, "winId", return_value=123
+        ), patch(
+            "clipsave_app.main_window.apply_windows_backdrop",
+            side_effect=[applied, failed, applied],
+        ) as backdrop:
+            self.window._native_backdrop_hwnd = None
+            self.window._apply_native_backdrop()
+            self.window._apply_native_backdrop(force=True)
+            self.window._apply_native_backdrop()
+
+        self.assertEqual(backdrop.call_count, 3)
+        self.assertEqual(self.window._native_backdrop_hwnd, 123)
+        self.assertEqual(self.window._native_backdrop_result, applied)
+
+    def test_solid_backdrop_switches_top_level_surfaces_to_opaque_theme(self):
+        solid = BackdropResult(BackdropBackend.SOLID, True)
+        acrylic = BackdropResult(BackdropBackend.DESKTOP_ACRYLIC, True)
+        system_acrylic = BackdropResult(BackdropBackend.WINDOWS_APP_SDK_ACRYLIC, True)
+        legacy = BackdropResult(BackdropBackend.LEGACY_BLUR, True)
+
+        self.window._sync_surface_style(result=solid, dark=False)
+        self.assertIn(
+            "QMainWindow, QWidget#AppRoot, QWidget#WindowBody, QWidget#ContentSurface { background: #f6f6f6; }",
+            self.window.styleSheet(),
+        )
+
+        self.window._sync_surface_style(result=acrylic, dark=False)
+        self.assertNotIn(
+            "QMainWindow, QWidget#AppRoot, QWidget#WindowBody, QWidget#ContentSurface { background: #f6f6f6; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "QMainWindow, QWidget#AppRoot { background: transparent; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "rgba(255, 255, 255, 76)",
+            self.window.styleSheet(),
+        )
+
+        self.window._sync_surface_style(result=system_acrylic, dark=False)
+        self.assertIn(
+            "rgba(255, 255, 255, 76)",
+            self.window.styleSheet(),
+        )
+
+        self.window._sync_surface_style(result=legacy, dark=False)
+        self.assertIn(
+            "rgba(255, 255, 255, 204)",
+            self.window.styleSheet(),
+        )
+
+    def test_windows_material_messages_schedule_one_refresh(self):
+        for native_message in (0x001A, 0x0218, 0x031A, 0x031E):
+            with self.subTest(native_message=hex(native_message)):
+                message = wintypes.MSG()
+                message.hWnd = int(self.window.winId())
+                message.message = native_message
+                self.window._material_refresh_pending = False
+                with patch.object(
+                    self.window, "_schedule_material_refresh"
+                ) as schedule, patch(
+                    "PySide6.QtWidgets.QMainWindow.nativeEvent", return_value=(False, 0)
+                ):
+                    self.window.nativeEvent(
+                        b"windows_generic_MSG", ctypes.addressof(message)
+                    )
+                schedule.assert_called_once_with()
+
+    def test_window_activation_updates_system_backdrop_configuration(self):
+        for w_param, expected in ((1, True), (0, False), (2, True)):
+            with self.subTest(w_param=w_param):
+                message = wintypes.MSG()
+                message.hWnd = int(self.window.winId())
+                message.message = 0x0006  # WM_ACTIVATE
+                message.wParam = w_param
+                with patch(
+                    "clipsave_app.main_window.set_windows_backdrop_input_active",
+                    return_value=True,
+                ) as active, patch(
+                    "PySide6.QtWidgets.QMainWindow.nativeEvent", return_value=(False, 0)
+                ):
+                    self.window.nativeEvent(
+                        b"windows_generic_MSG", ctypes.addressof(message)
+                    )
+                active.assert_called_once_with(expected)
+
+    def test_power_saving_notification_follows_hwnd_and_is_released(self):
+        with patch(
+            "clipsave_app.main_window.is_windows_qt_platform", return_value=True
+        ), patch.object(
+            self.window, "winId", side_effect=[123, 123, 456]
+        ), patch(
+            "clipsave_app.main_window.register_windows_power_saving_notification",
+            side_effect=[55, 66],
+        ) as register, patch(
+            "clipsave_app.main_window.unregister_windows_power_saving_notification",
+            return_value=True,
+        ) as unregister:
+            self.window._power_saving_notification_handle = None
+            self.window._power_saving_notification_hwnd = None
+            self.window._ensure_power_saving_notification()
+            self.window._ensure_power_saving_notification()
+            self.window._ensure_power_saving_notification()
+            self.window._release_power_saving_notification()
+
+        self.assertEqual(register.call_args_list[0].args, (123,))
+        self.assertEqual(register.call_args_list[1].args, (456,))
+        self.assertEqual(register.call_count, 2)
+        self.assertEqual([call.args for call in unregister.call_args_list], [(55,), (66,)])
+        self.assertIsNone(self.window._power_saving_notification_handle)
+        self.assertIsNone(self.window._power_saving_notification_hwnd)
+
+    def test_system_material_refresh_coalesces_and_reapplies_backdrop(self):
+        self.settings.data["follow_system_theme"] = False
+        with patch.object(self.window, "_refresh_material_from_system") as refresh:
+            self.window._material_refresh_pending = False
+            self.window._schedule_material_refresh()
+            self.window._schedule_material_refresh()
+            self.assertTrue(self.window._material_refresh_pending)
+            self.app.processEvents()
+        refresh.assert_called_once_with()
+
+        self.window._material_refresh_pending = True
+        with patch.object(self.window, "_apply_native_backdrop") as backdrop:
+            self.window._refresh_material_from_system()
+        self.assertFalse(self.window._material_refresh_pending)
+        backdrop.assert_called_once_with(force=True)
 
     def test_move_resize_and_detail_toggle_do_not_force_window_back_on_screen(self):
         with patch.object(self.window, "_constrain_to_available_screen") as constrain:
@@ -1182,14 +1319,17 @@ class MainWindowTests(unittest.TestCase):
     def test_theme_follows_system_and_can_be_disabled_in_settings(self):
         self.settings.data["follow_system_theme"] = True
         with patch("clipsave_app.main_window.system_uses_dark_theme", return_value=True), patch(
-            "clipsave_app.main_window.apply_windows_acrylic"
-        ) as acrylic:
+            "clipsave_app.main_window.is_windows_qt_platform", return_value=True
+        ), patch(
+            "clipsave_app.main_window.apply_windows_backdrop",
+            return_value=BackdropResult(BackdropBackend.DESKTOP_ACRYLIC, True),
+        ) as backdrop:
             self.window.apply_theme(force=True)
             self.app.processEvents()
         self.assertTrue(self.window.dark_theme)
         self.assertTrue(self.app.property("darkTheme"))
         self.assertIn("#202020", self.window.styleSheet())
-        self.assertIn("rgba(32,32,32,204)", self.window.styleSheet())
+        self.assertIn("rgba(32,32,32,76)", self.window.styleSheet())
         self.assertIn(
             "QWidget#ContentSurface { background: transparent; }",
             self.window.styleSheet(),
@@ -1208,7 +1348,7 @@ class MainWindowTests(unittest.TestCase):
             self.window.styleSheet(),
         )
         self.assertNotIn("rgba(0,0,0,204)", self.window.styleSheet())
-        acrylic.assert_called_with(self.window, True)
+        backdrop.assert_called_with(self.window, True)
 
         self.settings.data["follow_system_theme"] = False
         self.settings.data["theme_mode"] = "light"
