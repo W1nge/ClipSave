@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.1.1 - 2026-09-19
+
+- Rebuilt Windows 10 Acrylic around an always-on Windows.UI.Composition effect path so blur remains visually identical while moving and resizing the window.
+- Added a dedicated pure-Win32 backdrop HWND behind the Qt UI, with pixel-perfect live geometry synchronization and no material switching during interactive move/resize.
+- Fixed the Composition visual tree root sizing bug that allowed the effect graph to attach successfully while rendering no visible blur.
+- Added compositor-side Gaussian blur and saturation through Win2D, including the required VCRT forwarders and release license notices.
+- Expanded Windows Acrylic release validation with controlled blur probes, geometry-lock checks, packaged visual smoke tests and regression coverage.
+
 ## 1.1.0 - 2026-07-30
 
 - Rebuilt sidebar and detail-panel transitions around measured start/end geometry, linear high-refresh progress, stable layering and reversible animation transactions.
