@@ -1,0 +1,191 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish (for example v1.1.1)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve release tag
+        id: meta
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:INPUT_TAG) {
+            $tag = $env:INPUT_TAG.Trim()
+          } elseif ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+          } else {
+            $version = python -c "from clipsave_app.constants import APP_VERSION; print(APP_VERSION)"
+            if ($LASTEXITCODE -ne 0 -or -not $version) { throw "Could not resolve APP_VERSION" }
+            $tag = "v$version"
+          }
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          gh api "repos/${{ github.repository }}/git/ref/tags/$tag" *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Tag $tag does not exist; nothing to publish."
+            "should_release=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+
+          gh api "repos/${{ github.repository }}/releases/tags/$tag" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; nothing to publish."
+            "should_release=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+
+          "should_release=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Checkout tagged source
+        if: steps.meta.outputs.should_release == 'true'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up official Python
+        if: steps.meta.outputs.should_release == 'true'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.5"
+          cache: pip
+
+      - name: Create official build environment
+        if: steps.meta.outputs.should_release == 'true'
+        shell: pwsh
+        run: python -m venv .venv
+
+      - name: Locate Inno Setup
+        if: steps.meta.outputs.should_release == 'true'
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 7\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 7\ISCC.exe')
+          )
+          $compiler = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $compiler) { throw 'Inno Setup 6 or 7 was not found on the Windows runner.' }
+          "INNO_SETUP_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build official release bundle
+        if: steps.meta.outputs.should_release == 'true'
+        shell: cmd
+        run: set CLIPSAVE_OFFICIAL_BUILD=1&& echo.|build.bat
+
+      - name: Run regression suite
+        if: steps.meta.outputs.should_release == 'true'
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests
+
+      - name: Validate release artifacts
+        if: steps.meta.outputs.should_release == 'true'
+        shell: pwsh
+        run: |
+          $version = .\.venv\Scripts\python.exe -c "from clipsave_app.constants import APP_VERSION; print(APP_VERSION)"
+          if ("v$version" -ne "${{ steps.meta.outputs.tag }}") {
+            throw "Tag/version mismatch: tag=${{ steps.meta.outputs.tag }} version=$version"
+          }
+
+          $head = (git rev-parse HEAD).Trim()
+          $buildInfo = Get-Content .\build\release\BUILD_INFO.txt -Raw
+          if ($buildInfo -notmatch 'Build channel OFFICIAL') { throw 'Release is not marked OFFICIAL' }
+          if ($buildInfo -notmatch "Commit $head(\r?\n|$)") { throw 'Release provenance does not match tagged HEAD' }
+
+          $zip = Get-Item "build\release\ClipSave-$version-windows-x64.zip"
+          $installer = Get-Item "build\release\ClipSave-$version-windows-x64-installer.exe"
+          foreach ($asset in @($zip, $installer)) {
+            $checksumPath = $asset.FullName + '.sha256'
+            if (-not (Test-Path -LiteralPath $checksumPath)) { throw "Missing checksum for $($asset.Name)" }
+            $actual = (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash
+            $expected = (Get-Content -LiteralPath $checksumPath).Split()[0]
+            if ($actual -ne $expected) { throw "Checksum mismatch for $($asset.Name)" }
+          }
+
+          $productVersion = (Get-Item '.\build\release\ClipSave\ClipSave.exe').VersionInfo.ProductVersion
+          if ($productVersion -ne $version) { throw "Incorrect packaged version: $productVersion" }
+
+      - name: Installer smoke test
+        if: steps.meta.outputs.should_release == 'true'
+        shell: pwsh
+        run: |
+          $version = .\.venv\Scripts\python.exe -c "from clipsave_app.constants import APP_VERSION; print(APP_VERSION)"
+          $installer = (Resolve-Path "build\release\ClipSave-$version-windows-x64-installer.exe").Path
+          $installDir = Join-Path $PWD 'build\installer-release-smoke\app'
+          $install = Start-Process $installer -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOICONS',"/DIR=$installDir") -PassThru -Wait
+          if ($install.ExitCode -ne 0) { throw "Installer failed with exit code $($install.ExitCode)" }
+          $installedExe = Join-Path $installDir 'ClipSave.exe'
+          if (-not (Test-Path -LiteralPath $installedExe)) { throw 'Installer did not install ClipSave.exe' }
+          if ((Get-Item $installedExe).VersionInfo.ProductVersion -ne $version) { throw 'Installed ClipSave version is incorrect' }
+          $uninstaller = Join-Path $installDir 'unins000.exe'
+          $uninstall = Start-Process $uninstaller -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') -PassThru -Wait
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstall.ExitCode)" }
+          if (Test-Path -LiteralPath $installedExe) { throw 'Uninstaller left ClipSave.exe behind' }
+
+      - name: Generate release notes
+        if: steps.meta.outputs.should_release == 'true'
+        shell: pwsh
+        run: |
+          $version = .\.venv\Scripts\python.exe -c "from clipsave_app.constants import APP_VERSION; print(APP_VERSION)"
+          $text = Get-Content .\CHANGELOG.md -Raw -Encoding UTF8
+          $escaped = [regex]::Escape($version)
+          $match = [regex]::Match($text, "(?ms)^## $escaped - [^\r\n]+\r?\n\r?\n(.*?)(?=^## |\z)")
+          if (-not $match.Success) { throw "Could not find CHANGELOG section for $version" }
+          $body = @"
+          ClipSave $version focuses on Windows Acrylic quality and interactive window performance.
+
+          ## Highlights
+
+          $($match.Groups[1].Value.Trim())
+
+          ## Validation
+
+          - Official release build uses Python.org CPython 3.13.5.
+          - Full regression suite passed on the Windows release runner.
+          - Installer install/uninstall smoke passed.
+          - Portable ZIP and installer SHA256 files are included as release assets.
+
+          Local ClipSave libraries and settings remain separate under %LOCALAPPDATA%\ClipSave and are not removed by uninstalling the application.
+          "@
+          Set-Content -LiteralPath .\build\release-notes.md -Value $body -Encoding UTF8
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.should_release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = .\.venv\Scripts\python.exe -c "from clipsave_app.constants import APP_VERSION; print(APP_VERSION)"
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $assets = @(
+            "build\release\ClipSave-$version-windows-x64.zip",
+            "build\release\ClipSave-$version-windows-x64.zip.sha256",
+            "build\release\ClipSave-$version-windows-x64-installer.exe",
+            "build\release\ClipSave-$version-windows-x64-installer.exe.sha256"
+          )
+          gh release create $tag $assets --repo "${{ github.repository }}" --title "ClipSave $version" --notes-file .\build\release-notes.md --verify-tag --latest
