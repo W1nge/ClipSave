@@ -11,18 +11,30 @@ from PySide6.QtGui import QGuiApplication
 WM_NCCALCSIZE = 0x0083
 WM_NCACTIVATE = 0x0086
 WM_GETMINMAXINFO = 0x0024
+WM_WINDOWPOSCHANGING = 0x0046
 WM_WINDOWPOSCHANGED = 0x0047
 WM_DPICHANGED = 0x02E0
 WS_THICKFRAME = 0x00040000
+WS_POPUP = 0x80000000
 GWL_STYLE = -16
+
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOREDIRECTIONBITMAP = 0x00200000
+WS_EX_NOACTIVATE = 0x08000000
 
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+SWP_SHOWWINDOW = 0x0040
+SWP_HIDEWINDOW = 0x0080
+SWP_NOOWNERZORDER = 0x0200
 SW_MAXIMIZE = 3
 SW_RESTORE = 9
+SW_HIDE = 0
+SW_SHOWNOACTIVATE = 4
 
 MONITOR_DEFAULTTONEAREST = 0x00000002
 
@@ -109,6 +121,25 @@ def _user32():
     library.IsZoomed.restype = wintypes.BOOL
     library.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     library.ShowWindow.restype = wintypes.BOOL
+    library.IsWindowVisible.argtypes = [wintypes.HWND]
+    library.IsWindowVisible.restype = wintypes.BOOL
+    library.CreateWindowExW.argtypes = [
+        wintypes.DWORD,
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HWND,
+        wintypes.HMENU,
+        wintypes.HINSTANCE,
+        ctypes.c_void_p,
+    ]
+    library.CreateWindowExW.restype = wintypes.HWND
+    library.DestroyWindow.argtypes = [wintypes.HWND]
+    library.DestroyWindow.restype = wintypes.BOOL
     library.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
     library.MonitorFromWindow.restype = wintypes.HMONITOR
     library.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
@@ -134,10 +165,116 @@ def enable_native_resize_frame(hwnd: int) -> bool:
             previous = user32.SetWindowLongPtrW(hwnd, GWL_STYLE, desired_style)
             if previous == 0 and ctypes.get_last_error():
                 return False
-            flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+            flags = (
+                SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOZORDER
+                | SWP_NOACTIVATE
+                | SWP_FRAMECHANGED
+            )
             if not user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, flags):
                 return False
         return bool(user32.GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_THICKFRAME)
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def create_backdrop_host_window() -> int | None:
+    """Create a pure Win32, non-activating backdrop HWND owned by no UI toolkit.
+
+    Using a native helper rather than a second Qt top-level is important:
+    SetWindowPos can then be called synchronously from the host's
+    WM_WINDOWPOSCHANGING callback without re-entering Qt's window state machine.
+    """
+    if not is_windows_qt_platform():
+        return None
+    try:
+        user32 = _user32()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+        instance = kernel32.GetModuleHandleW(None)
+        hwnd = user32.CreateWindowExW(
+            WS_EX_TRANSPARENT
+            | WS_EX_TOOLWINDOW
+            | WS_EX_NOREDIRECTIONBITMAP
+            | WS_EX_NOACTIVATE,
+            "STATIC",
+            "",
+            WS_POPUP,
+            -32000,
+            -32000,
+            1,
+            1,
+            None,
+            None,
+            instance,
+            None,
+        )
+        if not hwnd:
+            return None
+        return int(hwnd)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def destroy_backdrop_host_window(hwnd: int) -> bool:
+    if not is_windows_qt_platform() or not hwnd:
+        return True
+    try:
+        return bool(_user32().DestroyWindow(hwnd))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def sync_backdrop_host_window(
+    backdrop_hwnd: int,
+    host_hwnd: int,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    *,
+    visible: bool = True,
+    sync_z_order: bool = True,
+) -> bool:
+    """Keep the helper HWND directly behind its Qt host in one Win32 operation."""
+    if not is_windows_qt_platform() or not backdrop_hwnd or not host_hwnd:
+        return False
+    try:
+        user32 = _user32()
+        if not visible or width <= 0 or height <= 0:
+            if user32.IsWindowVisible(backdrop_hwnd):
+                user32.ShowWindow(backdrop_hwnd, SW_HIDE)
+            return True
+        flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER
+        insert_after = host_hwnd
+        if not sync_z_order:
+            flags |= SWP_NOZORDER
+            insert_after = None
+        if not user32.IsWindowVisible(backdrop_hwnd):
+            flags |= SWP_SHOWWINDOW
+        return bool(
+            user32.SetWindowPos(
+                backdrop_hwnd,
+                insert_after,
+                int(x),
+                int(y),
+                max(1, int(width)),
+                max(1, int(height)),
+                flags,
+            )
+        )
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def hide_backdrop_host_window(backdrop_hwnd: int) -> bool:
+    if not is_windows_qt_platform() or not backdrop_hwnd:
+        return True
+    try:
+        _user32().ShowWindow(backdrop_hwnd, SW_HIDE)
+        return True
     except (AttributeError, OSError, ValueError):
         return False
 

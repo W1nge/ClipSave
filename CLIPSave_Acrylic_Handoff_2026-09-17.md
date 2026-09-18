@@ -1,93 +1,204 @@
 # ClipSave Acrylic Backend Handoff
 
+Updated: 2026-09-18
+
 ## Final architecture
 
-Win11: DWM System Acrylic.
+Windows 11:
+- DWM System Acrylic via DWMWA_SYSTEMBACKDROP_TYPE = 3.
 
-Win10: hybrid material path:
-- at rest: native `ACCENT_ENABLE_ACRYLICBLURBEHIND = 4` (real Win10 Acrylic)
-- during `WM_ENTERSIZEMOVE`: temporary Windows.UI.Composition HostBackdrop fast path
-- on `WM_EXITSIZEMOVE`: detach the fast path and immediately restore state 4
+Windows 10:
+- one always-on Windows.UI.Composition Acrylic effect for the entire visible lifetime of the window;
+- no material switch on WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE;
+- no ACCENT_ENABLE_ACRYLICBLURBEHIND = 4 in the production path;
+- no tint-only HostBackdrop masquerading as Acrylic.
 
-The transient composition path uses the non-topmost DesktopWindowTarget +
-NativeAOT bridge + ctypes from PySide. It is deliberately not called Acrylic:
-it is a performance fallback used only while the window geometry is changing.
+The final Win10 structure is:
 
-## Root cause
+~~~text
+desktop
+  -> pure Win32 backdrop HWND
+       WS_EX_TOOLWINDOW
+       WS_EX_NOACTIVATE
+       WS_EX_TRANSPARENT
+       WS_EX_NOREDIRECTIONBITMAP
+       -> DesktopWindowTarget
+       -> HostBackdropBrush
+       -> GaussianBlurEffect
+       -> tint visual
+  -> foreground Qt / PySide HWND
+       -> all ClipSave UI
+~~~
 
-Win10 native Acrylic (ACCENT_ENABLE_ACRYLICBLURBEHIND=4) is visually correct but was rejected as a live-move/live-resize backend by benchmark:
-- move ~13.77ms
-- resize ~20.85ms
+The backdrop HWND is kept immediately behind the Qt HWND and never accepts input or activation. During live move/resize the two Win32 rectangles are synchronized at WM_WINDOWPOSCHANGING, followed by a geometry-only final snap at WM_WINDOWPOSCHANGED.
 
-The previous HostBackdrop-only release fixed geometry cadence, but the user's
-real screenshot proved that it was only a sharp translucent/tinted backdrop,
-not Acrylic: background detail remained unblurred. That release is superseded.
+## Root causes found
 
-The hybrid route keeps real state-4 Acrylic while stationary and switches to
-the proven fast HostBackdrop composition only during interactive move/resize.
+### 1. Native Accent Acrylic is visually correct but too slow during geometry changes
 
-An earlier `DesktopAttachedSiteBridge -> ContentIsland -> DesktopAcrylicController`
-prototype was rejected after a real desktop screenshot showed the ContentIsland
-covering all Qt controls. Do not restore that architecture even though its geometry
-benchmark looked fast.
+On Windows 10 build 19044 / 144.001 Hz:
 
-## Completed
+- AccentState=4 move: about 13.77 ms
+- AccentState=4 resize: about 20.85 ms
 
-- NativeAOT bridge integrated
-- direct NativeAOT COM ABI for `ICompositorDesktopInterop`
-- Windows App SDK dependency/runtime removed; packaged backdrop runtime is one DLL
-- manifest integration
-- fallback logic
-- build pipeline integration
-- release visual-smoke validation of the final desktop-composited frame
-- backend diagnostics
-- full 531-test regression, including the hybrid backdrop-switch test
-- Windows cmd.exe/build.bat subprocess decoding cleanup
-- packaged EXE move/resize performance verification
+This is compositor cadence, not Python/Qt CPU time. The old state-4 path is therefore retained only as historical evidence, not as the final backend.
 
-Verified release:
-- `backdrop_backend=win10_native_acrylic`
-- `backdrop_success=True`
-- `backdrop_native_error=None`
-- `event_loop_exited=0`
+### 2. HostBackdrop + tint alone is not Acrylic
 
-Final packaged EXE interactive geometry validation on Win10 19044 / 144.001 Hz:
-- move: mean 6.918ms, p50 6.936ms, p95 7.091ms, p99 7.502ms,
-  0/240 >16.7ms, 0/240 >33.3ms
-- resize: mean 7.436ms, p50 7.272ms, p95 10.328ms, p99 23.399ms,
-  4/240 >16.7ms, 0/240 >33.3ms
+The earlier HostBackdrop-only implementation fixed move/resize cadence, but the user's real screenshot showed the desktop sharply through the UI. That proved that a backdrop sample plus tint is not sufficient; a real blur effect is required.
 
-Visual regression evidence for the original blank-window bug:
-- broken ContentIsland build: 105 sampled colors / 41 edge pixels
-- old HostBackdrop-only release: 530 sampled colors / 914 edge pixels
-- hybrid native-Acrylic release: 1360 sampled colors / 614 edge pixels
-- `visual_smoke=PASS backend=win10_native_acrylic`
+### 3. The Composition effect tree existed but rendered at 0x0
 
-Final regression on the exact final working tree:
-- `Ran 531 tests in 324.968s`
-- `OK`
-- no `_readerthread` / `UnicodeDecodeError` noise
+This was the decisive bug.
 
-Final package audit:
-- `_internal/windows_backdrop/` contains only `clipsave_windows_backdrop.dll`
-- no Windows App SDK / WindowsAppRuntime DLLs or license are bundled
-- bridge DLL has no `Microsoft.WindowsAppRuntime.dll` reference
-- embedded EXE manifest retains `asInvoker`, Windows supportedOS declarations,
-  Common Controls v6 and `longPathAware`, with no private WinAppSDK registration
+The bridge created a root ContainerVisual, and all child visuals used RelativeSizeAdjustment = Vector2.One, but the root itself never received a size. The effect graph could attach successfully while drawing nothing.
 
-## Resolved test-runner issue
+The fix is:
 
-The apparent unittest hangs were Windows subprocess decode failures: this Python runs with UTF-8 mode enabled while `cmd.exe` emits the local Windows code page. The affected tests now use `locale.getencoding()` plus `errors="replace"` for captured `cmd.exe` / `build.bat` text. On this machine that resolves to `cp936`. Do not switch those subprocess captures back to implicit UTF-8 decoding.
+~~~csharp
+_root = _compositor.CreateContainerVisual();
+_root.RelativeSizeAdjustment = Vector2.One;
+_desktopTarget.Root = _root;
+~~~
 
-## Remaining
+After that fix, the controlled 6-pixel black/white stripe probe immediately changed from sharp passthrough to strong blur.
 
-- no Acrylic/backend blocker is known
-- keep the normal release/build validation when future production code changes
+### 4. One Qt top-level HWND cannot safely host both layers
 
-## Do not revisit
+Putting the Composition tree on the same Qt-owned HWND either hides the Qt client layer or makes transparent child/native surfaces bypass the blur.
 
-- Do not use the tint-only HostBackdrop composition as the resting material; it
-  is fast but is not Acrylic.
-- Do not leave AccentState 4 active during live move/resize on this Win10 host;
-  it is the correct resting material but has a stable lower compositor cadence
-  while geometry changes.
+The robust design is two top-level HWNDs:
+
+- lower pure Win32 backdrop HWND;
+- upper Qt UI HWND.
+
+The lower HWND must not be Qt-owned, because synchronously moving a second Qt-owned top-level from the host's WM_WINDOWPOSCHANGING callback can re-enter Qt's window state machine and trigger STATUS_FATAL_USER_CALLBACK_EXCEPTION (0xC000041D).
+
+## Native bridge
+
+Files:
+
+- native/windows_backdrop/AcrylicBridge.cs
+- native/windows_backdrop/NativeExports.cs
+- native/windows_backdrop/WindowsBackdropBridge.csproj
+- clipsave_app/windows_backdrop.py
+
+The bridge is .NET 8 NativeAOT and calls ICompositorDesktopInterop through the COM ABI directly.
+
+The Win10 effect graph currently uses:
+
+~~~text
+HostBackdropBrush
+  -> GaussianBlurEffect
+  -> SpriteVisual
+  -> tint SpriteVisual
+~~~
+
+Win2D is used only for the effect projection/runtime. NuGet PackageDownload is used so Win2D's XAML framework references are not imported into the NativeAOT bridge project.
+
+Required packaged runtime files:
+
+- clipsave_windows_backdrop.dll
+- Microsoft.Graphics.Canvas.dll
+- msvcp140_app.dll
+- vcruntime140_1_app.dll
+- vcruntime140_app.dll
+
+The three VCRT APP forwarders are required by Microsoft.Graphics.Canvas.dll.
+
+## Window synchronization
+
+The backdrop host is a pure Win32 WS_POPUP created by create_backdrop_host_window().
+
+Important behavior:
+
+- normal show / restore can synchronize geometry and z-order;
+- inside live move/resize, WM_WINDOWPOSCHANGING follows the proposed RECT with sync_z_order=False;
+- WM_WINDOWPOSCHANGED performs a geometry-only snap to the final committed GetWindowRect();
+- no z-order manipulation is performed from the host's live window callback.
+
+This eliminated the final occasional 1-pixel resize mismatch without reintroducing the Windows user-callback crash.
+
+## Final packaged validation
+
+Target:
+
+~~~text
+D:\GPT_WEB\clipsave\build\release\ClipSave\ClipSave.exe
+~~~
+
+Host:
+
+- Windows 10 build 19044
+- 144.001 Hz desktop
+
+### Visual smoke
+
+~~~text
+visual_smoke=PASS
+backend=win10_effect_acrylic
+
+unique=718/19800
+edge=519/19800
+edge_mean=1.813
+~~~
+
+### Controlled blur probe
+
+The final packaged EXE was placed above a 6-pixel black/white stripe field.
+
+~~~text
+outside_adjacent_mean     = 42.194
+resting_adjacent_mean     = 4.089
+interactive_adjacent_mean = 4.089
+
+resting_ratio     = 0.0969
+interactive_ratio = 0.0969
+interactive_blur  = PASS
+~~~
+
+The blur strength is unchanged when entering the real WM_ENTERSIZEMOVE loop.
+
+### Interactive performance and geometry lock
+
+~~~text
+move
+  mean 6.928 ms
+  p50  6.936 ms
+  p95  7.226 ms
+  p99  8.348 ms
+  >16.7 ms = 0/240
+  >33.3 ms = 0/240
+  geometry max delta = 0 px
+
+resize
+  mean 9.337 ms
+  p50  8.408 ms
+  p95  14.119 ms
+  p99  23.977 ms
+  >16.7 ms = 6/240
+  >33.3 ms = 0/240
+  geometry max delta = 0 px
+~~~
+
+### Full regression
+
+~~~text
+Ran 532 tests in 322.948s
+OK
+~~~
+
+## Packaging / licensing
+
+The portable release includes the Win2D runtime and the required VCRT forwarders. Their license texts are included under third_party_licenses/ and listed in THIRD_PARTY_NOTICES.md.
+
+Inno Setup is optional; on the validation host it was not installed, so the portable ZIP was built successfully without an installer.
+
+## Do not regress
+
+- Do not restore the old state-4 / fast-path hybrid switch.
+- Do not use HostBackdrop + tint without Gaussian blur and call it Acrylic.
+- Do not remove _root.RelativeSizeAdjustment = Vector2.One.
+- Do not replace the pure Win32 backdrop HWND with a Qt-owned helper top-level.
+- Do not change z-order from inside the host's live WM_WINDOWPOSCHANGING callback.
+- Do not remove the Win2D / VCRT runtime files or their license notices from the release package.

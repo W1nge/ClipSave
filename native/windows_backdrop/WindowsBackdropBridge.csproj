@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0-windows10.0.17763.0</TargetFramework>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
     <RootNamespace>ClipSave.WindowsBackdrop</RootNamespace>
     <AssemblyName>clipsave_windows_backdrop</AssemblyName>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -13,4 +14,36 @@
     <WindowsPackageType>None</WindowsPackageType>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
+  <PropertyGroup>
+    <Win2DPackageRoot>$(NuGetPackageRoot)win2d.uwp\1.28.3</Win2DPackageRoot>
+    <VCRTForwardersPackageRoot>$(NuGetPackageRoot)microsoft.vcrtforwarders.140\1.1.0</VCRTForwardersPackageRoot>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageDownload Include="Win2D.uwp" Version="[1.28.3]" />
+    <PackageDownload Include="Microsoft.VCRTForwarders.140" Version="[1.1.0]" />
+    <Reference Include="Microsoft.Graphics.Canvas.Interop">
+      <HintPath>$(Win2DPackageRoot)\lib\net8.0-windows10.0.19041.0\Microsoft.Graphics.Canvas.Interop.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <None
+      Include="$(Win2DPackageRoot)\runtimes\win-x64\native\Microsoft.Graphics.Canvas.dll"
+      Link="Microsoft.Graphics.Canvas.dll"
+      CopyToOutputDirectory="PreserveNewest"
+      CopyToPublishDirectory="PreserveNewest" />
+    <None
+      Include="$(VCRTForwardersPackageRoot)\runtimes\win-x64\native\release\msvcp140_app.dll"
+      Link="msvcp140_app.dll"
+      CopyToOutputDirectory="PreserveNewest"
+      CopyToPublishDirectory="PreserveNewest" />
+    <None
+      Include="$(VCRTForwardersPackageRoot)\runtimes\win-x64\native\release\vcruntime140_1_app.dll"
+      Link="vcruntime140_1_app.dll"
+      CopyToOutputDirectory="PreserveNewest"
+      CopyToPublishDirectory="PreserveNewest" />
+    <None
+      Include="$(VCRTForwardersPackageRoot)\runtimes\win-x64\native\release\vcruntime140_app.dll"
+      Link="vcruntime140_app.dll"
+      CopyToOutputDirectory="PreserveNewest"
+      CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

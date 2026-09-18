@@ -6,6 +6,62 @@ from clipsave_app import windows_frame
 
 
 class WindowsFrameTests(unittest.TestCase):
+    def test_create_backdrop_host_window_uses_native_no_redirection_helper(self):
+        user32 = Mock()
+        user32.CreateWindowExW.return_value = 456
+        kernel32 = Mock()
+        kernel32.GetModuleHandleW.return_value = 123
+
+        with patch.object(
+            windows_frame, "is_windows_qt_platform", return_value=True
+        ), patch.object(
+            windows_frame, "_user32", return_value=user32
+        ), patch(
+            "clipsave_app.windows_frame.ctypes.WinDLL", return_value=kernel32
+        ):
+            hwnd = windows_frame.create_backdrop_host_window()
+
+        self.assertEqual(hwnd, 456)
+        ex_style, class_name, title, style, x, y, width, height, *_rest = (
+            user32.CreateWindowExW.call_args.args
+        )
+        self.assertEqual(class_name, "STATIC")
+        self.assertEqual(title, "")
+        self.assertEqual(style, windows_frame.WS_POPUP)
+        self.assertEqual((x, y, width, height), (-32000, -32000, 1, 1))
+        self.assertTrue(ex_style & windows_frame.WS_EX_TRANSPARENT)
+        self.assertTrue(ex_style & windows_frame.WS_EX_TOOLWINDOW)
+        self.assertTrue(ex_style & windows_frame.WS_EX_NOACTIVATE)
+        self.assertTrue(ex_style & windows_frame.WS_EX_NOREDIRECTIONBITMAP)
+
+    def test_sync_backdrop_host_window_geometry_only_never_changes_z_order(self):
+        user32 = Mock()
+        user32.IsWindowVisible.return_value = 1
+        user32.SetWindowPos.return_value = 1
+
+        with patch.object(
+            windows_frame, "is_windows_qt_platform", return_value=True
+        ), patch.object(
+            windows_frame, "_user32", return_value=user32
+        ):
+            synced = windows_frame.sync_backdrop_host_window(
+                456,
+                123,
+                10,
+                20,
+                800,
+                600,
+                sync_z_order=False,
+            )
+
+        self.assertTrue(synced)
+        args = user32.SetWindowPos.call_args.args
+        self.assertEqual(args[:6], (456, None, 10, 20, 800, 600))
+        flags = args[6]
+        self.assertTrue(flags & windows_frame.SWP_NOZORDER)
+        self.assertTrue(flags & windows_frame.SWP_NOACTIVATE)
+        self.assertTrue(flags & windows_frame.SWP_NOOWNERZORDER)
+
     def test_getminmaxinfo_uses_monitor_work_area_relative_to_monitor(self):
         minimum = windows_frame.MINMAXINFO()
         minimum.ptMinTrackSize = windows_frame.POINT(800, 440)

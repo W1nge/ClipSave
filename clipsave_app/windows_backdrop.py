@@ -8,6 +8,12 @@ from pathlib import Path
 
 
 _BRIDGE_DLL = "clipsave_windows_backdrop.dll"
+_OPTIONAL_RUNTIME_DLLS = (
+    "msvcp140_app.dll",
+    "vcruntime140_1_app.dll",
+    "vcruntime140_app.dll",
+    "Microsoft.Graphics.Canvas.dll",
+)
 
 
 def _runtime_root() -> Path:
@@ -37,6 +43,8 @@ class WindowsCompositionBackdropBridge:
 
     def __init__(self) -> None:
         self._bridge = None
+        self._runtime_modules: list[object] = []
+        self._dll_directory = None
         self._owner_thread_id: int | None = None
         self._attached_hwnd: int | None = None
         self._last_error: int | None = None
@@ -101,6 +109,12 @@ class WindowsCompositionBackdropBridge:
             return False
 
         try:
+            if hasattr(os, "add_dll_directory"):
+                self._dll_directory = os.add_dll_directory(str(root))
+            for dll_name in _OPTIONAL_RUNTIME_DLLS:
+                dll_path = root / dll_name
+                if dll_path.is_file():
+                    self._runtime_modules.append(ctypes.WinDLL(str(dll_path)))
             bridge = ctypes.CDLL(str(bridge_path))
             self._configure_exports(bridge)
         except (AttributeError, OSError, TypeError, ValueError) as exc:

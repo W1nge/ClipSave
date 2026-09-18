@@ -29,6 +29,8 @@ def collect(output: Path) -> None:
         "Qt-LGPL-3.0-only.txt",
         "Qt-GPL-3.0-only.txt",
         "SQLite-Public-Domain.txt",
+        "Win2D-MIT.txt",
+        "VCRTForwarders-MIT.txt",
     }
     upstream_dir = Path("third_party_licenses")
     missing_upstream = [

@@ -696,7 +696,7 @@ class MainWindowTests(unittest.TestCase):
     def test_solid_backdrop_switches_top_level_surfaces_to_opaque_theme(self):
         solid = BackdropResult(BackdropBackend.SOLID, True)
         acrylic = BackdropResult(BackdropBackend.DESKTOP_ACRYLIC, True)
-        system_acrylic = BackdropResult(BackdropBackend.WIN10_NATIVE_ACRYLIC, True)
+        system_acrylic = BackdropResult(BackdropBackend.WIN10_EFFECT_ACRYLIC, True)
         legacy = BackdropResult(BackdropBackend.LEGACY_BLUR, True)
 
         self.window._sync_surface_style(result=solid, dark=False)
@@ -1348,7 +1348,7 @@ class MainWindowTests(unittest.TestCase):
             self.window.styleSheet(),
         )
         self.assertNotIn("rgba(0,0,0,204)", self.window.styleSheet())
-        backdrop.assert_called_with(self.window, True)
+        backdrop.assert_called_with(self.window, True, composition_window=None)
 
         self.settings.data["follow_system_theme"] = False
         self.settings.data["theme_mode"] = "light"

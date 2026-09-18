@@ -112,9 +112,17 @@ if errorlevel 1 goto :failed
 if exist "%appDir%\_internal\windows_backdrop" rmdir /s /q "%appDir%\_internal\windows_backdrop"
 xcopy /e /i /y "%backdropRuntime%" "%appDir%\_internal\windows_backdrop" >nul
 if errorlevel 1 goto :failed
-if not exist "%appDir%\_internal\windows_backdrop\clipsave_windows_backdrop.dll" (
-  echo ERROR: Windows backdrop runtime was not staged into the application directory.
-  goto :missing_output
+for %%F in (
+  clipsave_windows_backdrop.dll
+  Microsoft.Graphics.Canvas.dll
+  msvcp140_app.dll
+  vcruntime140_1_app.dll
+  vcruntime140_app.dll
+) do (
+  if not exist "%appDir%\_internal\windows_backdrop\%%F" (
+    echo ERROR: Windows backdrop runtime is missing %%F in the application directory.
+    goto :missing_output
+  )
 )
 
 copy /y "%~dp0LICENSE" "%releaseDir%\LICENSE" >nul

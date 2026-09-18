@@ -6,8 +6,14 @@ import subprocess
 from pathlib import Path
 
 
-TARGET_FRAMEWORK = "net8.0-windows10.0.17763.0"
-BRIDGE_DLL = "clipsave_windows_backdrop.dll"
+TARGET_FRAMEWORK = "net8.0-windows10.0.19041.0"
+RUNTIME_DLLS = (
+    "clipsave_windows_backdrop.dll",
+    "Microsoft.Graphics.Canvas.dll",
+    "msvcp140_app.dll",
+    "vcruntime140_1_app.dll",
+    "vcruntime140_app.dll",
+)
 
 _PYINSTALLER_APPLICATION_SETTINGS = r"""
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -99,10 +105,11 @@ def build(project_root: Path, output_root: Path) -> None:
         shutil.rmtree(runtime_dir)
     runtime_dir.mkdir(parents=True)
 
-    bridge = publish_dir / BRIDGE_DLL
-    if not bridge.is_file():
-        raise RuntimeError(f"Windows backdrop publish is missing {bridge}")
-    shutil.copy2(bridge, runtime_dir / BRIDGE_DLL)
+    for dll_name in RUNTIME_DLLS:
+        source = publish_dir / dll_name
+        if not source.is_file():
+            raise RuntimeError(f"Windows backdrop publish is missing {source}")
+        shutil.copy2(source, runtime_dir / dll_name)
 
     manifest_path = output_root / "ClipSave.manifest"
     manifest_path.write_text(

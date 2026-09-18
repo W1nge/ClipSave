@@ -132,7 +132,7 @@ _LEGACY_BLUR_TINT_ALPHA = 204  # 80%; Qt supplies most of the fallback material 
 def _surface_tint_alpha(backend: str | None) -> int:
     if backend in {
         "desktop_acrylic",
-        "win10_native_acrylic",
+        "win10_effect_acrylic",
     }:
         return _ACRYLIC_TINT_ALPHA
     return _LEGACY_BLUR_TINT_ALPHA

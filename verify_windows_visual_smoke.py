@@ -75,6 +75,8 @@ def _status_values(path: Path) -> dict[str, str]:
 
 
 def _find_visible_window(pid: int) -> int:
+    GWL_EXSTYLE = -20
+    WS_EX_TOOLWINDOW = 0x00000080
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
@@ -86,6 +88,8 @@ def _find_visible_window(pid: int) -> int:
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.IsWindowVisible.argtypes = [wintypes.HWND]
     user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
     found: list[int] = []
 
     @callback_type
@@ -93,7 +97,11 @@ def _find_visible_window(pid: int) -> int:
         if user32.IsWindowVisible(hwnd):
             window_pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
-            if int(window_pid.value) == pid:
+            ex_style = int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+            if (
+                int(window_pid.value) == pid
+                and not (ex_style & WS_EX_TOOLWINDOW)
+            ):
                 found.append(int(hwnd))
         return True
 

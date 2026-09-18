@@ -163,7 +163,12 @@ class DependencyLockTests(unittest.TestCase):
         return log_path.read_text(encoding="ascii").splitlines()
 
     def test_native_runtime_license_texts_are_present(self):
-        for name in ("OpenSSL-Apache-2.0.txt", "SQLite-Public-Domain.txt"):
+        for name in (
+            "OpenSSL-Apache-2.0.txt",
+            "SQLite-Public-Domain.txt",
+            "Win2D-MIT.txt",
+            "VCRTForwarders-MIT.txt",
+        ):
             with self.subTest(name=name):
                 path = Path("third_party_licenses") / name
                 self.assertTrue(path.is_file())

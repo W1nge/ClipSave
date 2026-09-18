@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Numerics;
+using Microsoft.Graphics.Canvas.Effects;
 using WinRT;
 using Windows.UI.Composition;
 using Windows.UI.Composition.Desktop;
@@ -69,6 +70,8 @@ internal static class AcrylicBridge
     private static SpriteVisual? _backdropVisual;
     private static SpriteVisual? _tintVisual;
     private static CompositionBackdropBrush? _hostBackdropBrush;
+    private static CompositionEffectFactory? _blurEffectFactory;
+    private static CompositionEffectBrush? _blurBrush;
     private static CompositionColorBrush? _tintBrush;
     private static nint _attachedHwnd;
     private static int _lastError;
@@ -131,8 +134,11 @@ internal static class AcrylicBridge
             var createDesktopWindowTarget =
                 (delegate* unmanaged[Stdcall]<nint, nint, int, nint*, int>)interopVtable[3];
             nint rawTarget = 0;
-            // A non-topmost desktop target lives behind the HWND's regular
-            // client rendering, so Qt widgets remain visible above the blur.
+            // Keep the Composition target non-topmost. The dedicated backdrop
+            // HWND itself sits immediately behind the foreground Qt window, so
+            // the effect remains visible without entering Qt's topmost client
+            // composition path (which can trigger fatal user-callback failures
+            // during helper-window lifecycle changes).
             hr = createDesktopWindowTarget(interopPointer, hwnd, 0, &rawTarget);
             Marshal.ThrowExceptionForHR(hr);
             if (rawTarget == 0)
@@ -200,13 +206,31 @@ internal static class AcrylicBridge
             _lastStage = 4;
             _desktopTarget = CreateDesktopTarget(hwnd);
             _root = _compositor!.CreateContainerVisual();
+            _root.RelativeSizeAdjustment = Vector2.One;
             _desktopTarget.Root = _root;
             _lastStage = 5;
 
             _hostBackdropBrush = _compositor.CreateHostBackdropBrush();
+            GaussianBlurEffect blurEffect = new()
+            {
+                Name = "BackdropBlur",
+                BlurAmount = 20.0f,
+                BorderMode = EffectBorderMode.Hard,
+                Optimization = EffectOptimization.Speed,
+                Source = new CompositionEffectSourceParameter("Backdrop"),
+            };
+            SaturationEffect acrylicEffect = new()
+            {
+                Name = "BackdropSaturation",
+                Saturation = 1.25f,
+                Source = blurEffect,
+            };
+            _blurEffectFactory = _compositor.CreateEffectFactory(acrylicEffect);
+            _blurBrush = _blurEffectFactory.CreateBrush();
+            _blurBrush.SetSourceParameter("Backdrop", _hostBackdropBrush);
             _backdropVisual = _compositor.CreateSpriteVisual();
             _backdropVisual.RelativeSizeAdjustment = Vector2.One;
-            _backdropVisual.Brush = _hostBackdropBrush;
+            _backdropVisual.Brush = _blurBrush;
             _root.Children.InsertAtBottom(_backdropVisual);
 
             _tintBrush = _compositor.CreateColorBrush(TintColor(dark));
@@ -282,6 +306,8 @@ internal static class AcrylicBridge
                     _backdropVisual.Brush = null;
                     _backdropVisual = null;
                 }
+                _blurBrush = null;
+                _blurEffectFactory = null;
                 _hostBackdropBrush = null;
 
                 if (_desktopTarget is not null)

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "dependencies": {
-    "net8.0-windows10.0.17763": {
+    "net8.0-windows10.0.19041": {
       "Microsoft.DotNet.ILCompiler": {
         "type": "Direct",
         "requested": "[8.0.13, )",
@@ -15,7 +15,7 @@
         "contentHash": "R19ZTaRiQAK+xo9ZwaHbF/1vb1wwR1Wn5+sqp9v8+CDjbdS8R6qftKdw0VSXWKm7VAMi7P+NCU4zxDzhEWcAwQ=="
       }
     },
-    "net8.0-windows10.0.17763/win-x64": {
+    "net8.0-windows10.0.19041/win-x64": {
       "Microsoft.DotNet.ILCompiler": {
         "type": "Direct",
         "requested": "[8.0.13, )",

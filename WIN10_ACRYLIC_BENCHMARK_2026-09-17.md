@@ -1,110 +1,209 @@
 # Win10 Acrylic Performance Benchmark
 
-Date: 2026-09-17
+Updated: 2026-09-18
 
-Environment: Windows 10 build 19044, 144.001 Hz desktop, PySide6/Qt window with `WA_TranslucentBackground`.
+Environment:
 
-## Minimal-window A/B/C
+- Windows 10 build 19044
+- 144.001 Hz desktop
+- PySide6 / Qt translucent top-level window
 
-Each case used the same visible HWND and Qt surface. The only changed variable was the native backdrop backend. Every geometry update processed Qt events and then called `DwmFlush()` so the timing includes compositor completion rather than only the API call.
+## Historical AccentPolicy baseline
 
-Aggregate over three rotated rounds, 540 measured samples per case:
+The old native AccentPolicy paths were measured with the same visible HWND and
+Qt surface. Each geometry update processed Qt events and then called DwmFlush().
 
 | Backend | Move mean | Resize mean |
 | --- | ---: | ---: |
-| Solid (`AccentState=0`) | 6.942 ms | 7.007 ms |
-| Legacy Blur (`AccentState=3`) | 6.943 ms | 7.098 ms |
-| Accent Acrylic (`AccentState=4`) | 13.773 ms | 20.845 ms |
+| Solid, AccentState=0 | 6.942 ms | 7.007 ms |
+| Legacy Blur, AccentState=3 | 6.943 ms | 7.098 ms |
+| Native Acrylic, AccentState=4 | 13.773 ms | 20.845 ms |
 
-At 144 Hz one refresh interval is about 6.944 ms. The measured cadences therefore line up closely with about 144 Hz for Solid/Legacy Blur, about 72 Hz for Acrylic movement, and about 48 Hz for Acrylic resize.
+At 144 Hz one refresh interval is about 6.944 ms. The state-4 measurements
+therefore correspond roughly to 72 Hz movement and 48 Hz resize cadence.
 
-## Additional controls
+Additional controls established that the slowdown was compositor-side:
 
-- Static repaint without geometry changes: Solid 6.944 ms, Blur 6.954 ms, Acrylic 6.943 ms.
-- Acrylic movement was essentially invariant with window size: 480x320 = 13.888 ms, 960x620 = 13.889 ms, 1500x900 = 13.887 ms.
-- Wall/CPU timing: Solid move 6.939/2.214 ms; Acrylic move 13.191/1.628 ms. Solid resize 6.943/2.734 ms; Acrylic resize 20.831/5.924 ms. Most added wall time is compositor wait rather than Python/Qt CPU work.
-- Native Acrylic `GradientColor` alpha was swept through 1, 32, 76, 128, 204, and 255. Movement remained about 13.65 ms and resize about 20.83 ms for every alpha.
-- A real ClipSave `MainWindow` was also tested using a temporary database and temporary settings. Legacy Blur resize was about 9 ms while Accent Acrylic remained about 20.83 ms.
+- static repaint without geometry changes stayed near 6.94 ms;
+- Acrylic move time was nearly invariant with window size;
+- changing Accent Acrylic GradientColor alpha did not materially change move or resize cadence;
+- CPU time did not account for the extra wall-clock delay.
 
-## Win10 Composition HostBackdrop fast path
+Conclusion: AccentState=4 is visually correct Acrylic, but it is not suitable
+for live geometry changes on this validation host.
 
-An intermediate prototype used `DesktopAttachedSiteBridge -> ContentIsland -> DesktopAcrylicController`. It benchmarked near one 144 Hz refresh interval, but that result was not a valid final UX verification: a later real-screen capture showed the ContentIsland sitting above the Qt client content, leaving the user with one large Acrylic surface and no visible controls. That prototype is rejected.
+## Failed intermediate paths
 
-`DesktopAcrylicController.SetTarget(WindowId, DesktopWindowTarget)` was also investigated. On Windows 10 build 19044 its documented `DWMWA_USE_HOSTBACKDROPBRUSH` prerequisite is not available, so that is not the production Win10 route either.
+### ContentIsland / DesktopAcrylicController
 
-The composition fast path uses only OS-provided Windows composition APIs:
+DesktopAttachedSiteBridge -> ContentIsland -> DesktopAcrylicController could
+benchmark quickly, but a real desktop capture showed the ContentIsland covering
+the Qt client content. The window became one large Acrylic surface with the Qt
+controls hidden. This architecture is rejected.
 
-```text
-Qt translucent HWND
-  -> ACCENT_ENABLE_HOSTBACKDROP (state 5)
-  -> Windows.UI.Composition Compositor
-  -> non-topmost DesktopWindowTarget
-  -> CreateHostBackdropBrush()
+### HostBackdrop plus tint only
+
+HostBackdropBrush with a tint visual benchmarked near a 144 Hz refresh
+interval, but the user's real screenshot showed the desktop sharply through the
+window. That path was translucent, not Acrylic.
+
+## Decisive Composition bug
+
+The NativeAOT bridge later added a real GaussianBlurEffect, but initial tests
+still appeared sharp even though the bridge returned attach=True.
+
+The root cause was the Composition root ContainerVisual:
+
+~~~csharp
+_root = _compositor.CreateContainerVisual();
+_desktopTarget.Root = _root;
+~~~
+
+All child visuals used RelativeSizeAdjustment = Vector2.One, but the root itself
+had no size. The effect tree therefore existed successfully while effectively
+rendering at 0x0.
+
+The required fix is:
+
+~~~csharp
+_root = _compositor.CreateContainerVisual();
+_root.RelativeSizeAdjustment = Vector2.One;
+_desktopTarget.Root = _root;
+~~~
+
+After this change the controlled stripe probe immediately showed strong blur.
+
+## Final Win10 Composition Acrylic
+
+The final effect path is:
+
+~~~text
+pure Win32 backdrop HWND
+  -> DesktopWindowTarget
+  -> HostBackdropBrush
+  -> GaussianBlurEffect
   -> tint SpriteVisual
-  -> Qt client content remains above the backdrop visual
-```
 
-The composition objects live in a small in-process NativeAOT shared library called from PySide/Python with `ctypes`. C#/WinRT custom `ComImport` projection is not used for `ICompositorDesktopInterop`, because that projection throws `NotSupportedException` under NativeAOT; the bridge performs the COM `QueryInterface`/vtable call directly.
+foreground Qt HWND
+  -> all application UI
+~~~
 
-The bridge no longer depends on or bundles Microsoft Windows App SDK. A clean NativeAOT publish contains only `clipsave_windows_backdrop.dll` (plus the build-only PDB outside the release runtime).
+The backdrop HWND is:
 
-Important correction after real-user visual inspection: HostBackdropBrush plus tint alone is not Acrylic. It samples/translucently shows the background but does not provide the native Acrylic blur/noise recipe. The user's screenshot showed the desktop sharply through the sidebar/top bar, which invalidated the earlier conclusion that this could be the resting Win10 material.
+- WS_POPUP
+- WS_EX_TOOLWINDOW
+- WS_EX_NOACTIVATE
+- WS_EX_TRANSPARENT
+- WS_EX_NOREDIRECTIONBITMAP
 
-### Visual regression that found the ContentIsland bug
+It is not Qt-owned. This matters because SetWindowPos can then be called from
+the host window's WM_WINDOWPOSCHANGING callback without re-entering Qt's QWindow
+state machine.
 
-The final desktop-composited HWND is now captured from the screen instead of trusting `window.isVisible()` alone. On the same 1440x880 window:
+The final implementation keeps the same blur material active continuously.
+There is no material swap on WM_ENTERSIZEMOVE or WM_EXITSIZEMOVE.
 
-| Build | Sampled colors | Edge pixels >= 24 | Result |
-| --- | ---: | ---: | --- |
-| Broken ContentIsland prototype | 105 | 41 | Qt UI hidden by Acrylic surface |
-| Composition HostBackdrop candidate | 484 | 850 | Qt controls/content visible |
-| Final clean-build HostBackdrop release | 530 | 914 | visual smoke PASS |
+## Controlled packaged blur verification
 
-`verify_windows_visual_smoke.py` keeps this check as a local Windows release gate so a backdrop layer cannot silently cover the UI again.
+The final packaged ClipSave.exe was placed above a 6-pixel alternating
+black/white stripe field.
 
-### Final packaged ClipSave: hybrid Acrylic
+| Sample | Adjacent-pixel mean |
+| --- | ---: |
+| Outside window | 42.194 |
+| Resting Acrylic | 4.089 |
+| Interactive Acrylic | 4.089 |
 
-The actual `build/release/ClipSave/ClipSave.exe` was then launched in smoke mode. The application itself reported:
+Ratios:
 
-```text
-backdrop_backend=win10_native_acrylic
-backdrop_success=True
-backdrop_native_error=None
-```
+~~~text
+resting_ratio     = 0.0969
+interactive_ratio = 0.0969
+interactive_blur  = PASS
+~~~
 
-The final design is hybrid:
+The static and WM_ENTERSIZEMOVE measurements are identical to three decimal
+places. The material therefore remains blurred during the interactive loop.
 
-```text
-resting HWND
-  -> ACCENT_ENABLE_ACRYLICBLURBEHIND (state 4)
-  -> real Win10 Acrylic
+## Final packaged performance
 
-WM_ENTERSIZEMOVE
-  -> disable state 4
-  -> attach fast non-topmost HostBackdrop composition
+Target:
 
-WM_EXITSIZEMOVE
-  -> detach fast composition
-  -> restore state 4 immediately
-```
+~~~text
+build/release/ClipSave/ClipSave.exe
+~~~
 
-This keeps the visually correct material while stationary, but avoids the state-4 72/48 Hz compositor cadence only during live geometry changes.
-
-The packaged EXE was exercised with 240 moves and 240 resizes while explicitly entering/exiting the interactive size/move loop:
+The verifier ran 240 move samples and 240 resize samples while explicitly
+entering the real interactive size/move loop.
 
 | Action | Mean | p50 | p95 | p99 | >16.7 ms | >33.3 ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Move | 6.918 ms | 6.936 ms | 7.091 ms | 7.502 ms | 0/240 | 0/240 |
-| Resize | 7.436 ms | 7.272 ms | 10.328 ms | 23.399 ms | 4/240 | 0/240 |
+| Move | 6.928 ms | 6.936 ms | 7.226 ms | 8.348 ms | 0/240 | 0/240 |
+| Resize | 9.337 ms | 8.408 ms | 14.119 ms | 23.977 ms | 6/240 | 0/240 |
 
-The final visual smoke of the packaged hybrid release reported 1360 sampled colors and 614 edge pixels, with `visual_smoke=PASS backend=win10_native_acrylic`. The old HostBackdrop-only release measured 530 sampled colors / 914 edge pixels. The metric is used only as a regression guard that Qt UI remains visible; material correctness comes from the native state-4 resting path rather than from this scalar image score.
+Geometry lock was measured independently:
 
-The exact final Python working tree was also run through the complete unittest suite: 531/531 tests passed in 324.968 seconds.
+~~~text
+initial RECT delta = 0 px
+move max delta      = 0 px
+resize max delta    = 0 px
+~~~
 
-The final clean release package was audited as well. `_internal/windows_backdrop/` contains only `clipsave_windows_backdrop.dll`; neither the release directory nor the portable ZIP contains Windows App SDK / WindowsAppRuntime files, and the NativeAOT bridge no longer references `Microsoft.WindowsAppRuntime.dll`. The embedded executable manifest still contains the normal `asInvoker`, supportedOS, Common Controls v6 and `longPathAware` declarations without any private WinAppSDK registration.
+The final 1-pixel resize discrepancy was removed by:
+
+1. following the proposed RECT in WM_WINDOWPOSCHANGING;
+2. snapping to the committed GetWindowRect in WM_WINDOWPOSCHANGED;
+3. using geometry-only SetWindowPos with SWP_NOZORDER inside live callbacks.
+
+## Packaged visual smoke
+
+~~~text
+visual_smoke=PASS
+backend=win10_effect_acrylic
+unique=718/19800
+edge=519/19800
+edge_mean=1.813
+rgb_stddev=11.562,12.180,13.278
+~~~
+
+The visual-smoke metric is a UI visibility regression guard. Material
+correctness is established by the controlled stripe test above.
+
+## NativeAOT and dependencies
+
+The bridge remains an in-process NativeAOT shared library.
+
+Win2D provides the Gaussian blur effect projection/runtime. It is consumed using
+NuGet PackageDownload so its XAML framework references are not imported into the
+bridge build.
+
+Final runtime files:
+
+- clipsave_windows_backdrop.dll
+- Microsoft.Graphics.Canvas.dll
+- msvcp140_app.dll
+- vcruntime140_1_app.dll
+- vcruntime140_app.dll
+
+The Win2D and VCRT Forwarders license texts are bundled with the release.
+
+## Final regression
+
+~~~text
+Ran 532 tests in 322.948s
+OK
+~~~
 
 ## Final conclusion
 
-The Win10 `ACCENT_ENABLE_ACRYLICBLURBEHIND` path is the correct resting material, but it exhibits a lower compositor cadence during live move/resize on this machine. The evidence does not support ClipSave UI complexity, `WA_TranslucentBackground`, window area, tint alpha, or Python/Qt CPU cost as the primary cause.
+The final Win10 solution is one continuously active Composition Acrylic
+material, not a hybrid backend.
 
-The final Win10 solution is therefore not one backend for all phases. It uses native state-4 Acrylic at rest and the fast Windows.UI.Composition HostBackdrop only as a transient interactive fallback. Legacy `ACCENT_ENABLE_BLURBEHIND = 3` remains a compatibility fallback if the fast composition bridge cannot be attached.
+The old AccentState=4 result remains useful as evidence that native Acrylic has
+a geometry-change cadence limitation on this machine, but the production path
+no longer needs to switch away from Acrylic during movement.
+
+The two most important implementation constraints are:
+
+1. the Composition root must be sized with RelativeSizeAdjustment = Vector2.One;
+2. the backdrop host must be a pure Win32 HWND, not a Qt-owned helper top-level.

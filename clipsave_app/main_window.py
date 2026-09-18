@@ -53,7 +53,6 @@ from .services import (
     register_windows_power_saving_notification,
     release_windows_backdrop,
     set_windows_backdrop_input_active,
-    set_windows_backdrop_interactive,
     shutdown_ai_ocr_task_executor,
     unregister_windows_power_saving_notification,
 )
@@ -62,19 +61,28 @@ from .startup import set_start_with_windows
 from .storage import is_under_local_store, recycle_managed_file
 from .styles import stylesheet_for_theme
 from .windows_frame import (
+    WINDOWPOS,
     WM_DPICHANGED,
     WM_GETMINMAXINFO,
     WM_NCACTIVATE,
     WM_NCCALCSIZE,
+    WM_WINDOWPOSCHANGING,
     WM_WINDOWPOSCHANGED,
+    SWP_HIDEWINDOW,
+    SWP_NOMOVE,
+    SWP_NOSIZE,
+    create_backdrop_host_window,
+    destroy_backdrop_host_window,
     enable_native_resize_frame,
     handle_getminmaxinfo,
     handle_nccalcsize,
     handle_ncactivate,
+    hide_backdrop_host_window,
     is_windows_qt_platform,
     maximize_native_window,
     native_window_is_maximized,
     restore_native_window,
+    sync_backdrop_host_window,
     synchronize_maximized_work_area,
     window_dpi_scale,
     window_rect,
@@ -223,6 +231,7 @@ class MainWindow(QMainWindow):
         self._native_resize_frame_hwnd: int | None = None
         self._native_backdrop_hwnd: int | None = None
         self._native_backdrop_result: BackdropResult | None = None
+        self._windows_backdrop_window_hwnd: int | None = None
         self._power_saving_notification_hwnd: int | None = None
         self._power_saving_notification_handle: int | None = None
         self._material_refresh_pending = False
@@ -252,6 +261,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.aboutToQuit.connect(self._release_power_saving_notification)
             app.aboutToQuit.connect(release_windows_backdrop)
+            app.aboutToQuit.connect(self._destroy_windows_backdrop_window)
 
         self.clipboard_service = ClipboardService(database, self)
         self.clipboard_service.captured.connect(self.on_captured)
@@ -270,7 +280,6 @@ class MainWindow(QMainWindow):
         self.backup_timer.timeout.connect(self._start_periodic_backup)
         self.backup_timer.start()
         QTimer.singleShot(0, self._show_database_recovery_state)
-        self._apply_native_backdrop()
 
     def _desired_dark_theme(self) -> bool:
         if self.settings.get("follow_system_theme", True):
@@ -528,6 +537,157 @@ class MainWindow(QMainWindow):
         if not self.resize_handles:
             self._install_resize_handles(self.centralWidget())
 
+    def _ensure_windows_backdrop_window(self) -> int | None:
+        if not is_windows_qt_platform():
+            return None
+        if self._windows_backdrop_window_hwnd:
+            return self._windows_backdrop_window_hwnd
+        hwnd = create_backdrop_host_window()
+        if not hwnd:
+            return None
+        self._windows_backdrop_window_hwnd = hwnd
+        return hwnd
+
+    def _destroy_windows_backdrop_window(self) -> None:
+        hwnd = self._windows_backdrop_window_hwnd
+        self._windows_backdrop_window_hwnd = None
+        if hwnd:
+            destroy_backdrop_host_window(hwnd)
+
+    def _hide_windows_backdrop_window(self) -> None:
+        hwnd = self._windows_backdrop_window_hwnd
+        if hwnd:
+            hide_backdrop_host_window(hwnd)
+
+    def _sync_windows_backdrop_window_rect(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        *,
+        visible: bool | None = None,
+    ) -> None:
+        if (
+            self._native_backdrop_result is None
+            or self._native_backdrop_result.backend.value != "win10_effect_acrylic"
+            or not self._native_backdrop_result.success
+        ):
+            self._hide_windows_backdrop_window()
+            return
+        backdrop_hwnd = self._windows_backdrop_window_hwnd
+        if not backdrop_hwnd:
+            return
+        should_show = (
+            self.isVisible() and not self.isMinimized()
+            if visible is None
+            else visible
+        )
+        if not should_show:
+            hide_backdrop_host_window(backdrop_hwnd)
+            return
+        sync_backdrop_host_window(
+            backdrop_hwnd,
+            int(self.winId()),
+            int(x),
+            int(y),
+            max(1, int(width)),
+            max(1, int(height)),
+            visible=True,
+        )
+
+    def _sync_windows_backdrop_window(self) -> None:
+        if not is_windows_qt_platform():
+            return
+        if (
+            self._native_backdrop_result is None
+            or self._native_backdrop_result.backend.value != "win10_effect_acrylic"
+            or not self._native_backdrop_result.success
+        ):
+            return
+        hwnd = int(self.winId())
+        rect = window_rect(hwnd)
+        if rect is None:
+            return
+        left, top, right, bottom = rect
+        self._sync_windows_backdrop_window_rect(
+            left,
+            top,
+            max(1, right - left),
+            max(1, bottom - top),
+        )
+
+    def _sync_windows_backdrop_geometry_now(self) -> None:
+        """Mirror the host's real Win32 bounds and keep the helper just behind it."""
+        if (
+            self._native_backdrop_result is None
+            or self._native_backdrop_result.backend.value != "win10_effect_acrylic"
+            or not self._native_backdrop_result.success
+        ):
+            return
+        backdrop_hwnd = self._windows_backdrop_window_hwnd
+        host_hwnd = int(self.winId())
+        if not backdrop_hwnd or self.isMinimized():
+            return
+        rect = window_rect(host_hwnd)
+        if rect is None:
+            return
+        left, top, right, bottom = rect
+        sync_backdrop_host_window(
+            backdrop_hwnd,
+            host_hwnd,
+            left,
+            top,
+            max(1, right - left),
+            max(1, bottom - top),
+            visible=self.isVisible(),
+            sync_z_order=False,
+        )
+
+    def _sync_windows_backdrop_from_windowpos(self, lparam: int) -> None:
+        """Pre-position the Acrylic HWND during WM_WINDOWPOSCHANGING.
+
+        This runs before the host geometry is committed, removing the one-event
+        lag that is visible when a separate backdrop window follows a live drag
+        only from moveEvent/resizeEvent.
+        """
+        if (
+            not lparam
+            or self._native_backdrop_result is None
+            or self._native_backdrop_result.backend.value != "win10_effect_acrylic"
+            or not self._native_backdrop_result.success
+            or self.isMinimized()
+        ):
+            return
+        backdrop_hwnd = self._windows_backdrop_window_hwnd
+        host_hwnd = int(self.winId())
+        if not backdrop_hwnd or not host_hwnd:
+            return
+        try:
+            position = WINDOWPOS.from_address(int(lparam))
+        except (TypeError, ValueError):
+            return
+        current = window_rect(host_hwnd)
+        if current is None:
+            return
+        left, top, right, bottom = current
+        x = left if position.flags & SWP_NOMOVE else int(position.x)
+        y = top if position.flags & SWP_NOMOVE else int(position.y)
+        width = max(1, right - left) if position.flags & SWP_NOSIZE else max(1, int(position.cx))
+        height = max(1, bottom - top) if position.flags & SWP_NOSIZE else max(1, int(position.cy))
+        if position.flags & SWP_HIDEWINDOW:
+            return
+        sync_backdrop_host_window(
+            backdrop_hwnd,
+            host_hwnd,
+            x,
+            y,
+            width,
+            height,
+            visible=True,
+            sync_z_order=False,
+        )
+
     def _apply_native_backdrop(
         self, *, force: bool = False, dark: bool | None = None
     ) -> None:
@@ -536,16 +696,23 @@ class MainWindow(QMainWindow):
         hwnd = int(self.winId())
         if not force and self._native_backdrop_hwnd == hwnd:
             return
+        composition_window = self._ensure_windows_backdrop_window()
         result = apply_windows_backdrop(
             self,
             self.dark_theme if dark is None else dark,
+            composition_window=composition_window,
         )
         self._native_backdrop_result = result
         self._sync_surface_style(result=result, dark=dark)
         if result.success:
             self._native_backdrop_hwnd = hwnd
+            if result.backend.value == "win10_effect_acrylic":
+                self._sync_windows_backdrop_window()
+            else:
+                self._hide_windows_backdrop_window()
         else:
             self._native_backdrop_hwnd = None
+            self._hide_windows_backdrop_window()
 
     def _ensure_power_saving_notification(self) -> None:
         if not is_windows_qt_platform():
@@ -626,8 +793,15 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._update_resize_handles()
+        if is_windows_qt_platform() and not self._interactive_resize_active:
+            self._sync_windows_backdrop_geometry_now()
         if hasattr(self, "copy_toast"):
             self.copy_toast.reposition()
+
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        if is_windows_qt_platform() and not self._interactive_resize_active:
+            self._sync_windows_backdrop_geometry_now()
 
     def toggle_maximized(self) -> None:
         if self._window_is_maximized():
@@ -657,6 +831,11 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "window_title_bar"):
             self.window_title_bar.update_maximize_state(self._window_is_maximized())
             self._update_resize_handles()
+            if is_windows_qt_platform():
+                if self.isMinimized():
+                    self._hide_windows_backdrop_window()
+                else:
+                    QTimer.singleShot(0, self._sync_windows_backdrop_window)
         super().changeEvent(event)
 
     def nativeEvent(self, event_type, message):
@@ -693,8 +872,20 @@ class MainWindow(QMainWindow):
                 handled, result = handle_nccalcsize(int(msg.hWnd), int(msg.wParam), int(msg.lParam))
                 if handled:
                     return True, result
+            if msg.message == WM_WINDOWPOSCHANGING and self._interactive_resize_active:
+                self._sync_windows_backdrop_from_windowpos(int(msg.lParam))
             if msg.message in (WM_WINDOWPOSCHANGED, WM_DPICHANGED):
                 self._schedule_maximized_bounds_sync()
+                if self._interactive_resize_active:
+                    # WM_WINDOWPOSCHANGING follows the proposed rectangle so
+                    # the Acrylic host moves in the same transaction.  Windows
+                    # can still commit a final size that differs by one device
+                    # pixel after NCCALCSIZE/Qt rounding, so snap the native
+                    # helper to the committed GetWindowRect here.  Geometry
+                    # only: never touch z-order from inside the host callback.
+                    self._sync_windows_backdrop_geometry_now()
+                else:
+                    QTimer.singleShot(0, self._sync_windows_backdrop_window)
             if msg.message == 0x0231:  # WM_ENTERSIZEMOVE
                 self._begin_interactive_resize()
             elif msg.message == 0x0232:  # WM_EXITSIZEMOVE
@@ -774,23 +965,16 @@ class MainWindow(QMainWindow):
             return
         self._interactive_resize_active = True
         self.grid.set_layout_updates_suspended(True)
-        if is_windows_qt_platform():
-            set_windows_backdrop_interactive(
-                int(self.winId()),
-                True,
-                dark=self.dark_theme,
-            )
 
     def _end_interactive_resize(self) -> None:
         if not self._interactive_resize_active:
             return
         self._interactive_resize_active = False
         if is_windows_qt_platform():
-            set_windows_backdrop_interactive(
-                int(self.winId()),
-                False,
-                dark=self.dark_theme,
-            )
+            # The live loop used geometry-only native sync to avoid callback
+            # reentrancy. Re-establish exact z-order once the Win32 sizing loop
+            # has returned to Qt's event queue.
+            QTimer.singleShot(0, self._sync_windows_backdrop_window)
         self.grid.set_layout_updates_suspended(
             self._sidebar_animation_active or self._detail_animation_active
         )
@@ -3175,12 +3359,15 @@ class MainWindow(QMainWindow):
         self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
         self.raise_()
         self.activateWindow()
+        if is_windows_qt_platform():
+            QTimer.singleShot(0, self._sync_windows_backdrop_window)
 
     def showEvent(self, event) -> None:
         self._ensure_native_resize_frame()
         self._ensure_power_saving_notification()
-        self._apply_native_backdrop()
         super().showEvent(event)
+        if is_windows_qt_platform():
+            QTimer.singleShot(0, self._activate_windows_backdrop_after_show)
         self.grid.set_preview_loading_enabled(self.view_stack.currentWidget() is self.grid)
         if not self._initial_position_constrained:
             self._initial_position_constrained = True
@@ -3204,7 +3391,15 @@ class MainWindow(QMainWindow):
         ):
             self.setGeometry(x, y, width, height)
 
+    def _activate_windows_backdrop_after_show(self) -> None:
+        if self._closing or self._quit_in_progress:
+            return
+        self._apply_native_backdrop()
+        self._sync_windows_backdrop_window()
+
     def hideEvent(self, event) -> None:
+        if is_windows_qt_platform():
+            self._hide_windows_backdrop_window()
         self.grid.set_preview_loading_enabled(False)
         super().hideEvent(event)
 

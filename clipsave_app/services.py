@@ -1808,7 +1808,7 @@ class AIService:
 class BackdropBackend(Enum):
     SOLID = "solid"
     LEGACY_BLUR = "legacy_blur"
-    WIN10_NATIVE_ACRYLIC = "win10_native_acrylic"
+    WIN10_EFFECT_ACRYLIC = "win10_effect_acrylic"
     DESKTOP_ACRYLIC = "desktop_acrylic"
     MICA = "mica"
 
@@ -2076,62 +2076,28 @@ def set_windows_backdrop_input_active(active: bool) -> bool:
     return True
 
 
-def set_windows_backdrop_interactive(
-    hwnd: int,
-    active: bool,
-    *,
-    dark: bool = False,
-) -> bool:
-    """Use a fast translucent composition path only during live move/resize.
-
-    Win10 AccentState=4 is the real Acrylic material but its compositor cadence
-    drops sharply while HWND geometry changes on the validation host. Keep it
-    while the window is at rest, temporarily attach the fast HostBackdrop
-    composition surface between WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE, then restore
-    native Acrylic immediately when interaction ends.
-    """
-    if os.name != "nt" or not hwnd:
-        return True
-    try:
-        user32, _dwmapi = _windows_effect_apis()
-        build = sys.getwindowsversion().build
-        if build >= 22000 or build < 17134:
-            return True
-        if active:
-            # During live move/resize use the fast composition path. It keeps
-            # the window translucent while avoiding state-4's 72/48 Hz
-            # compositor cadence. The real Acrylic material returns on EXIT.
-            _set_windows_accent_state(user32, hwnd, 0)
-            if attach_windows_composition_backdrop(hwnd, dark):
-                return True
-            # If the fast composition bridge is unavailable, fall back to the
-            # old blur rather than leaving the window without a backdrop.
-            return _set_windows_accent_state(
-                user32, hwnd, 3, gradient_color=0x00FFFFFF
-            )
-        detached = detach_windows_composition_backdrop()
-        restored = _set_windows_accent_state(
-            user32,
-            hwnd,
-            4,  # ACCENT_ENABLE_ACRYLICBLURBEHIND
-            gradient_color=0x01000000,
-        )
-        return detached and restored
-    except (AttributeError, OSError, TypeError, ValueError):
-        return False
-
-
 def release_windows_backdrop() -> bool:
     if os.name != "nt":
         return True
     return detach_windows_composition_backdrop()
 
 
-def apply_windows_backdrop(window, dark: bool = False) -> BackdropResult:
+def apply_windows_backdrop(
+    window,
+    dark: bool = False,
+    *,
+    composition_window=None,
+) -> BackdropResult:
     if os.name != "nt":
         return BackdropResult(BackdropBackend.SOLID, False)
     try:
         hwnd = int(window.winId())
+        if composition_window is None:
+            composition_hwnd = hwnd
+        elif isinstance(composition_window, int):
+            composition_hwnd = int(composition_window)
+        else:
+            composition_hwnd = int(composition_window.winId())
         user32, dwmapi = _windows_effect_apis()
         build = sys.getwindowsversion().build
         backdrop_applied = False
@@ -2160,22 +2126,23 @@ def apply_windows_backdrop(window, dark: bool = False) -> BackdropResult:
                     native_error = backdrop_result
             if not backdrop_applied:
                 if system_policy.allows_app_managed_backdrop:
-                    # Use real Win10 native Acrylic while the window is at rest.
-                    # MainWindow temporarily switches to the fast composition
-                    # path only during live move/resize, then restores state 4.
-                    if build >= 17134:
+                    # Keep one GPU-composited Acrylic effect active for the
+                    # entire lifetime of the Win10 HWND, including live
+                    # move/resize. The bridge renders HostBackdrop through a
+                    # GaussianBlur effect behind Qt's client content.
+                    if build >= 17763:
                         detach_windows_composition_backdrop()
-                        backdrop_applied = _set_windows_accent_state(
-                            user32,
-                            hwnd,
-                            4,  # ACCENT_ENABLE_ACRYLICBLURBEHIND
-                            gradient_color=0x01000000,
+                        _set_windows_accent_state(user32, hwnd, 0)
+                        backdrop_applied = attach_windows_composition_backdrop(
+                            composition_hwnd, dark
                         )
                         if backdrop_applied:
-                            backend = BackdropBackend.WIN10_NATIVE_ACRYLIC
+                            backend = BackdropBackend.WIN10_EFFECT_ACRYLIC
                             native_error = None
                         else:
-                            native_error = _last_windows_error() or native_error
+                            native_error = (
+                                windows_composition_backdrop_error() or native_error
+                            )
 
                 if not backdrop_applied and system_policy.allows_app_managed_backdrop:
                     # Compatibility fallback when the composition bridge is
