@@ -24,7 +24,7 @@ def _runtime_root() -> Path:
     )
 
 
-class WindowsCompositionAcrylicBridge:
+class WindowsCompositionBackdropBridge:
     """Thin, fail-safe ctypes wrapper around the NativeAOT backdrop bridge.
 
     The Windows.UI.Composition objects and DispatcherQueue are created on the Qt
@@ -198,32 +198,32 @@ class WindowsCompositionAcrylicBridge:
         return success
 
 
-_WINDOWS_COMPOSITION_ACRYLIC = WindowsCompositionAcrylicBridge()
+_WINDOWS_COMPOSITION_BACKDROP = WindowsCompositionBackdropBridge()
 
 
-def windows_composition_acrylic_supported() -> bool:
-    return _WINDOWS_COMPOSITION_ACRYLIC.is_supported()
+def windows_composition_backdrop_supported() -> bool:
+    return _WINDOWS_COMPOSITION_BACKDROP.is_supported()
 
 
-def attach_windows_composition_acrylic(hwnd: int, dark: bool) -> bool:
-    return _WINDOWS_COMPOSITION_ACRYLIC.attach(hwnd, dark)
+def attach_windows_composition_backdrop(hwnd: int, dark: bool) -> bool:
+    return _WINDOWS_COMPOSITION_BACKDROP.attach(hwnd, dark)
 
 
-def set_windows_composition_acrylic_theme(dark: bool) -> bool:
-    return _WINDOWS_COMPOSITION_ACRYLIC.set_theme(dark)
+def set_windows_composition_backdrop_theme(dark: bool) -> bool:
+    return _WINDOWS_COMPOSITION_BACKDROP.set_theme(dark)
 
 
-def set_windows_composition_acrylic_input_active(active: bool) -> bool:
-    return _WINDOWS_COMPOSITION_ACRYLIC.set_input_active(active)
+def set_windows_composition_backdrop_input_active(active: bool) -> bool:
+    return _WINDOWS_COMPOSITION_BACKDROP.set_input_active(active)
 
 
-def detach_windows_composition_acrylic() -> bool:
-    return _WINDOWS_COMPOSITION_ACRYLIC.detach()
+def detach_windows_composition_backdrop() -> bool:
+    return _WINDOWS_COMPOSITION_BACKDROP.detach()
 
 
-def windows_composition_acrylic_error() -> int | None:
-    return _WINDOWS_COMPOSITION_ACRYLIC.last_error
+def windows_composition_backdrop_error() -> int | None:
+    return _WINDOWS_COMPOSITION_BACKDROP.last_error
 
 
-def windows_composition_acrylic_stage() -> int | None:
-    return _WINDOWS_COMPOSITION_ACRYLIC.last_stage
+def windows_composition_backdrop_stage() -> int | None:
+    return _WINDOWS_COMPOSITION_BACKDROP.last_stage

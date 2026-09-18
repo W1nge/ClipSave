@@ -4,18 +4,27 @@
 
 Win11: DWM System Acrylic.
 
-Win10: Windows.UI.Composition HostBackdrop + non-topmost DesktopWindowTarget + NativeAOT bridge + ctypes from PySide.
+Win10: hybrid material path:
+- at rest: native `ACCENT_ENABLE_ACRYLICBLURBEHIND = 4` (real Win10 Acrylic)
+- during `WM_ENTERSIZEMOVE`: temporary Windows.UI.Composition HostBackdrop fast path
+- on `WM_EXITSIZEMOVE`: detach the fast path and immediately restore state 4
+
+The transient composition path uses the non-topmost DesktopWindowTarget +
+NativeAOT bridge + ctypes from PySide. It is deliberately not called Acrylic:
+it is a performance fallback used only while the window geometry is changing.
 
 ## Root cause
 
-Old Win10 AccentPolicy Acrylic (ACCENT_ENABLE_ACRYLICBLURBEHIND=4) was rejected by benchmark:
+Win10 native Acrylic (ACCENT_ENABLE_ACRYLICBLURBEHIND=4) is visually correct but was rejected as a live-move/live-resize backend by benchmark:
 - move ~13.77ms
 - resize ~20.85ms
 
-Win10 Composition HostBackdrop final release:
-- final validation round A: move 6.943ms mean, resize 7.760ms mean
-- final validation round B: move 6.971ms mean, resize 6.981ms mean
-- neither final round had a sample above 33.3ms
+The previous HostBackdrop-only release fixed geometry cadence, but the user's
+real screenshot proved that it was only a sharp translucent/tinted backdrop,
+not Acrylic: background detail remained unblurred. That release is superseded.
+
+The hybrid route keeps real state-4 Acrylic while stationary and switches to
+the proven fast HostBackdrop composition only during interactive move/resize.
 
 An earlier `DesktopAttachedSiteBridge -> ContentIsland -> DesktopAcrylicController`
 prototype was rejected after a real desktop screenshot showed the ContentIsland
@@ -32,37 +41,30 @@ benchmark looked fast.
 - build pipeline integration
 - release visual-smoke validation of the final desktop-composited frame
 - backend diagnostics
-- full 530-test regression, including the new visual-smoke analyzer tests
+- full 531-test regression, including the hybrid backdrop-switch test
 - Windows cmd.exe/build.bat subprocess decoding cleanup
 - packaged EXE move/resize performance verification
 
 Verified release:
-- `backdrop_backend=win10_composition_acrylic`
+- `backdrop_backend=win10_native_acrylic`
 - `backdrop_success=True`
 - `backdrop_native_error=None`
 - `event_loop_exited=0`
 
-Final packaged EXE geometry validation on Win10 19044 / 144.001 Hz:
-
-Round A:
-- move: mean 6.943ms, p50 6.931ms, p95 7.172ms, p99 9.160ms, 0/240 >16.7ms, 0/240 >33.3ms
-- resize: mean 7.760ms, p50 6.976ms, p95 13.845ms, p99 22.003ms, 6/240 >16.7ms, 0/240 >33.3ms
-
-Round B:
-- move: mean 6.971ms, p50 6.934ms, p95 7.179ms, p99 9.828ms, 0/240 >16.7ms, 0/240 >33.3ms
-- resize: mean 6.981ms, p50 6.913ms, p95 8.534ms, p99 11.036ms, 0/240 >16.7ms, 0/240 >33.3ms
-
-Post-cleanup final run (after failure-path hardening and the final clean rebuild):
-- move: mean 6.942ms, p50 6.926ms, p95 7.209ms, p99 9.140ms, 0/240 >16.7ms, 0/240 >33.3ms
-- resize: mean 7.058ms, p50 6.933ms, p95 8.795ms, p99 13.365ms, 0/240 >16.7ms, 0/240 >33.3ms
+Final packaged EXE interactive geometry validation on Win10 19044 / 144.001 Hz:
+- move: mean 6.918ms, p50 6.936ms, p95 7.091ms, p99 7.502ms,
+  0/240 >16.7ms, 0/240 >33.3ms
+- resize: mean 7.436ms, p50 7.272ms, p95 10.328ms, p99 23.399ms,
+  4/240 >16.7ms, 0/240 >33.3ms
 
 Visual regression evidence for the original blank-window bug:
 - broken ContentIsland build: 105 sampled colors / 41 edge pixels
-- final clean-build HostBackdrop release: 530 sampled colors / 914 edge pixels
-- `visual_smoke=PASS backend=win10_composition_acrylic`
+- old HostBackdrop-only release: 530 sampled colors / 914 edge pixels
+- hybrid native-Acrylic release: 1360 sampled colors / 614 edge pixels
+- `visual_smoke=PASS backend=win10_native_acrylic`
 
 Final regression on the exact final working tree:
-- `Ran 530 tests in 195.801s`
+- `Ran 531 tests in 324.968s`
 - `OK`
 - no `_readerthread` / `UnicodeDecodeError` noise
 
@@ -84,4 +86,8 @@ The apparent unittest hangs were Windows subprocess decode failures: this Python
 
 ## Do not revisit
 
-Do not return to AccentPolicy Acrylic tuning. It was benchmarked and is not the correct path.
+- Do not use the tint-only HostBackdrop composition as the resting material; it
+  is fast but is not Acrylic.
+- Do not leave AccentState 4 active during live move/resize on this Win10 host;
+  it is the correct resting material but has a stable lower compositor cadence
+  while geometry changes.

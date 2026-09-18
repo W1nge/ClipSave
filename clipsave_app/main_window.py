@@ -53,6 +53,7 @@ from .services import (
     register_windows_power_saving_notification,
     release_windows_backdrop,
     set_windows_backdrop_input_active,
+    set_windows_backdrop_interactive,
     shutdown_ai_ocr_task_executor,
     unregister_windows_power_saving_notification,
 )
@@ -773,11 +774,23 @@ class MainWindow(QMainWindow):
             return
         self._interactive_resize_active = True
         self.grid.set_layout_updates_suspended(True)
+        if is_windows_qt_platform():
+            set_windows_backdrop_interactive(
+                int(self.winId()),
+                True,
+                dark=self.dark_theme,
+            )
 
     def _end_interactive_resize(self) -> None:
         if not self._interactive_resize_active:
             return
         self._interactive_resize_active = False
+        if is_windows_qt_platform():
+            set_windows_backdrop_interactive(
+                int(self.winId()),
+                False,
+                dark=self.dark_theme,
+            )
         self.grid.set_layout_updates_suspended(
             self._sidebar_animation_active or self._detail_animation_active
         )

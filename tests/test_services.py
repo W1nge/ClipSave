@@ -1419,7 +1419,7 @@ class BackdropTests(unittest.TestCase):
         )
         user32.UnregisterPowerSettingNotification.assert_called_once_with(77)
 
-    def test_windows_10_uses_win10_composition_acrylic_for_both_themes(self):
+    def test_windows_10_uses_native_acrylic_for_both_themes(self):
         class AccentPolicy(ctypes.Structure):
             _fields_ = [
                 ("accent_state", ctypes.c_int),
@@ -1461,7 +1461,7 @@ class BackdropTests(unittest.TestCase):
             "clipsave_app.services._windows_backdrop_policy",
             return_value=WindowsBackdropPolicy(False, True),
         ), patch(
-            "clipsave_app.services.attach_windows_composition_acrylic",
+            "clipsave_app.services.attach_windows_composition_backdrop",
             return_value=True,
         ):
             light = apply_windows_backdrop(window, False)
@@ -1469,18 +1469,18 @@ class BackdropTests(unittest.TestCase):
 
         self.assertEqual(
             light,
-            BackdropResult(BackdropBackend.WIN10_COMPOSITION_ACRYLIC, True),
+            BackdropResult(BackdropBackend.WIN10_NATIVE_ACRYLIC, True),
         )
         self.assertEqual(
             dark,
-            BackdropResult(BackdropBackend.WIN10_COMPOSITION_ACRYLIC, True),
+            BackdropResult(BackdropBackend.WIN10_NATIVE_ACRYLIC, True),
         )
 
         self.assertEqual(
             captured,
             [
-                (19, 0, 0, 0),
-                (19, 0, 0, 0),
+                (19, 4, 0, 0x01000000),
+                (19, 4, 0, 0x01000000),
             ],
         )
 
@@ -1515,10 +1515,10 @@ class BackdropTests(unittest.TestCase):
             "clipsave_app.services._windows_backdrop_policy",
             return_value=WindowsBackdropPolicy(False, True),
         ), patch(
-            "clipsave_app.services.attach_windows_composition_acrylic",
+            "clipsave_app.services.attach_windows_composition_backdrop",
             return_value=False,
         ), patch(
-            "clipsave_app.services.windows_composition_acrylic_error",
+            "clipsave_app.services.windows_composition_backdrop_error",
             return_value=126,
         ), patch(
             "clipsave_app.services._last_windows_error", return_value=None
@@ -1526,7 +1526,55 @@ class BackdropTests(unittest.TestCase):
             result = apply_windows_backdrop(window, False)
 
         self.assertEqual(result, BackdropResult(BackdropBackend.LEGACY_BLUR, True))
-        self.assertEqual(captured_states, [0, 3])
+        self.assertEqual(captured_states, [4, 3])
+
+    def test_windows_10_interactive_move_uses_fast_composition_then_restores_acrylic(self):
+        captured = []
+
+        def set_composition(_hwnd, data_pointer):
+            data = ctypes.cast(
+                data_pointer,
+                ctypes.POINTER(services_module._WindowCompositionAttributeData),
+            ).contents
+            policy = ctypes.cast(
+                data.data,
+                ctypes.POINTER(services_module._AccentPolicy),
+            ).contents
+            captured.append((policy.accent_state, policy.gradient_color))
+            return 1
+
+        user32 = Mock()
+        user32.SetWindowCompositionAttribute.side_effect = set_composition
+        version = Mock(build=19044)
+
+        with patch("clipsave_app.services.os.name", "nt"), patch(
+            "clipsave_app.services.sys.getwindowsversion", return_value=version
+        ), patch(
+            "clipsave_app.services._windows_effect_apis",
+            return_value=(user32, Mock()),
+        ), patch(
+            "clipsave_app.services.attach_windows_composition_backdrop",
+            return_value=True,
+        ) as attach, patch(
+            "clipsave_app.services.detach_windows_composition_backdrop",
+            return_value=True,
+        ) as detach:
+            self.assertTrue(
+                services_module.set_windows_backdrop_interactive(123, True)
+            )
+            self.assertTrue(
+                services_module.set_windows_backdrop_interactive(123, False)
+            )
+
+        attach.assert_called_once_with(123, False)
+        detach.assert_called_once_with()
+        self.assertEqual(
+            captured,
+            [
+                (0, 0),
+                (4, 0x01000000),
+            ],
+        )
 
     def test_windows_11_22h2_uses_system_backdrop_and_checks_hresult(self):
         user32 = Mock()
@@ -1571,10 +1619,10 @@ class BackdropTests(unittest.TestCase):
             "clipsave_app.services._windows_backdrop_policy",
             return_value=WindowsBackdropPolicy(False, True),
         ), patch(
-            "clipsave_app.services.attach_windows_composition_acrylic",
+            "clipsave_app.services.attach_windows_composition_backdrop",
             return_value=False,
         ), patch(
-            "clipsave_app.services.windows_composition_acrylic_error",
+            "clipsave_app.services.windows_composition_backdrop_error",
             return_value=None,
         ), patch(
             "clipsave_app.services._last_windows_error", return_value=None
