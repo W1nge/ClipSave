@@ -696,7 +696,7 @@ class MainWindowTests(unittest.TestCase):
     def test_solid_backdrop_switches_top_level_surfaces_to_opaque_theme(self):
         solid = BackdropResult(BackdropBackend.SOLID, True)
         acrylic = BackdropResult(BackdropBackend.DESKTOP_ACRYLIC, True)
-        system_acrylic = BackdropResult(BackdropBackend.WINDOWS_APP_SDK_ACRYLIC, True)
+        system_acrylic = BackdropResult(BackdropBackend.WIN10_COMPOSITION_ACRYLIC, True)
         legacy = BackdropResult(BackdropBackend.LEGACY_BLUR, True)
 
         self.window._sync_surface_style(result=solid, dark=False)

@@ -9,29 +9,6 @@ from pathlib import Path
 
 _BRIDGE_DLL = "clipsave_windows_backdrop.dll"
 
-# These libraries are intentionally preloaded before the WinRT activation
-# factory is queried.  The Windows App SDK reg-free manifest can point at the
-# private subdirectory, but on Windows 10 some transitive composition/windowing
-# dependencies are otherwise resolved as though they lived beside the host
-# executable.  Keeping the handles alive also prevents an unload while WinRT
-# objects still reference code in the runtime.
-_PRELOAD_DLLS = (
-    "Microsoft.WindowsAppRuntime.dll",
-    "CoreMessagingXP.dll",
-    "dcompi.dll",
-    "dwmcorei.dll",
-    "DwmSceneI.dll",
-    "wuceffectsi.dll",
-    "marshal.dll",
-    "Microsoft.InputStateManager.dll",
-    "Microsoft.Internal.FrameworkUdk.dll",
-    "Microsoft.UI.Composition.OSSupport.dll",
-    "Microsoft.UI.Input.dll",
-    "Microsoft.UI.Windowing.Core.dll",
-    "Microsoft.UI.Windowing.dll",
-    "Microsoft.UI.dll",
-)
-
 
 def _runtime_root() -> Path:
     override = os.environ.get("CLIPSAVE_WINDOWS_BACKDROP_RUNTIME")
@@ -47,20 +24,18 @@ def _runtime_root() -> Path:
     )
 
 
-class WindowsAppSdkAcrylicBridge:
+class WindowsCompositionAcrylicBridge:
     """Thin, fail-safe ctypes wrapper around the NativeAOT backdrop bridge.
 
-    The Windows App SDK composition objects and DispatcherQueues are created on
-    the Qt GUI thread and remain thread-affine.  All public operations therefore
-    reject calls from a different thread after the first successful load.
+    The Windows.UI.Composition objects and DispatcherQueue are created on the Qt
+    GUI thread and remain thread-affine. All public operations therefore reject
+    calls from a different thread after the first successful load.
     """
 
     RPC_E_WRONG_THREAD = 0x8001010E
     ERROR_MOD_NOT_FOUND = 126
 
     def __init__(self) -> None:
-        self._dll_directory = None
-        self._preloaded: list[object] = []
         self._bridge = None
         self._owner_thread_id: int | None = None
         self._attached_hwnd: int | None = None
@@ -120,15 +95,13 @@ class WindowsAppSdkAcrylicBridge:
             return self._same_thread()
 
         root = _runtime_root()
-        required = (*_PRELOAD_DLLS, _BRIDGE_DLL)
-        if any(not (root / name).is_file() for name in required):
+        bridge_path = root / _BRIDGE_DLL
+        if not bridge_path.is_file():
             self._last_error = self.ERROR_MOD_NOT_FOUND
             return False
 
         try:
-            dll_directory = os.add_dll_directory(str(root))
-            preloaded = [ctypes.WinDLL(str(root / name)) for name in _PRELOAD_DLLS]
-            bridge = ctypes.CDLL(str(root / _BRIDGE_DLL))
+            bridge = ctypes.CDLL(str(bridge_path))
             self._configure_exports(bridge)
         except (AttributeError, OSError, TypeError, ValueError) as exc:
             self._last_error = (
@@ -138,8 +111,6 @@ class WindowsAppSdkAcrylicBridge:
             )
             return False
 
-        self._dll_directory = dll_directory
-        self._preloaded = preloaded
         self._bridge = bridge
         self._owner_thread_id = threading.get_ident()
         self._last_error = None
@@ -227,32 +198,32 @@ class WindowsAppSdkAcrylicBridge:
         return success
 
 
-_WINDOWS_APP_SDK_ACRYLIC = WindowsAppSdkAcrylicBridge()
+_WINDOWS_COMPOSITION_ACRYLIC = WindowsCompositionAcrylicBridge()
 
 
-def windows_app_sdk_acrylic_supported() -> bool:
-    return _WINDOWS_APP_SDK_ACRYLIC.is_supported()
+def windows_composition_acrylic_supported() -> bool:
+    return _WINDOWS_COMPOSITION_ACRYLIC.is_supported()
 
 
-def attach_windows_app_sdk_acrylic(hwnd: int, dark: bool) -> bool:
-    return _WINDOWS_APP_SDK_ACRYLIC.attach(hwnd, dark)
+def attach_windows_composition_acrylic(hwnd: int, dark: bool) -> bool:
+    return _WINDOWS_COMPOSITION_ACRYLIC.attach(hwnd, dark)
 
 
-def set_windows_app_sdk_acrylic_theme(dark: bool) -> bool:
-    return _WINDOWS_APP_SDK_ACRYLIC.set_theme(dark)
+def set_windows_composition_acrylic_theme(dark: bool) -> bool:
+    return _WINDOWS_COMPOSITION_ACRYLIC.set_theme(dark)
 
 
-def set_windows_app_sdk_acrylic_input_active(active: bool) -> bool:
-    return _WINDOWS_APP_SDK_ACRYLIC.set_input_active(active)
+def set_windows_composition_acrylic_input_active(active: bool) -> bool:
+    return _WINDOWS_COMPOSITION_ACRYLIC.set_input_active(active)
 
 
-def detach_windows_app_sdk_acrylic() -> bool:
-    return _WINDOWS_APP_SDK_ACRYLIC.detach()
+def detach_windows_composition_acrylic() -> bool:
+    return _WINDOWS_COMPOSITION_ACRYLIC.detach()
 
 
-def windows_app_sdk_acrylic_error() -> int | None:
-    return _WINDOWS_APP_SDK_ACRYLIC.last_error
+def windows_composition_acrylic_error() -> int | None:
+    return _WINDOWS_COMPOSITION_ACRYLIC.last_error
 
 
-def windows_app_sdk_acrylic_stage() -> int | None:
-    return _WINDOWS_APP_SDK_ACRYLIC.last_stage
+def windows_composition_acrylic_stage() -> int | None:
+    return _WINDOWS_COMPOSITION_ACRYLIC.last_stage

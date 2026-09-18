@@ -1,42 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import re
 import shutil
 import subprocess
 from pathlib import Path
 
 
-WINDOWS_APP_SDK_VERSION = "1.8.260804001"
 TARGET_FRAMEWORK = "net8.0-windows10.0.17763.0"
-RUNTIME_SUBDIR = r"_internal\windows_backdrop"
-
-RUNTIME_FILES = (
-    "clipsave_windows_backdrop.dll",
-    "CoreMessagingXP.dll",
-    "dcompi.dll",
-    "dwmcorei.dll",
-    "DwmSceneI.dll",
-    "marshal.dll",
-    "Microsoft.InputStateManager.dll",
-    "Microsoft.Internal.FrameworkUdk.dll",
-    "Microsoft.UI.Composition.OSSupport.dll",
-    "Microsoft.UI.dll",
-    "Microsoft.UI.Input.dll",
-    "Microsoft.UI.Windowing.Core.dll",
-    "Microsoft.UI.Windowing.dll",
-    "Microsoft.WindowsAppRuntime.dll",
-    "Microsoft.UI.pri",
-    "Microsoft.WindowsAppRuntime.pri",
-    "wuceffectsi.dll",
-)
-
-_FILE_BLOCK = re.compile(
-    r"(?P<indent>\s*)<asmv3:file name=\"(?P<name>[^\"]+)\">.*?</asmv3:file>\s*",
-    re.DOTALL,
-)
+BRIDGE_DLL = "clipsave_windows_backdrop.dll"
 
 _PYINSTALLER_APPLICATION_SETTINGS = r"""
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly manifestVersion="1.0"
+  xmlns:asmv3="urn:schemas-microsoft-com:asm.v3"
+  xmlns="urn:schemas-microsoft-com:asm.v1">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
@@ -63,6 +40,7 @@ _PYINSTALLER_APPLICATION_SETTINGS = r"""
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"></assemblyIdentity>
     </dependentAssembly>
   </dependency>
+ </assembly>
 """
 
 
@@ -91,62 +69,23 @@ def _run_publish(project: Path) -> None:
         raise RuntimeError(f"dotnet publish failed with exit code {completed.returncode}")
 
 
-def _filtered_manifest(source: Path) -> str:
-    text = source.read_text(encoding="utf-8-sig")
-    keep = set(RUNTIME_FILES)
-    kept_blocks: list[str] = []
-    for match in _FILE_BLOCK.finditer(text):
-        name = match.group("name")
-        if name not in keep:
-            continue
-        block = match.group(0).strip()
-        block = block.replace(
-            f'<asmv3:file name="{name}">',
-            f'<asmv3:file name="{RUNTIME_SUBDIR}\\{name}">',
-            1,
-        )
-        kept_blocks.append("    " + block.lstrip())
-
-    required_manifest_files = {
-        "CoreMessagingXP.dll",
-        "dcompi.dll",
-        "Microsoft.UI.Input.dll",
-        "Microsoft.UI.Windowing.dll",
-        "Microsoft.UI.Windowing.Core.dll",
-        "Microsoft.WindowsAppRuntime.dll",
-        "wuceffectsi.dll",
-    }
-    found = {
-        match.group("name")
-        for match in _FILE_BLOCK.finditer(text)
-        if match.group("name") in keep
-    }
-    missing = sorted(required_manifest_files - found)
-    if missing:
-        raise RuntimeError(
-            "Windows App SDK manifest is missing required registrations: "
-            + ", ".join(missing)
-        )
-
-    header = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-        '<assembly manifestVersion="1.0" '
-        'xmlns:asmv3="urn:schemas-microsoft-com:asm.v3" '
-        'xmlns:winrtv1="urn:schemas-microsoft-com:winrt.v1" '
-        'xmlns="urn:schemas-microsoft-com:asm.v1">\n'
-    )
-    body = "\n".join(kept_blocks)
-    return header + body + "\n" + _PYINSTALLER_APPLICATION_SETTINGS + "</assembly>\n"
-
-
 def build(project_root: Path, output_root: Path) -> None:
     project = project_root / "native" / "windows_backdrop" / "WindowsBackdropBridge.csproj"
     if not project.is_file():
         raise RuntimeError(f"Missing backdrop project: {project}")
 
+    native_root = project.parent
+    # The bridge used to reference Windows App SDK and its build-generated
+    # module initializer can survive an incremental publish after that package
+    # is removed.  Release builds must therefore start from fresh native
+    # intermediates or the resulting DLL may still try to load
+    # Microsoft.WindowsAppRuntime.dll at process startup.
+    for directory in (native_root / "bin", native_root / "obj"):
+        if directory.exists():
+            shutil.rmtree(directory)
+
     _run_publish(project)
 
-    native_root = project.parent
     publish_dir = (
         native_root
         / "bin"
@@ -155,46 +94,22 @@ def build(project_root: Path, output_root: Path) -> None:
         / "win-x64"
         / "publish"
     )
-    manifest_source = (
-        native_root
-        / "obj"
-        / "Release"
-        / TARGET_FRAMEWORK
-        / "win-x64"
-        / "Manifests"
-        / "app.manifest"
-    )
-    if not manifest_source.is_file():
-        raise RuntimeError(f"Windows App SDK did not generate {manifest_source}")
-
     runtime_dir = output_root / "runtime"
     if runtime_dir.exists():
         shutil.rmtree(runtime_dir)
     runtime_dir.mkdir(parents=True)
 
-    missing_runtime = [name for name in RUNTIME_FILES if not (publish_dir / name).is_file()]
-    if missing_runtime:
-        raise RuntimeError(
-            "Windows backdrop publish is missing required runtime files: "
-            + ", ".join(missing_runtime)
-        )
-    for name in RUNTIME_FILES:
-        shutil.copy2(publish_dir / name, runtime_dir / name)
+    bridge = publish_dir / BRIDGE_DLL
+    if not bridge.is_file():
+        raise RuntimeError(f"Windows backdrop publish is missing {bridge}")
+    shutil.copy2(bridge, runtime_dir / BRIDGE_DLL)
 
     manifest_path = output_root / "ClipSave.manifest"
-    manifest_path.write_text(_filtered_manifest(manifest_source), encoding="utf-8", newline="\n")
-
-    nuget_license = (
-        Path.home()
-        / ".nuget"
-        / "packages"
-        / "microsoft.windowsappsdk"
-        / WINDOWS_APP_SDK_VERSION
-        / "license.txt"
+    manifest_path.write_text(
+        _PYINSTALLER_APPLICATION_SETTINGS.strip() + "\n",
+        encoding="utf-8",
+        newline="\n",
     )
-    if not nuget_license.is_file():
-        raise RuntimeError(f"Windows App SDK license file is missing: {nuget_license}")
-    shutil.copy2(nuget_license, output_root / "WindowsAppSDK-LICENSE.txt")
 
     print(f"Windows backdrop runtime: {runtime_dir}")
     print(f"Windows backdrop manifest: {manifest_path}")

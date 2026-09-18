@@ -1,19 +1,75 @@
-using Microsoft.UI.Content;
-using Microsoft.UI.Composition;
-using Microsoft.UI.Composition.SystemBackdrops;
+using System.Runtime.InteropServices;
+using System.Numerics;
+using WinRT;
+using Windows.UI.Composition;
+using Windows.UI.Composition.Desktop;
 
 namespace ClipSave.WindowsBackdrop;
 
 internal static class AcrylicBridge
 {
+    private const int WcaAccentPolicy = 19;
+    private const int AccentDisabled = 0;
+    private const int AccentEnableHostBackdrop = 5;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AccentPolicy
+    {
+        public int AccentState;
+        public int AccentFlags;
+        public uint GradientColor;
+        public int AnimationId;
+    }
+
+    private static unsafe bool SetHostBackdropEnabled(nint hwnd, bool enabled)
+    {
+        AccentPolicy policy = new()
+        {
+            AccentState = enabled ? AccentEnableHostBackdrop : AccentDisabled,
+            AccentFlags = 0,
+            GradientColor = 0,
+            AnimationId = 0,
+        };
+        WindowCompositionAttribData data = new()
+        {
+            Attribute = WcaAccentPolicy,
+            Data = (nint)(&policy),
+            Size = (nuint)sizeof(AccentPolicy),
+        };
+        return SetWindowCompositionAttribute(hwnd, ref data) != 0;
+    }
+
+    private static Windows.UI.Color TintColor(bool dark)
+    {
+        return dark
+            ? Windows.UI.Color.FromArgb(0x58, 0x18, 0x1B, 0x20)
+            : Windows.UI.Color.FromArgb(0x48, 0xF6, 0xF7, 0xF9);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowCompositionAttribData
+    {
+        public int Attribute;
+        public nint Data;
+        public nuint Size;
+    }
+
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+    private static extern int SetWindowCompositionAttribute(
+        nint hwnd,
+        ref WindowCompositionAttribData data);
+
+    private static readonly Guid CompositorDesktopInteropIid =
+        new("29E691FA-4567-4DCA-B319-D0F207EB6807");
+
     private static Windows.System.DispatcherQueueController? _systemDispatcher;
-    private static Microsoft.UI.Dispatching.DispatcherQueueController? _appDispatcher;
     private static Compositor? _compositor;
+    private static DesktopWindowTarget? _desktopTarget;
     private static ContainerVisual? _root;
-    private static ContentIsland? _island;
-    private static DesktopAttachedSiteBridge? _siteBridge;
-    private static SystemBackdropConfiguration? _configuration;
-    private static DesktopAcrylicController? _acrylic;
+    private static SpriteVisual? _backdropVisual;
+    private static SpriteVisual? _tintVisual;
+    private static CompositionBackdropBrush? _hostBackdropBrush;
+    private static CompositionColorBrush? _tintBrush;
     private static nint _attachedHwnd;
     private static int _lastError;
     private static int _lastStage;
@@ -29,22 +85,78 @@ internal static class AcrylicBridge
 
     internal static int IsSupported()
     {
-        try
-        {
-            _lastError = 0;
-            return DesktopAcrylicController.IsSupported() ? 1 : 0;
-        }
-        catch (Exception exception)
-        {
-            return Failure(exception);
-        }
+        _lastError = 0;
+        return OperatingSystem.IsWindowsVersionAtLeast(10, 0, 17763) ? 1 : 0;
     }
 
     private static void EnsureThreadRuntime()
     {
         _systemDispatcher ??= CoreMessagingHelper.CreateForCurrentThread();
-        _appDispatcher ??= Microsoft.UI.Dispatching.DispatcherQueueController.CreateOnCurrentThread();
         _compositor ??= new Compositor();
+    }
+
+    private static unsafe uint ReleaseComPointer(nint pointer)
+    {
+        if (pointer == 0)
+        {
+            return 0;
+        }
+
+        nint* vtable = *(nint**)pointer;
+        var release = (delegate* unmanaged[Stdcall]<nint, uint>)vtable[2];
+        return release(pointer);
+    }
+
+    private static unsafe DesktopWindowTarget CreateDesktopTarget(nint hwnd)
+    {
+        // C#/WinRT's custom ComImport projection (`compositor.As<TInterop>()`)
+        // throws NotSupportedException under NativeAOT.  Use the COM ABI
+        // directly instead: query ICompositorDesktopInterop and invoke its
+        // CreateDesktopWindowTarget vtable slot.  The projected compositor
+        // remains alive for the duration of this call.
+        _lastStage = 31;
+        nint compositorPointer = ((IWinRTObject)_compositor!).NativeObject.ThisPtr;
+        nint interopPointer = 0;
+        Guid iid = CompositorDesktopInteropIid;
+        nint* compositorVtable = *(nint**)compositorPointer;
+        var queryInterface =
+            (delegate* unmanaged[Stdcall]<nint, Guid*, nint*, int>)compositorVtable[0];
+        int hr = queryInterface(compositorPointer, &iid, &interopPointer);
+        Marshal.ThrowExceptionForHR(hr);
+
+        try
+        {
+            _lastStage = 32;
+            nint* interopVtable = *(nint**)interopPointer;
+            var createDesktopWindowTarget =
+                (delegate* unmanaged[Stdcall]<nint, nint, int, nint*, int>)interopVtable[3];
+            nint rawTarget = 0;
+            // A non-topmost desktop target lives behind the HWND's regular
+            // client rendering, so Qt widgets remain visible above the blur.
+            hr = createDesktopWindowTarget(interopPointer, hwnd, 0, &rawTarget);
+            Marshal.ThrowExceptionForHR(hr);
+            if (rawTarget == 0)
+            {
+                throw new COMException("CreateDesktopWindowTarget returned a null target.");
+            }
+
+            try
+            {
+                _lastStage = 33;
+                return DesktopWindowTarget.FromAbi(rawTarget);
+            }
+            finally
+            {
+                ReleaseComPointer(rawTarget);
+            }
+        }
+        finally
+        {
+            if (interopPointer != 0)
+            {
+                ReleaseComPointer(interopPointer);
+            }
+        }
     }
 
     internal static int Attach(nint hwnd, bool dark)
@@ -59,13 +171,13 @@ internal static class AcrylicBridge
         {
             _lastError = 0;
             _lastStage = 1;
-            if (!DesktopAcrylicController.IsSupported())
+            if (IsSupported() == 0)
             {
                 _lastError = unchecked((int)0x80004001); // E_NOTIMPL
                 return 0;
             }
 
-            if (_attachedHwnd == hwnd && _acrylic is not null)
+            if (_attachedHwnd == hwnd && _desktopTarget is not null)
             {
                 return SetTheme(dark);
             }
@@ -74,40 +186,48 @@ internal static class AcrylicBridge
             _lastStage = 2;
             EnsureThreadRuntime();
             _lastStage = 3;
-            _root = _compositor!.CreateContainerVisual();
-            _lastStage = 4;
-            _island = ContentIsland.Create(_root);
-            var windowId = new Microsoft.UI.WindowId((ulong)hwnd);
-            _lastStage = 5;
-            _siteBridge = DesktopAttachedSiteBridge.CreateFromWindowId(
-                _appDispatcher!.DispatcherQueue,
-                windowId);
-            _lastStage = 6;
-            _siteBridge.Connect(_island);
-            _lastStage = 7;
-            _configuration = new SystemBackdropConfiguration
+
+            if (!SetHostBackdropEnabled(hwnd, true))
             {
-                IsInputActive = true,
-                Theme = dark ? SystemBackdropTheme.Dark : SystemBackdropTheme.Light,
-            };
-            _lastStage = 8;
-            _acrylic = new DesktopAcrylicController();
-            _acrylic.SetSystemBackdropConfiguration(_configuration);
-            _lastStage = 9;
-            if (!_acrylic.AddSystemBackdropTarget(_island))
-            {
-                _lastError = unchecked((int)0x80004005); // E_FAIL
-                Detach();
+                _lastError = Marshal.GetLastWin32Error();
                 return 0;
             }
-
+            // Record the HWND immediately after state 5 is enabled so a
+            // failure in any subsequent composition setup step can reliably
+            // roll the window back to AccentDisabled.
             _attachedHwnd = hwnd;
-            _lastStage = 10;
+
+            _lastStage = 4;
+            _desktopTarget = CreateDesktopTarget(hwnd);
+            _root = _compositor!.CreateContainerVisual();
+            _desktopTarget.Root = _root;
+            _lastStage = 5;
+
+            _hostBackdropBrush = _compositor.CreateHostBackdropBrush();
+            _backdropVisual = _compositor.CreateSpriteVisual();
+            _backdropVisual.RelativeSizeAdjustment = Vector2.One;
+            _backdropVisual.Brush = _hostBackdropBrush;
+            _root.Children.InsertAtBottom(_backdropVisual);
+
+            _tintBrush = _compositor.CreateColorBrush(TintColor(dark));
+            _tintVisual = _compositor.CreateSpriteVisual();
+            _tintVisual.RelativeSizeAdjustment = Vector2.One;
+            _tintVisual.Brush = _tintBrush;
+            _root.Children.InsertAtTop(_tintVisual);
+
+            _lastStage = 6;
             return 1;
         }
         catch (Exception exception)
         {
-            Detach();
+            try
+            {
+                Detach();
+            }
+            catch
+            {
+                // Preserve the original attach failure.
+            }
             return Failure(exception);
         }
     }
@@ -117,13 +237,13 @@ internal static class AcrylicBridge
         try
         {
             _lastError = 0;
-            if (_configuration is null)
+            if (_tintBrush is null)
             {
                 _lastError = unchecked((int)0x8000FFFF); // E_UNEXPECTED
                 return 0;
             }
 
-            _configuration.Theme = dark ? SystemBackdropTheme.Dark : SystemBackdropTheme.Light;
+            _tintBrush.Color = TintColor(dark);
             return 1;
         }
         catch (Exception exception)
@@ -134,43 +254,59 @@ internal static class AcrylicBridge
 
     internal static int SetInputActive(bool active)
     {
-        try
-        {
-            _lastError = 0;
-            if (_configuration is null)
-            {
-                _lastError = unchecked((int)0x8000FFFF); // E_UNEXPECTED
-                return 0;
-            }
-
-            _configuration.IsInputActive = active;
-            return 1;
-        }
-        catch (Exception exception)
-        {
-            return Failure(exception);
-        }
+        // HostBackdropBrush itself does not require an activation state.
+        // Keep the exported contract so the Python layer can use the same API
+        // on Windows 10 and Windows 11.
+        _lastError = 0;
+        return 1;
     }
 
     internal static int Detach()
     {
+        nint hwnd = _attachedHwnd;
         try
         {
             _lastError = 0;
             _attachedHwnd = 0;
-            if (_acrylic is not null)
+            try
             {
-                _acrylic.RemoveAllSystemBackdropTargets();
-                _acrylic.Dispose();
-                _acrylic = null;
+                if (_tintVisual is not null)
+                {
+                    _tintVisual.Brush = null;
+                    _tintVisual = null;
+                }
+                _tintBrush = null;
+
+                if (_backdropVisual is not null)
+                {
+                    _backdropVisual.Brush = null;
+                    _backdropVisual = null;
+                }
+                _hostBackdropBrush = null;
+
+                if (_desktopTarget is not null)
+                {
+                    _desktopTarget.Root = null;
+                    _desktopTarget.Dispose();
+                    _desktopTarget = null;
+                }
+                _root = null;
+            }
+            finally
+            {
+                // Even if a composition object throws while being torn down,
+                // never leave ACCENT_ENABLE_HOSTBACKDROP active on the HWND.
+                if (hwnd != 0 && !SetHostBackdropEnabled(hwnd, false))
+                {
+                    int win32Error = Marshal.GetLastWin32Error();
+                    if (win32Error != 0)
+                    {
+                        _lastError = win32Error;
+                    }
+                }
             }
 
-            _configuration = null;
-            _siteBridge?.Dispose();
-            _siteBridge = null;
-            _island = null;
-            _root = null;
-            return 1;
+            return _lastError == 0 ? 1 : 0;
         }
         catch (Exception exception)
         {

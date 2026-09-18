@@ -1419,7 +1419,7 @@ class BackdropTests(unittest.TestCase):
         )
         user32.UnregisterPowerSettingNotification.assert_called_once_with(77)
 
-    def test_windows_10_uses_windows_app_sdk_acrylic_for_both_themes(self):
+    def test_windows_10_uses_win10_composition_acrylic_for_both_themes(self):
         class AccentPolicy(ctypes.Structure):
             _fields_ = [
                 ("accent_state", ctypes.c_int),
@@ -1461,7 +1461,7 @@ class BackdropTests(unittest.TestCase):
             "clipsave_app.services._windows_backdrop_policy",
             return_value=WindowsBackdropPolicy(False, True),
         ), patch(
-            "clipsave_app.services.attach_windows_app_sdk_acrylic",
+            "clipsave_app.services.attach_windows_composition_acrylic",
             return_value=True,
         ):
             light = apply_windows_backdrop(window, False)
@@ -1469,11 +1469,11 @@ class BackdropTests(unittest.TestCase):
 
         self.assertEqual(
             light,
-            BackdropResult(BackdropBackend.WINDOWS_APP_SDK_ACRYLIC, True),
+            BackdropResult(BackdropBackend.WIN10_COMPOSITION_ACRYLIC, True),
         )
         self.assertEqual(
             dark,
-            BackdropResult(BackdropBackend.WINDOWS_APP_SDK_ACRYLIC, True),
+            BackdropResult(BackdropBackend.WIN10_COMPOSITION_ACRYLIC, True),
         )
 
         self.assertEqual(
@@ -1515,10 +1515,10 @@ class BackdropTests(unittest.TestCase):
             "clipsave_app.services._windows_backdrop_policy",
             return_value=WindowsBackdropPolicy(False, True),
         ), patch(
-            "clipsave_app.services.attach_windows_app_sdk_acrylic",
+            "clipsave_app.services.attach_windows_composition_acrylic",
             return_value=False,
         ), patch(
-            "clipsave_app.services.windows_app_sdk_acrylic_error",
+            "clipsave_app.services.windows_composition_acrylic_error",
             return_value=126,
         ), patch(
             "clipsave_app.services._last_windows_error", return_value=None
@@ -1571,10 +1571,10 @@ class BackdropTests(unittest.TestCase):
             "clipsave_app.services._windows_backdrop_policy",
             return_value=WindowsBackdropPolicy(False, True),
         ), patch(
-            "clipsave_app.services.attach_windows_app_sdk_acrylic",
+            "clipsave_app.services.attach_windows_composition_acrylic",
             return_value=False,
         ), patch(
-            "clipsave_app.services.windows_app_sdk_acrylic_error",
+            "clipsave_app.services.windows_composition_acrylic_error",
             return_value=None,
         ), patch(
             "clipsave_app.services._last_windows_error", return_value=None

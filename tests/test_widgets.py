@@ -165,6 +165,14 @@ class ThumbnailPixmapTests(unittest.TestCase):
             patch("clipsave_app.widgets._cache_decoded_thumbnail", side_effect=tracked_cache),
         ):
             grid.set_items(asset_records(1, kind="image", path=str(path)))
+            # Do not rely on an offscreen paint event to be scheduled within the
+            # short wait window.  The behavior under test is the worker/UI
+            # thread hand-off, so explicitly issue the visible item's thumbnail
+            # request once its layout has been processed.
+            self.app.processEvents()
+            index = grid.model().index(0, 0)
+            self.assertTrue(index.isValid())
+            self.assertIsNone(grid.thumbnail_for_index(index, path))
             self.assertTrue(wait_for(lambda: not thumbnail_pixmap(path).isNull()))
 
         first = thumbnail_pixmap(path)

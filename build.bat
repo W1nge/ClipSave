@@ -123,8 +123,6 @@ copy /y "%~dp0THIRD_PARTY_NOTICES.md" "%releaseDir%\THIRD_PARTY_NOTICES.md" >nul
 if errorlevel 1 goto :failed
 .venv\Scripts\python.exe collect_third_party_licenses.py "%releaseDir%\THIRD_PARTY_LICENSES"
 if errorlevel 1 goto :failed
-copy /y "%backdropBuild%\WindowsAppSDK-LICENSE.txt" "%releaseDir%\THIRD_PARTY_LICENSES\WindowsAppSDK-1.8.260804001-LICENSE.txt" >nul
-if errorlevel 1 goto :failed
 copy /y "%~dp0README_RELEASE.md" "%releaseDir%\README.md" >nul
 if errorlevel 1 goto :failed
 
