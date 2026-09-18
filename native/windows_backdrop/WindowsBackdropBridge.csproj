@@ -15,8 +15,10 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
   <PropertyGroup>
-    <Win2DPackageRoot>$(NuGetPackageRoot)win2d.uwp\1.28.3</Win2DPackageRoot>
-    <VCRTForwardersPackageRoot>$(NuGetPackageRoot)microsoft.vcrtforwarders.140\1.1.0</VCRTForwardersPackageRoot>
+    <BackdropPackageRoot Condition="'$(RestorePackagesPath)' != ''">$(RestorePackagesPath)</BackdropPackageRoot>
+    <BackdropPackageRoot Condition="'$(BackdropPackageRoot)' == ''">$(NuGetPackageRoot)</BackdropPackageRoot>
+    <Win2DPackageRoot>$([System.IO.Path]::Combine('$(BackdropPackageRoot)', 'win2d.uwp', '1.28.3'))</Win2DPackageRoot>
+    <VCRTForwardersPackageRoot>$([System.IO.Path]::Combine('$(BackdropPackageRoot)', 'microsoft.vcrtforwarders.140', '1.1.0'))</VCRTForwardersPackageRoot>
   </PropertyGroup>
   <ItemGroup>
     <PackageDownload Include="Win2D.uwp" Version="[1.28.3]" />

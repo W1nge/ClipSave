@@ -50,7 +50,8 @@ _PYINSTALLER_APPLICATION_SETTINGS = r"""
 """
 
 
-def _run_publish(project: Path) -> None:
+def _run_publish(project: Path, packages_dir: Path) -> None:
+    packages_dir.mkdir(parents=True, exist_ok=True)
     try:
         completed = subprocess.run(
             [
@@ -64,6 +65,7 @@ def _run_publish(project: Path) -> None:
                 "--self-contained",
                 "true",
                 "--nologo",
+                f"-p:RestorePackagesPath={packages_dir}",
             ],
             check=False,
         )
@@ -90,7 +92,8 @@ def build(project_root: Path, output_root: Path) -> None:
         if directory.exists():
             shutil.rmtree(directory)
 
-    _run_publish(project)
+    packages_dir = (output_root / "packages").resolve()
+    _run_publish(project, packages_dir)
 
     publish_dir = (
         native_root

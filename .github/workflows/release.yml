@@ -2,7 +2,6 @@ name: release
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -86,6 +85,12 @@ jobs:
           python-version: "3.13.5"
           cache: pip
 
+      - name: Set up locked .NET SDK
+        if: steps.meta.outputs.should_release == 'true'
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: "8.0.406"
+
       - name: Create official build environment
         if: steps.meta.outputs.should_release == 'true'
         shell: pwsh
@@ -108,6 +113,8 @@ jobs:
       - name: Build official release bundle
         if: steps.meta.outputs.should_release == 'true'
         shell: cmd
+        env:
+          RestoreLockedMode: "true"
         run: set CLIPSAVE_OFFICIAL_BUILD=1&& echo.|build.bat
 
       - name: Run regression suite

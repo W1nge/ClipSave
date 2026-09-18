@@ -174,6 +174,35 @@ class DependencyLockTests(unittest.TestCase):
                 self.assertTrue(path.is_file())
                 self.assertGreater(path.stat().st_size, 100)
 
+    def test_native_backdrop_uses_deterministic_restore_package_root(self):
+        build_script = Path("build_windows_backdrop.py").read_text(encoding="utf-8")
+        project = Path(
+            "native/windows_backdrop/WindowsBackdropBridge.csproj"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'packages_dir = (output_root / "packages").resolve()',
+            build_script,
+        )
+        self.assertIn(
+            'f"-p:RestorePackagesPath={packages_dir}"',
+            build_script,
+        )
+        self.assertIn(
+            '<BackdropPackageRoot Condition="\'$(RestorePackagesPath)\' != \'\'">'
+            "$(RestorePackagesPath)</BackdropPackageRoot>",
+            project,
+        )
+        self.assertIn(
+            '<BackdropPackageRoot Condition="\'$(BackdropPackageRoot)\' == \'\'">'
+            "$(NuGetPackageRoot)</BackdropPackageRoot>",
+            project,
+        )
+        self.assertNotIn(
+            "<Win2DPackageRoot>$(NuGetPackageRoot)",
+            project,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
