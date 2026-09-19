@@ -105,6 +105,23 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertNotIn("*.vbs", script)
         self.assertIn("ClipSave\\ClipSave.exe", release_readme)
 
+    def test_release_notes_do_not_hardcode_a_previous_release_theme(self):
+        workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "focuses on Windows Acrylic quality and interactive window performance",
+            workflow,
+        )
+        self.assertIn("$($match.Groups[1].Value.Trim())", workflow)
+
+    def test_release_checklist_owns_windows_visual_and_interactive_gates(self):
+        checklist = Path("RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
+        self.assertIn("verify_windows_visual_smoke.py", checklist)
+        self.assertIn("verify_windows_interactive_backdrop.py", checklist)
+        self.assertIn("--expected-backend win10_effect_acrylic", checklist)
+        self.assertIn("resting_backend=win10_effect_acrylic", checklist)
+        self.assertIn("geometry_lock: max_delta=0px", checklist)
+        self.assertIn("Do not publish a release", checklist)
+
     def test_ci_pins_runner_and_waits_before_second_instance(self):
         workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
         self.assertNotIn("windows-latest", workflow)

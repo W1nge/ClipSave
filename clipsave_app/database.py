@@ -13,6 +13,7 @@ import stat
 import tempfile
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -50,10 +51,16 @@ class ImportFileResult(Enum):
     LOCALIZED = "localized"
 
     def __bool__(self) -> bool:
-        return False
+        return True
 
-    def __int__(self) -> int:
-        return 0
+
+@dataclass(frozen=True)
+class ImportFileDetails:
+    added: bool
+    localized: bool
+    duplicate: bool
+    item_id: int | None
+    content_hash: str
 
 
 class _SQLiteLeafLock:
@@ -1508,7 +1515,7 @@ class LibraryDatabase:
                 )
 
     @staticmethod
-    def _path_key(path: Path | str) -> str:
+    def path_key(path: Path | str) -> str:
         value = Path(path).expanduser().resolve(strict=False)
         return os.path.normcase(os.path.normpath(str(value)))
 
@@ -1536,7 +1543,7 @@ class LibraryDatabase:
         ).fetchall()
         for row in rows:
             try:
-                resolved_path = self._path_key(row["path"])
+                resolved_path = self.path_key(row["path"])
             except (OSError, RuntimeError, ValueError):
                 continue
             self.connection.execute(
@@ -1662,7 +1669,8 @@ class LibraryDatabase:
                 return added
             scanned += 1
             try:
-                added += int(self.import_file(path, "image"))
+                if self.import_file(path, "image"):
+                    added += 1
             except Exception as exc:
                 failures += 1
                 if len(errors) < 8:
@@ -1673,7 +1681,8 @@ class LibraryDatabase:
                 return added
             scanned += 1
             try:
-                added += int(self.import_file(path, "markdown"))
+                if self.import_file(path, "markdown"):
+                    added += 1
             except Exception as exc:
                 failures += 1
                 if len(errors) < 8:
@@ -1719,7 +1728,7 @@ class LibraryDatabase:
                     return added
                 scanned += 1
                 try:
-                    path_key = self._path_key(path)
+                    path_key = self.path_key(path)
                     if path_key in indexed_paths:
                         continue
                     if self.import_file(path, kind):
@@ -1739,7 +1748,8 @@ class LibraryDatabase:
         copy_to_library: bool = False,
         *,
         strict: bool = False,
-    ) -> bool | ImportFileResult:
+        detailed: bool = False,
+    ) -> bool | ImportFileResult | ImportFileDetails:
         copied_path: Path | None = None
         copied_root: Path | None = None
         copied_hash: str | None = None
@@ -1826,20 +1836,6 @@ class LibraryDatabase:
                             continue
                     target = target_dir / f"{stem} ({index}){suffix}"
                     index += 1
-                if path != target.resolve(strict=False):
-                    try:
-                        with storage.open_managed_binary(target, "rb", managed_root) as copied:
-                            copied_hash = self._stream_hash(copied)
-                    except (OSError, RuntimeError) as exc:
-                        self._remove_failed_copy(copied_path, copied_root, copied_hash, copied_size)
-                        if strict:
-                            raise RuntimeError("Imported copy could not be verified") from exc
-                        return False
-                    if copied_hash != source_hash:
-                        self._remove_failed_copy(copied_path, copied_root, copied_hash, copied_size)
-                        if strict:
-                            raise RuntimeError("Imported copy hash did not match the source")
-                        return False
                 path = storage.normalized_absolute_path(target)
 
             identity_root = (
@@ -1857,24 +1853,20 @@ class LibraryDatabase:
             content = ""
             if kind == "image":
                 try:
-                    with storage.open_managed_binary(
-                        path, "rb", identity_root, identity_locked=True
-                    ) as image_source:
-                        with Image.open(image_source) as image:
-                            width, height = image.size
-                            if width * height > MAX_IMAGE_PIXELS:
-                                raise ValueError("Image file exceeds the configured pixel limit")
-                            image.load()
+                    identity_handle.seek(0)
+                    with Image.open(identity_handle) as image:
+                        width, height = image.size
+                        if width * height > MAX_IMAGE_PIXELS:
+                            raise ValueError("Image file exceeds the configured pixel limit")
+                        image.load()
                 except (OSError, ValueError):
-                    if strict:
-                        raise ValueError(f"Image file is invalid or unreadable: {path}")
                     raise ValueError(f"Image file is invalid or unreadable: {path}")
             else:
                 identity_handle.seek(0)
                 content = identity_handle.read().decode("utf-8", errors="replace")
             managed_local = is_under_local_store(path)
             created = self._utc_timestamp(dt.datetime.fromtimestamp(stat.st_mtime))
-            resolved_path = self._path_key(path)
+            resolved_path = self.path_key(path)
             mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
             source = "导入文件" if copy_to_library else "现有文件"
             external = int(not managed_local)
@@ -1898,6 +1890,7 @@ class LibraryDatabase:
             added = False
             localized = False
             duplicate_copy = False
+            result_item_id: int | None = None
             with self._transaction():
                 existing_path = self.connection.execute(
                     """
@@ -1931,9 +1924,11 @@ class LibraryDatabase:
                         if copy_to_library and existing_hash["external"] and managed_local:
                             self._update_file_record_locked(int(existing_hash["id"]), values)
                             localized = True
+                            result_item_id = int(existing_hash["id"])
                         else:
                             duplicate_copy = copied_path is not None
                     else:
+                        result_item_id = int(existing_path["id"])
                         self._update_file_record_locked(
                             int(existing_path["id"]),
                             values,
@@ -1945,6 +1940,7 @@ class LibraryDatabase:
                         if copy_to_library and existing_hash["external"] and managed_local:
                             self._update_file_record_locked(int(existing_hash["id"]), values)
                             localized = True
+                            result_item_id = int(existing_hash["id"])
                         else:
                             duplicate_copy = copied_path is not None
                     else:
@@ -1958,13 +1954,23 @@ class LibraryDatabase:
                             values,
                         )
                         added = cursor.rowcount == 1
+                        if added:
+                            result_item_id = int(cursor.lastrowid)
                         duplicate_copy = not added and copied_path is not None
             if duplicate_copy:
                 identity_handle.close()
                 identity_handle = None
                 self._remove_failed_copy(copied_path, copied_root, copied_hash, copied_size)
+            if detailed:
+                return ImportFileDetails(
+                    added=added,
+                    localized=localized,
+                    duplicate=not added and not localized,
+                    item_id=result_item_id if added or localized else None,
+                    content_hash=source_hash,
+                )
             return ImportFileResult.LOCALIZED if localized else added
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError):
             if identity_handle is not None:
                 identity_handle.close()
                 identity_handle = None
@@ -2025,8 +2031,37 @@ class LibraryDatabase:
                     return None
         except (OSError, ValueError):
             return None
+        return self.add_verified_image(
+            path,
+            content_hash=digest,
+            file_size=final_stat.st_size,
+            width=width,
+            height=height,
+            created_at=created_at,
+        )
+
+    def add_verified_image(
+        self,
+        path: Path,
+        *,
+        content_hash: str,
+        file_size: int,
+        width: int,
+        height: int,
+        created_at: dt.datetime | None = None,
+    ) -> int | None:
+        if (
+            len(content_hash) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in content_hash)
+            or file_size < 0
+            or width <= 0
+            or height <= 0
+            or width * height > MAX_IMAGE_PIXELS
+        ):
+            raise ValueError("Invalid verified image metadata")
+        created_at = created_at or dt.datetime.now(dt.timezone.utc)
         timestamp = self._utc_timestamp(created_at)
-        resolved_path = self._path_key(path)
+        resolved_path = self.path_key(path)
         with self._transaction():
             cursor = self.connection.execute(
                 """
@@ -2040,10 +2075,10 @@ class LibraryDatabase:
                     str(path.resolve()),
                     resolved_path,
                     mimetypes.guess_type(path.name)[0] or "image/png",
-                    digest,
+                    content_hash.lower(),
                     timestamp,
                     timestamp,
-                    final_stat.st_size,
+                    file_size,
                     width,
                     height,
                 ),
@@ -2135,13 +2170,6 @@ class LibraryDatabase:
             joins += " JOIN item_tags filter_tags ON filter_tags.item_id = i.id "
             clauses.append("filter_tags.tag_id = ?")
             parameters.append(tag_id)
-        orders = {
-            "newest": "i.created_at DESC, i.id DESC",
-            "oldest": "i.created_at ASC, i.id ASC",
-            "name": "i.title COLLATE NOCASE ASC, i.id ASC",
-            "size": "i.file_size DESC, i.id DESC",
-            "type": "i.kind ASC, i.created_at DESC, i.id DESC",
-        }
         projection = "i.*"
         if summary_only:
             projection = f"""
@@ -2176,11 +2204,56 @@ class LibraryDatabase:
             LEFT JOIN collections c ON c.id = i.collection_id
             {joins}
             WHERE {' AND '.join(clauses)}
-            ORDER BY {orders.get(sort, orders['newest'])}
+            ORDER BY {self._item_order(sort)}
             {pagination}
         """
         with self._lock:
             return list(self.connection.execute(sql, parameters).fetchall())
+
+    @staticmethod
+    def _item_order(sort: str) -> str:
+        orders = {
+            "newest": "i.created_at DESC, i.id DESC",
+            "oldest": "i.created_at ASC, i.id ASC",
+            "name": "i.title COLLATE NOCASE ASC, i.id ASC",
+            "size": "i.file_size DESC, i.id DESC",
+            "type": "i.kind ASC, i.created_at DESC, i.id DESC",
+        }
+        return orders.get(sort, orders["newest"])
+
+    def count_items(self, *, kind: str | None = None) -> int:
+        clauses = ["missing = 0"]
+        parameters: list[object] = []
+        if kind is not None:
+            clauses.append("kind = ?")
+            parameters.append(kind)
+        with self._lock:
+            return int(
+                self.connection.execute(
+                    f"SELECT COUNT(*) FROM items WHERE {' AND '.join(clauses)}",
+                    parameters,
+                ).fetchone()[0]
+            )
+
+    def item_ids(self, *, kind: str | None = None, sort: str = "newest") -> list[int]:
+        clauses = ["i.missing = 0"]
+        parameters: list[object] = []
+        if kind is not None:
+            clauses.append("i.kind = ?")
+            parameters.append(kind)
+        with self._lock:
+            return [
+                int(row[0])
+                for row in self.connection.execute(
+                    f"""
+                    SELECT i.id
+                    FROM items i
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY {self._item_order(sort)}
+                    """,
+                    parameters,
+                ).fetchall()
+            ]
 
     def get_item(self, item_id: int) -> sqlite3.Row | None:
         with self._lock:
@@ -2199,10 +2272,7 @@ class LibraryDatabase:
                        )) AS tag_colors
                 FROM items i
                 LEFT JOIN collections c ON c.id = i.collection_id
-                LEFT JOIN item_tags it ON it.item_id = i.id
-                LEFT JOIN tags t ON t.id = it.tag_id
                 WHERE i.id = ? AND i.missing = 0
-                GROUP BY i.id
                 """,
                 (item_id,),
             ).fetchone()
@@ -2514,38 +2584,14 @@ class LibraryDatabase:
                 FROM items WHERE path IS NOT NULL
                 """
             ).fetchall()
-        missing_candidates: list[tuple[int, Path, str, str]] = []
-        present_candidates: list[tuple[int, Path, str, str]] = []
         replacements: list[tuple[int, Path, str]] = []
         for row in rows:
             if cancel_event is not None and cancel_event.is_set():
                 return
             path = Path(row["path"])
-            try:
-                stat = path.stat()
-                if not path.is_file() or stat.st_size > MAX_IMPORT_BYTES:
-                    missing_candidates.append(
-                        (row["id"], path, row["kind"], row["content_hash"])
-                    )
-                    continue
-                digest = self.file_hash(path)
-            except (OSError, RuntimeError):
-                missing_candidates.append(
-                    (row["id"], path, row["kind"], row["content_hash"])
-                )
-                continue
-            if digest == row["content_hash"]:
-                present_candidates.append(
-                    (row["id"], path, row["kind"], row["content_hash"])
-                )
-            else:
-                replacements.append((row["id"], path, row["kind"]))
-        for item_id, path, kind, expected_hash in [
-            *missing_candidates,
-            *present_candidates,
-        ]:
-            if cancel_event is not None and cancel_event.is_set():
-                return
+            item_id = int(row["id"])
+            kind = str(row["kind"])
+            expected_hash = row["content_hash"]
             root = (
                 MARKDOWN_DIR if kind == "markdown" else PICTURE_DIR
             ) if is_under_local_store(path) else path.parent
@@ -2556,19 +2602,19 @@ class LibraryDatabase:
                     stat = os.fstat(current_file.fileno())
                     if stat.st_size > MAX_IMPORT_BYTES:
                         raise OSError("file is no longer importable")
-                    if self._stream_hash(current_file) != expected_hash:
-                        replacements.append((item_id, path, kind))
-                        continue
-                    with self._transaction():
-                        owner = self._live_hash_owner_locked(
-                            expected_hash, kind, item_id
-                        )
-                        self.connection.execute(
-                            "UPDATE items SET missing=? WHERE id=?",
-                            (1 if owner is not None else 0, item_id),
-                        )
+                    current_hash = self._stream_hash(current_file)
             except (OSError, RuntimeError):
                 self.mark_item_missing(item_id)
+                continue
+            if current_hash != expected_hash:
+                replacements.append((item_id, path, kind))
+                continue
+            with self._transaction():
+                owner = self._live_hash_owner_locked(expected_hash, kind, item_id)
+                self.connection.execute(
+                    "UPDATE items SET missing=? WHERE id=?",
+                    (1 if owner is not None else 0, item_id),
+                )
         for item_id, path, kind in replacements:
             if cancel_event is not None and cancel_event.is_set():
                 return

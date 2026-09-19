@@ -39,8 +39,8 @@ from .bulk_checkpoint import (
     new_checkpoint,
     save_checkpoint,
 )
-from .constants import APP_NAME, LIBRARY_DIR, MAX_IMPORT_BYTES, MAX_MARKDOWN_BYTES
-from .database import ImportFileResult, LibraryDatabase
+from .constants import APP_NAME, LIBRARY_DIR
+from .database import ImportFileDetails, LibraryDatabase
 from .services import (
     AIService,
     BackdropResult,
@@ -186,6 +186,9 @@ class MainWindow(QMainWindow):
         self._ocr_requests: dict[int, tuple[object, AsyncSignals]] = {}
         self._automatic_ai_items: set[int] = set()
         self._automatic_ocr_items: set[int] = set()
+        self._library_refresh_request: tuple[object, AsyncSignals] | None = None
+        self._item_search_request: tuple[object, AsyncSignals] | None = None
+        self._item_page_request: tuple[object, AsyncSignals] | None = None
         self._expanded_search_request: tuple[object, AsyncSignals] | None = None
         self._expanded_search_query = ""
         self._expanded_search_terms: tuple[str, ...] = ()
@@ -316,7 +319,7 @@ class MainWindow(QMainWindow):
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(220)
-        self.search_timer.timeout.connect(self.refresh_items)
+        self.search_timer.timeout.connect(self._refresh_search_items_async)
         root = QWidget()
         root.setObjectName("AppRoot")
         self.setCentralWidget(root)
@@ -1074,9 +1077,17 @@ class MainWindow(QMainWindow):
         self._refresh_navigation_metadata()
         self.refresh_items()
 
+    def _apply_navigation_metadata(self, counts, collections, tags) -> None:
+        self.sidebar.set_primary(counts)
+        self.sidebar.set_collections(collections)
+        self.sidebar.set_tags(tags)
+        self.detail.set_collections(collections)
+
     def _search_text_changed(self, _text: str) -> None:
         self._expanded_search_query = ""
         self._expanded_search_terms = ()
+        self._cancel_item_search_request()
+        self._cancel_item_page_request()
         self._cancel_expanded_search_request()
         self.search_timer.start()
 
@@ -1088,15 +1099,114 @@ class MainWindow(QMainWindow):
 
     def _refresh_navigation_metadata(self) -> None:
         counts = self.database.counts()
-        self.sidebar.set_primary(counts)
-        self.sidebar.set_collections(self.database.collections())
-        self.sidebar.set_tags(self.database.tags())
-        self.detail.set_collections(self.database.collections())
+        collections = self.database.collections()
+        self._apply_navigation_metadata(counts, collections, self.database.tags())
+
+    def _refresh_library_async(self) -> None:
+        if self._closing or self._quit_in_progress:
+            return
+        self._cancel_library_refresh_request()
+        self._cancel_item_search_request()
+        self._cancel_item_page_request()
+        spec = self._current_item_query_spec()
+        token = object()
+        signals = AsyncSignals()
+        self._async_signals.add(signals)
+        self._library_refresh_request = (token, signals)
+        signals.succeeded.connect(
+            lambda _item_id, _text, payload, request_token=token, request_signals=signals, request_spec=spec: self._library_refresh_succeeded(
+                request_token,
+                request_signals,
+                request_spec,
+                payload,
+            )
+        )
+        signals.failed.connect(
+            lambda message, request_token=token, request_signals=signals: self._library_refresh_failed(
+                request_token,
+                request_signals,
+                message,
+            )
+        )
+
+        def work(cancel_event: threading.Event) -> None:
+            try:
+                payload = {
+                    "counts": self.database.counts(),
+                    "collections": self.database.collections(),
+                    "tags": self.database.tags(),
+                    "items": self._query_items_for_spec(
+                        spec,
+                        self.ITEM_PAGE_SIZE,
+                        0,
+                    ),
+                }
+                if not cancel_event.is_set():
+                    signals.succeeded.emit(-1, "", payload)
+            except Exception as exc:
+                if not cancel_event.is_set():
+                    signals.failed.emit(str(exc))
+
+        self._start_async_task(token, work)
+
+    def _library_refresh_succeeded(
+        self,
+        token: object,
+        signals: AsyncSignals,
+        spec: dict[str, object],
+        payload: object,
+    ) -> None:
+        self._async_signals.discard(signals)
+        if self._library_refresh_request != (token, signals):
+            return
+        self._library_refresh_request = None
+        if self._closing or self._quit_in_progress or not isinstance(payload, dict):
+            return
+        self._apply_navigation_metadata(
+            payload.get("counts", {}),
+            payload.get("collections", []),
+            payload.get("tags", []),
+        )
+        if spec != self._current_item_query_spec():
+            return
+        items = payload.get("items")
+        if not isinstance(items, list):
+            self.show_error_status("资料库刷新失败：返回结果无效")
+            return
+        self._items_offset = 0
+        self._items_loading = False
+        self._apply_first_page(items)
+
+    def _library_refresh_failed(
+        self,
+        token: object,
+        signals: AsyncSignals,
+        message: str,
+    ) -> None:
+        self._async_signals.discard(signals)
+        if self._library_refresh_request != (token, signals):
+            return
+        self._library_refresh_request = None
+        if not self._closing and not self._quit_in_progress:
+            self.show_error_status(f"资料库刷新失败：{message}")
+
+    def _cancel_library_refresh_request(self) -> None:
+        request = self._library_refresh_request
+        if request is None:
+            return
+        self._library_refresh_request = None
+        self._cancel_request(request)
+
 
     def refresh_items(self) -> None:
+        self._cancel_item_search_request()
+        self._cancel_item_page_request()
         self._items_offset = 0
         self._items_loading = False
         items = self._query_current_items(self.ITEM_PAGE_SIZE, 0)
+        self._apply_first_page(items)
+
+    def _apply_first_page(self, items) -> None:
         self._items_offset = len(items)
         self._items_has_more = len(items) == self.ITEM_PAGE_SIZE
         self._apply_items(items)
@@ -1114,22 +1224,128 @@ class MainWindow(QMainWindow):
             filters.append(label)
         self.filter_hint.setText("  ·  ".join(filters))
 
-    def _query_current_items(self, limit: int, offset: int):
-        expanded_terms = self._expanded_search_terms if self._expanded_search_active() else None
+    def _current_item_query_spec(self) -> dict[str, object]:
+        expanded_terms = (
+            self._expanded_search_terms if self._expanded_search_active() else None
+        )
+        return {
+            "query": self.search.text().strip(),
+            "query_terms": expanded_terms,
+            "kind": self.current_kind,
+            "favorite": self.current_favorite,
+            "day": self.current_day,
+            "recent_days": 7 if self.current_recent else None,
+            "collection_id": self.current_collection,
+            "tag_id": self.current_tag,
+            "sort": self.current_sort,
+        }
+
+    def _query_items_for_spec(
+        self,
+        spec: dict[str, object],
+        limit: int,
+        offset: int,
+    ):
         return self.database.query_items(
-            query=self.search.text().strip(),
-            query_terms=expanded_terms,
-            kind=self.current_kind,
-            favorite=self.current_favorite,
-            day=self.current_day,
-            recent_days=7 if self.current_recent else None,
-            collection_id=self.current_collection,
-            tag_id=self.current_tag,
-            sort=self.current_sort,
+            **spec,
             summary_only=True,
             limit=limit,
             offset=offset,
         )
+
+    def _query_current_items(self, limit: int, offset: int):
+        return self._query_items_for_spec(
+            self._current_item_query_spec(),
+            limit,
+            offset,
+        )
+
+    def _refresh_search_items_async(self) -> None:
+        if self._closing or self._quit_in_progress:
+            return
+        self._cancel_item_search_request()
+        self._cancel_item_page_request()
+        spec = self._current_item_query_spec()
+        token = object()
+        signals = AsyncSignals()
+        self._async_signals.add(signals)
+        self._item_search_request = (token, signals)
+        signals.succeeded.connect(
+            lambda _item_id, _text, items, request_token=token, request_signals=signals, request_spec=spec: self._item_search_succeeded(
+                request_token,
+                request_signals,
+                request_spec,
+                items,
+            )
+        )
+        signals.failed.connect(
+            lambda message, request_token=token, request_signals=signals: self._item_search_failed(
+                request_token,
+                request_signals,
+                message,
+            )
+        )
+
+        def work(cancel_event: threading.Event) -> None:
+            try:
+                items = self._query_items_for_spec(spec, self.ITEM_PAGE_SIZE, 0)
+                if not cancel_event.is_set():
+                    signals.succeeded.emit(-1, "", items)
+            except Exception as exc:
+                if not cancel_event.is_set():
+                    signals.failed.emit(str(exc))
+
+        self._start_async_task(token, work)
+
+    def _item_search_succeeded(
+        self,
+        token: object,
+        signals: AsyncSignals,
+        spec: dict[str, object],
+        items: object,
+    ) -> None:
+        self._async_signals.discard(signals)
+        if self._item_search_request != (token, signals):
+            return
+        self._item_search_request = None
+        if self._closing or self._quit_in_progress:
+            return
+        if spec != self._current_item_query_spec():
+            return
+        if not isinstance(items, list):
+            self.show_error_status("搜索失败：返回结果无效")
+            return
+        self._items_offset = 0
+        self._items_loading = False
+        self._apply_first_page(items)
+
+    def _item_search_failed(
+        self,
+        token: object,
+        signals: AsyncSignals,
+        message: str,
+    ) -> None:
+        self._async_signals.discard(signals)
+        if self._item_search_request != (token, signals):
+            return
+        self._item_search_request = None
+        if not self._closing and not self._quit_in_progress:
+            self.show_error_status(f"搜索失败：{message}")
+
+    def _cancel_item_search_request(self) -> None:
+        request = self._item_search_request
+        if request is None:
+            return
+        self._item_search_request = None
+        self._cancel_request(request)
+
+    def _cancel_item_page_request(self) -> None:
+        request = self._item_page_request
+        if request is None:
+            return
+        self._item_page_request = None
+        self._items_loading = False
+        self._cancel_request(request)
 
     def _load_more_items_if_needed(self, view, value: int) -> None:
         if value < view.verticalScrollBar().maximum() - 120:
@@ -1139,27 +1355,99 @@ class MainWindow(QMainWindow):
     def load_more_items(self) -> None:
         if (
             self._items_loading
+            or self._item_search_request is not None
+            or self._item_page_request is not None
             or not self._items_has_more
             or self._closing
             or self._quit_in_progress
         ):
             return
         self._items_loading = True
-        try:
-            items = self._query_current_items(self.ITEM_PAGE_SIZE, self._items_offset)
-            self._items_offset += len(items)
-            self._items_has_more = len(items) == self.ITEM_PAGE_SIZE
-            if not items:
-                return
+        spec = self._current_item_query_spec()
+        offset = self._items_offset
+        token = object()
+        signals = AsyncSignals()
+        self._async_signals.add(signals)
+        self._item_page_request = (token, signals)
+        signals.succeeded.connect(
+            lambda _item_id, _text, items, request_token=token, request_signals=signals, request_spec=spec, request_offset=offset: self._item_page_succeeded(
+                request_token,
+                request_signals,
+                request_spec,
+                request_offset,
+                items,
+            )
+        )
+        signals.failed.connect(
+            lambda message, request_token=token, request_signals=signals: self._item_page_failed(
+                request_token,
+                request_signals,
+                message,
+            )
+        )
+
+        def work(cancel_event: threading.Event) -> None:
+            try:
+                items = self._query_items_for_spec(
+                    spec,
+                    self.ITEM_PAGE_SIZE,
+                    offset,
+                )
+                if not cancel_event.is_set():
+                    signals.succeeded.emit(-1, "", items)
+            except Exception as exc:
+                if not cancel_event.is_set():
+                    signals.failed.emit(str(exc))
+
+        self._start_async_task(token, work)
+
+    def _item_page_succeeded(
+        self,
+        token: object,
+        signals: AsyncSignals,
+        spec: dict[str, object],
+        offset: int,
+        items: object,
+    ) -> None:
+        self._async_signals.discard(signals)
+        if self._item_page_request != (token, signals):
+            return
+        self._item_page_request = None
+        self._items_loading = False
+        if self._closing or self._quit_in_progress:
+            return
+        if (
+            spec != self._current_item_query_spec()
+            or offset != self._items_offset
+            or not isinstance(items, list)
+        ):
+            return
+        self._items_offset += len(items)
+        self._items_has_more = len(items) == self.ITEM_PAGE_SIZE
+        if items:
             existing_ids = {item["id"] for item in self.current_items}
             self._apply_items(
-                self.current_items + [item for item in items if item["id"] not in existing_ids]
+                self.current_items
+                + [item for item in items if item["id"] not in existing_ids]
             )
-            expanded_suffix = " · 已扩大搜索" if self._expanded_search_active() else ""
-            self.result_count.setText(
-                f"{len(self.current_items):,}{'+' if self._items_has_more else ''} 项{expanded_suffix}"
-            )
-        finally:
+        expanded_suffix = " · 已扩大搜索" if self._expanded_search_active() else ""
+        self.result_count.setText(
+            f"{len(self.current_items):,}{'+' if self._items_has_more else ''} 项{expanded_suffix}"
+        )
+
+    def _item_page_failed(
+        self,
+        token: object,
+        signals: AsyncSignals,
+        message: str,
+    ) -> None:
+        self._async_signals.discard(signals)
+        if self._item_page_request != (token, signals):
+            return
+        self._item_page_request = None
+        self._items_loading = False
+        if not self._closing and not self._quit_in_progress:
+            self.show_error_status(f"加载更多失败：{message}")
             self._items_loading = False
 
     def _apply_items(self, items) -> None:
@@ -1218,7 +1506,7 @@ class MainWindow(QMainWindow):
         self.page_title.setText(titles.get(key, "全部内容"))
         active_key = f"{key}:{value}" if key in ("collection", "tag") else key
         self.sidebar.set_active(active_key)
-        self.refresh_items()
+        self._refresh_search_items_async()
 
     def open_day(self, day: str) -> None:
         self.current_kind = None
@@ -1229,7 +1517,7 @@ class MainWindow(QMainWindow):
         self.current_recent = False
         self.page_title.setText(f"{day} 的内容")
         self.sidebar.set_active("date")
-        self.refresh_items()
+        self._refresh_search_items_async()
 
     def select_item(self, item_id: int) -> None:
         if item_id not in {item["id"] for item in self.current_items}:
@@ -1498,7 +1786,7 @@ class MainWindow(QMainWindow):
         self.current_sort = key
         self._save_setting("sort", key)
         self.sort_button.setText(SORT_BUTTON_LABELS.get(key, label) + "  ▾")
-        self.refresh_items()
+        self._refresh_search_items_async()
 
     def toggle_monitor(self) -> None:
         previous = self.clipboard_service.timer.isActive()
@@ -1603,7 +1891,7 @@ class MainWindow(QMainWindow):
         if self._closing or self._quit_in_progress:
             return
         self.show_status("已保存一条新的剪贴板内容")
-        self.refresh_library()
+        self._refresh_library_async()
         self._schedule_auto_image_tasks(_item_id)
 
     def activate_item(self, item_id: int) -> None:
@@ -1854,7 +2142,9 @@ class MainWindow(QMainWindow):
             self._delete_failed(token, signals, item_id, str(exc))
 
     def _restore_delete_view(self, item_id: int, was_selected: bool, detail_was_visible: bool) -> None:
-        self._refresh_after_mutation()
+        # Failure/cancellation recovery is rare and must restore selection against
+        # the refreshed model before select_item() runs.
+        self.refresh_library()
         if not was_selected or self.current_item_id is not None:
             return
         if self.database.get_item(item_id) is None:
@@ -2053,7 +2343,7 @@ class MainWindow(QMainWindow):
         self.show_status("集合已更新")
 
     def _refresh_after_mutation(self) -> None:
-        self.refresh_library()
+        self._refresh_library_async()
 
     def _run_database_action(self, action, title: str, status: str) -> bool:
         try:
@@ -2101,32 +2391,26 @@ class MainWindow(QMainWindow):
                     break
                 try:
                     candidate = Path(filename)
-                    source_hash = None
-                    if candidate.suffix.lower() == ".md":
-                        if candidate.stat().st_size > MAX_MARKDOWN_BYTES:
-                            raise ValueError("Markdown 文件过大，已拒绝导入。")
-                        candidate.read_text(encoding="utf-8", errors="replace")
-                    else:
-                        preflight_image_file(candidate, max_file_bytes=MAX_IMPORT_BYTES)
-                        source_hash = LibraryDatabase.file_hash(candidate)
                     import_result = self.database.import_file(
-                        candidate, copy_to_library=True, strict=True
+                        candidate,
+                        copy_to_library=True,
+                        strict=True,
+                        detailed=True,
                     )
-                    if import_result is ImportFileResult.LOCALIZED:
+                    if not isinstance(import_result, ImportFileDetails):
+                        raise RuntimeError("导入未返回详细结果")
+                    if import_result.localized:
                         localized += 1
-                    elif import_result:
-                        added += int(import_result)
+                    elif import_result.added:
+                        added += 1
                     else:
                         duplicates += 1
-                    # ImportFileResult.LOCALIZED deliberately evaluates false, but it is
-                    # still a newly materialized library image that may need AI processing.
-                    if source_hash and (
-                        import_result is True
-                        or import_result is ImportFileResult.LOCALIZED
+                    if (
+                        candidate.suffix.lower() != ".md"
+                        and import_result.item_id is not None
+                        and (import_result.added or import_result.localized)
                     ):
-                        indexed = self.database.indexed_file_for_hash(source_hash)
-                        if indexed is not None:
-                            image_ids.append(int(indexed["id"]))
+                        image_ids.append(import_result.item_id)
                 except Exception as exc:
                     failed.append((Path(filename).name, str(exc)))
                 finally:
@@ -2153,7 +2437,7 @@ class MainWindow(QMainWindow):
         if self._closing or self._quit_in_progress or self._import_request != (token, signals):
             return
         self._import_request = None
-        self.refresh_library()
+        self._refresh_library_async()
         for item_id in result.get("image_ids", ()):
             self._schedule_auto_image_tasks(int(item_id))
         failed = result["failed"]
@@ -2303,7 +2587,7 @@ class MainWindow(QMainWindow):
         image_count = (
             checkpoint.total
             if checkpoint is not None
-            else len(self.database.query_items(kind="image", summary_only=True))
+            else self.database.count_items(kind="image")
         )
         if not image_count:
             QMessageBox.information(dialog, "没有图片", "本地资料库中没有可处理的图片。")
@@ -2358,14 +2642,7 @@ class MainWindow(QMainWindow):
                 return
             checkpoint = None
         if checkpoint is None:
-            image_ids = [
-                int(row["id"])
-                for row in self.database.query_items(
-                    kind="image",
-                    sort="oldest",
-                    summary_only=True,
-                )
-            ]
+            image_ids = self.database.item_ids(kind="image", sort="oldest")
             if not image_ids:
                 QMessageBox.information(self, "没有图片", "本地资料库中没有可处理的图片。")
                 return
@@ -2584,7 +2861,7 @@ class MainWindow(QMainWindow):
             )
         if self._closing or self._quit_in_progress:
             return
-        self.refresh_library()
+        self._refresh_library_async()
         if error:
             QMessageBox.warning(
                 self,
@@ -2779,7 +3056,7 @@ class MainWindow(QMainWindow):
             return
         self._startup_scan_request = None
         self.startup_scan_error = None
-        self.refresh_library()
+        self._refresh_library_async()
         if imported:
             self.show_status(f"已导入 {imported} 个现有文件")
         report = getattr(self.database, "last_scan_report", {})
@@ -2899,6 +3176,40 @@ class MainWindow(QMainWindow):
         self._cancel_request(self._ai_requests.pop(item_id, None))
         self._cancel_request(self._ocr_requests.pop(item_id, None))
 
+    def _cancel_background_requests(self) -> set[object]:
+        self._cancel_library_refresh_request()
+        self._cancel_item_search_request()
+        self._cancel_item_page_request()
+        cancelled_tokens: set[object] = set()
+        expanded_search_request = self._expanded_search_request
+        self._cancel_request(expanded_search_request)
+        if expanded_search_request is not None:
+            cancelled_tokens.add(expanded_search_request[0])
+        for request in list(self._ai_requests.values()):
+            self._cancel_request(request)
+            cancelled_tokens.add(request[0])
+        for request in list(self._ocr_requests.values()):
+            self._cancel_request(request)
+            cancelled_tokens.add(request[0])
+        if self._copy_request is not None:
+            self._cancel_async_token(self._copy_request[0])
+            self._async_signals.discard(self._copy_request[1])
+            cancelled_tokens.add(self._copy_request[0])
+        for token, _signals, _was_selected, _detail_was_visible in self._delete_requests.values():
+            self._cancel_async_token(token)
+            cancelled_tokens.add(token)
+        return cancelled_tokens
+
+    def _clear_background_request_state(self) -> None:
+        self._expanded_search_request = None
+        self.expanded_search_button.setEnabled(True)
+        self.expanded_search_button.setText("扩大搜索")
+        self._ai_requests.clear()
+        self._ocr_requests.clear()
+        self._copy_request = None
+        self._delete_requests.clear()
+        self._pending_delete_item_ids.clear()
+
     def _cancel_and_wait_request(
         self,
         request: tuple[object, AsyncSignals] | None,
@@ -2968,89 +3279,39 @@ class MainWindow(QMainWindow):
         return regular_done and (bounded_done or not require_bounded)
 
     def generate_ai_description(self, item_id: int, *, automatic: bool = False) -> bool:
-        item = self.database.get_item(item_id)
-        if not item or item["kind"] != "image" or not item["path"]:
-            if not automatic:
-                QMessageBox.information(self, "AI 描述", "当前只支持为图片生成 AI 描述。")
-            return False
-        service = self._ai_service()
-        if not service.configured:
-            if automatic:
-                return False
-            QMessageBox.information(self, "AI 服务未配置", "请先在设置中填写 OpenAI-compatible 服务地址和视觉模型；需要鉴权的服务还应填写 API Key。")
-            self.open_settings()
-            return False
-        expected_content_hash = item["content_hash"]
-        if not expected_content_hash:
-            if not automatic:
-                QMessageBox.warning(self, "AI 描述失败", "图片索引缺少内容校验值，请重新导入后再试。")
-            return False
-        if item_id in self._ai_requests:
-            if automatic:
-                return False
-            self._automatic_ai_items.discard(item_id)
-            self._cancel_request(self._ai_requests.pop(item_id, None))
-        if self.current_item_id == item_id:
-            self.detail.ai_button.setEnabled(False)
-            self.detail.ai_button.setText("生成中…")
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        self._ai_requests[item_id] = (token, signals)
-        if automatic:
-            self._automatic_ai_items.add(item_id)
-        signals.succeeded.connect(
-            lambda result_item_id, description, _unused, request_token=token, request_signals=signals, request_hash=expected_content_hash: self._ai_succeeded(
-                request_token,
-                request_signals,
-                result_item_id,
-                description,
-                request_hash,
-            )
-        )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals, request_item_id=item_id: self._ai_failed(
-                request_token, request_signals, request_item_id, message
-            )
-        )
-
-        def work(cancel_event: threading.Event) -> None:
-            try:
-                image_snapshot = preflight_image_file(Path(item["path"]))
-                description = service.describe_image(
-                    image_snapshot,
-                    cancel_event,
-                    expected_sha256=expected_content_hash,
-                )
-                image_snapshot.require_current()
-                if not cancel_event.is_set():
-                    signals.succeeded.emit(item_id, description, None)
-            except OperationCancelled:
-                return
-            except Exception as exc:
-                if not cancel_event.is_set():
-                    signals.failed.emit(str(exc))
-
-        try:
-            self._start_bounded_task(token, work, estimated_bytes=self._image_task_estimate(item))
-        except (TaskCapacityExceeded, RuntimeError) as exc:
-            self._ai_requests.pop(item_id, None)
-            self._automatic_ai_items.discard(item_id)
-            self._async_signals.discard(signals)
-            if self.current_item_id == item_id:
-                self.detail.set_ai_busy(False, failed=True)
-            if automatic:
-                self.show_error_status(f"自动生成描述暂时无法启动：{exc}")
-            else:
-                QMessageBox.warning(self, "AI 任务繁忙", str(exc))
-            return False
-        return True
+        return self._start_image_ai_operation(item_id, automatic, operation="ai")
 
     def generate_ocr(self, item_id: int, *, automatic: bool = False) -> bool:
+        return self._start_image_ai_operation(item_id, automatic, operation="ocr")
+
+    def _start_image_ai_operation(
+        self,
+        item_id: int,
+        automatic: bool,
+        *,
+        operation: str,
+    ) -> bool:
+        is_ai = operation == "ai"
+        requests = self._ai_requests if is_ai else self._ocr_requests
+        automatic_items = self._automatic_ai_items if is_ai else self._automatic_ocr_items
+        result_handler = self._ai_succeeded if is_ai else self._ocr_succeeded
+        failure_handler = self._ai_failed if is_ai else self._ocr_failed
+        invalid_title = "AI 描述" if is_ai else "OCR"
+        invalid_message = (
+            "当前只支持为图片生成 AI 描述。"
+            if is_ai
+            else "当前只支持识别图片中的文字。"
+        )
+        missing_hash_title = "AI 描述失败" if is_ai else "OCR 识别失败"
+        capacity_title = "AI 任务繁忙" if is_ai else "OCR 任务繁忙"
+        automatic_capacity_prefix = (
+            "自动生成描述暂时无法启动" if is_ai else "自动 OCR 暂时无法启动"
+        )
+
         item = self.database.get_item(item_id)
         if not item or item["kind"] != "image" or not item["path"]:
             if not automatic:
-                QMessageBox.information(self, "OCR", "当前只支持识别图片中的文字。")
+                QMessageBox.information(self, invalid_title, invalid_message)
             return False
         service = self._ai_service()
         if not service.configured:
@@ -3058,36 +3319,52 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self,
                     "AI 服务未配置",
-                    "云端 OCR 需要先在设置中填写 OpenAI-compatible 服务地址和视觉模型；需要鉴权的服务还应填写 API Key。",
+                    (
+                        "请先在设置中填写 OpenAI-compatible 服务地址和视觉模型；"
+                        "需要鉴权的服务还应填写 API Key。"
+                        if is_ai
+                        else "云端 OCR 需要先在设置中填写 OpenAI-compatible 服务地址和视觉模型；"
+                        "需要鉴权的服务还应填写 API Key。"
+                    ),
                 )
                 self.open_settings()
             return False
         expected_content_hash = item["content_hash"]
         if not expected_content_hash:
             if not automatic:
-                QMessageBox.warning(self, "OCR 识别失败", "图片索引缺少内容校验值，请重新导入后再试。")
+                QMessageBox.warning(
+                    self,
+                    missing_hash_title,
+                    "图片索引缺少内容校验值，请重新导入后再试。",
+                )
             return False
-        if item_id in self._ocr_requests:
+        if item_id in requests:
             if automatic:
                 return False
-            self._automatic_ocr_items.discard(item_id)
-            self._cancel_request(self._ocr_requests.pop(item_id, None))
+            automatic_items.discard(item_id)
+            self._cancel_request(requests.pop(item_id, None))
         if self.current_item_id == item_id:
-            self.detail.ocr_button.setEnabled(False)
-            self.detail.ocr_button.setText("识别中…")
+            if is_ai:
+                self.detail.set_ai_busy(True)
+            else:
+                self.detail.set_ocr_busy(True)
         token = object()
         signals = AsyncSignals()
         self._async_signals.add(signals)
-        self._ocr_requests[item_id] = (token, signals)
+        requests[item_id] = (token, signals)
         if automatic:
-            self._automatic_ocr_items.add(item_id)
+            automatic_items.add(item_id)
         signals.succeeded.connect(
-            lambda result_item_id, text, unused, request_token=token, request_signals=signals, request_hash=expected_content_hash: self._ocr_succeeded(
-                request_token, request_signals, result_item_id, text, unused, request_hash
+            lambda result_item_id, result_text, _unused, request_token=token, request_signals=signals, request_hash=expected_content_hash: result_handler(
+                request_token,
+                request_signals,
+                result_item_id,
+                result_text,
+                request_hash,
             )
         )
         signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals, request_item_id=item_id: self._ocr_failed(
+            lambda message, request_token=token, request_signals=signals, request_item_id=item_id: failure_handler(
                 request_token, request_signals, request_item_id, message
             )
         )
@@ -3095,14 +3372,15 @@ class MainWindow(QMainWindow):
         def work(cancel_event: threading.Event) -> None:
             try:
                 image_snapshot = preflight_image_file(Path(item["path"]))
-                text = service.ocr_image(
+                processor = service.describe_image if is_ai else service.ocr_image
+                result_text = processor(
                     image_snapshot,
                     cancel_event,
                     expected_sha256=expected_content_hash,
                 )
                 image_snapshot.require_current()
                 if not cancel_event.is_set():
-                    signals.succeeded.emit(item_id, text, None)
+                    signals.succeeded.emit(item_id, result_text, None)
             except OperationCancelled:
                 return
             except Exception as exc:
@@ -3112,15 +3390,18 @@ class MainWindow(QMainWindow):
         try:
             self._start_bounded_task(token, work, estimated_bytes=self._image_task_estimate(item))
         except (TaskCapacityExceeded, RuntimeError) as exc:
-            self._ocr_requests.pop(item_id, None)
-            self._automatic_ocr_items.discard(item_id)
+            requests.pop(item_id, None)
+            automatic_items.discard(item_id)
             self._async_signals.discard(signals)
             if self.current_item_id == item_id:
-                self.detail.set_ocr_busy(False, failed=True)
+                if is_ai:
+                    self.detail.set_ai_busy(False, failed=True)
+                else:
+                    self.detail.set_ocr_busy(False, failed=True)
             if automatic:
-                self.show_error_status(f"自动 OCR 暂时无法启动：{exc}")
+                self.show_error_status(f"{automatic_capacity_prefix}：{exc}")
             else:
-                QMessageBox.warning(self, "OCR 任务繁忙", str(exc))
+                QMessageBox.warning(self, capacity_title, str(exc))
             return False
         return True
 
@@ -3130,8 +3411,7 @@ class MainWindow(QMainWindow):
         signals: AsyncSignals,
         item_id: int,
         text: str,
-        _unused,
-        expected_content_hash: str | None = None,
+        expected_content_hash: str,
     ) -> None:
         self._async_signals.discard(signals)
         self._finish_async_token(token)
@@ -3141,14 +3421,9 @@ class MainWindow(QMainWindow):
             self._automatic_ocr_items.discard(item_id)
             return
         try:
-            if expected_content_hash is None:
-                saved = self.database.get_item(item_id) is not None
-                if saved:
-                    self.database.update_ocr(item_id, text)
-            else:
-                saved = self.database.update_ocr_if_current(
-                    item_id, expected_content_hash, text
-                )
+            saved = self.database.update_ocr_if_current(
+                item_id, expected_content_hash, text
+            )
         except Exception as exc:
             self._ocr_failed(token, signals, item_id, f"OCR 结果无法保存：{exc}")
             return
@@ -3198,6 +3473,7 @@ class MainWindow(QMainWindow):
             self.open_settings()
             return
         self.search_timer.stop()
+        self._cancel_item_search_request()
         self._cancel_expanded_search_request()
         self.expanded_search_button.setEnabled(False)
         self.expanded_search_button.setText("扩展中…")
@@ -3262,7 +3538,7 @@ class MainWindow(QMainWindow):
             return
         self._expanded_search_query = query
         self._expanded_search_terms = tuple(terms)
-        self.refresh_items()
+        self._refresh_search_items_async()
         self.show_status(f"搜索范围已扩大：使用 {len(self._expanded_search_terms):,} 个搜索词")
 
     def _expanded_search_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
@@ -3292,7 +3568,7 @@ class MainWindow(QMainWindow):
         signals: AsyncSignals,
         item_id: int,
         description: str,
-        expected_content_hash: str | None = None,
+        expected_content_hash: str,
     ) -> None:
         self._async_signals.discard(signals)
         self._finish_async_token(token)
@@ -3302,16 +3578,11 @@ class MainWindow(QMainWindow):
             self._automatic_ai_items.discard(item_id)
             return
         try:
-            if expected_content_hash is None:
-                saved = self.database.get_item(item_id) is not None
-                if saved:
-                    self.database.update_ai(item_id, description)
-            else:
-                saved = self.database.update_ai_if_current(
-                    item_id,
-                    expected_content_hash,
-                    description,
-                )
+            saved = self.database.update_ai_if_current(
+                item_id,
+                expected_content_hash,
+                description,
+            )
         except Exception as exc:
             self._ai_failed(token, signals, item_id, f"AI 结果无法保存：{exc}")
             return
@@ -3456,6 +3727,7 @@ class MainWindow(QMainWindow):
         self.force_quit = True
         self._set_interactions_enabled(False)
         self.search_timer.stop()
+        self._cancel_item_search_request()
         monitoring_was_active = self.clipboard_service.timer.isActive()
         self.clipboard_service.prepare_for_shutdown()
 
@@ -3463,37 +3735,60 @@ class MainWindow(QMainWindow):
         if self.detail.current_item is not None:
             item_id = self.detail.current_item["id"]
             notes = self.detail.notes.toPlainText()
-            if notes != self.detail._loaded_notes:
-                note_updates[item_id] = (self.detail._loaded_notes, notes)
+            if notes != self.detail.loaded_notes:
+                note_updates[item_id] = (self.detail.loaded_notes, notes)
         if note_updates:
             note_result: list[Exception | None] = []
             note_saved_ids: list[int] = []
+            reconciled_note_ids: set[int] = set()
+            note_state_lock = threading.Lock()
             note_done = threading.Event()
+            note_token = object()
 
-            def persist_notes() -> None:
+            def persist_notes(cancel_event: threading.Event) -> None:
                 error = None
                 try:
                     for item_id, (expected_notes, notes) in note_updates.items():
+                        if cancel_event.is_set():
+                            return
                         if not self.database.set_notes_if_unchanged(
                             item_id, expected_notes, notes
                         ):
                             raise RuntimeError("notes changed during session shutdown")
-                        note_saved_ids.append(item_id)
+                        with note_state_lock:
+                            note_saved_ids.append(item_id)
                 except Exception as exc:
                     error = exc
                 finally:
                     note_result.append(error)
                     note_done.set()
 
-            threading.Thread(
-                target=persist_notes,
-                name="ClipSaveSessionNotes",
-                daemon=True,
-            ).start()
+            def reconcile_saved_notes() -> None:
+                with note_state_lock:
+                    pending_ids = [
+                        item_id
+                        for item_id in note_saved_ids
+                        if item_id not in reconciled_note_ids
+                    ]
+                    reconciled_note_ids.update(pending_ids)
+                for item_id in pending_ids:
+                    _expected_notes, notes = note_updates[item_id]
+                    self.detail.mark_notes_saved(item_id, notes)
+
+            def reconcile_late_note_saves() -> None:
+                if self._closing:
+                    return
+                if not note_done.is_set():
+                    QTimer.singleShot(25, reconcile_late_note_saves)
+                    return
+                reconcile_saved_notes()
+
+            self._start_async_task(note_token, persist_notes)
             notes_finished = note_done.wait(remaining())
-            for item_id in list(note_saved_ids):
-                _expected_notes, notes = note_updates[item_id]
-                self.detail.mark_notes_saved(item_id, notes)
+            reconcile_saved_notes()
+            if not notes_finished:
+                self._cancel_async_token(note_token)
+                QTimer.singleShot(0, reconcile_late_note_saves)
             if not notes_finished or note_result != [None]:
                 return abort(monitoring_was_active)
 
@@ -3506,46 +3801,39 @@ class MainWindow(QMainWindow):
                 return abort(monitoring_was_active)
             setattr(self, attribute, None)
         self.backup_timer.stop()
-        expanded_search_request = self._expanded_search_request
-        self._cancel_request(expanded_search_request)
-        if expanded_search_request is not None:
-            cancelled_request_tokens.add(expanded_search_request[0])
-        for request in list(self._ai_requests.values()):
-            self._cancel_request(request)
-            cancelled_request_tokens.add(request[0])
-        for request in list(self._ocr_requests.values()):
-            self._cancel_request(request)
-            cancelled_request_tokens.add(request[0])
-        if self._copy_request is not None:
-            self._cancel_async_token(self._copy_request[0])
-            self._async_signals.discard(self._copy_request[1])
-            cancelled_request_tokens.add(self._copy_request[0])
-        for token, _signals, _was_selected, _detail_was_visible in self._delete_requests.values():
-            self._cancel_async_token(token)
-            cancelled_request_tokens.add(token)
+        cancelled_request_tokens.update(self._cancel_background_requests())
         if not self._cancel_and_wait_for_async_tasks(
             remaining(), require_bounded=True, process_events=False
         ):
             return abort(monitoring_was_active)
-        self._expanded_search_request = None
-        self.expanded_search_button.setEnabled(True)
-        self.expanded_search_button.setText("扩大搜索")
-        self._ai_requests.clear()
-        self._ocr_requests.clear()
-        self._copy_request = None
-        self._delete_requests.clear()
-        self._pending_delete_item_ids.clear()
+        self._clear_background_request_state()
 
         if not self.clipboard_service.wait_for_idle(remaining()):
             return abort(monitoring_was_active)
         if not self.clipboard_service.shutdown(timeout=remaining()):
             return abort(monitoring_was_active)
 
+        return self._finalize_shutdown(
+            executor_timeout=min(remaining(), 0.1),
+            thumbnail_timeout_ms=max(0, int(remaining() * 1000)),
+        )
+
+    def _finalize_shutdown(
+        self,
+        *,
+        executor_timeout: float,
+        thumbnail_timeout_ms: int | None = None,
+    ) -> bool:
         self._closing = True
         self._async_signals.clear()
-        shutdown_ai_ocr_task_executor(timeout=min(remaining(), 0.1))
-        self.grid.shutdown_thumbnail_loader(timeout_ms=max(0, int(remaining() * 1000)))
-        self.detail.shutdown_thumbnail_loader(timeout_ms=max(0, int(remaining() * 1000)))
+        shutdown_ai_ocr_task_executor(timeout=max(0.0, executor_timeout))
+        if thumbnail_timeout_ms is None:
+            self.grid.shutdown_thumbnail_loader()
+            self.detail.shutdown_thumbnail_loader()
+        else:
+            timeout_ms = max(0, int(thumbnail_timeout_ms))
+            self.grid.shutdown_thumbnail_loader(timeout_ms=timeout_ms)
+            self.detail.shutdown_thumbnail_loader(timeout_ms=timeout_ms)
         self.database.close()
         self.tray.hide()
         application = QApplication.instance()
@@ -3561,6 +3849,7 @@ class MainWindow(QMainWindow):
         self.force_quit = True
         self._set_interactions_enabled(False)
         self.search_timer.stop()
+        self._cancel_item_search_request()
         if not self.detail.flush_notes():
             self._set_interactions_enabled(True)
             self._quit_in_progress = False
@@ -3617,24 +3906,7 @@ class MainWindow(QMainWindow):
             return False
         self._cancel_request(self._backup_request)
         self._backup_request = None
-        cancelled_request_tokens: set[object] = set()
-        expanded_search_request = self._expanded_search_request
-        self._cancel_request(expanded_search_request)
-        if expanded_search_request is not None:
-            cancelled_request_tokens.add(expanded_search_request[0])
-        for request in list(self._ai_requests.values()):
-            self._cancel_request(request)
-            cancelled_request_tokens.add(request[0])
-        for request in list(self._ocr_requests.values()):
-            self._cancel_request(request)
-            cancelled_request_tokens.add(request[0])
-        if self._copy_request is not None:
-            self._cancel_async_token(self._copy_request[0])
-            self._async_signals.discard(self._copy_request[1])
-            cancelled_request_tokens.add(self._copy_request[0])
-        for token, _signals, _was_selected, _detail_was_visible in self._delete_requests.values():
-            self._cancel_async_token(token)
-            cancelled_request_tokens.add(token)
+        cancelled_request_tokens = self._cancel_background_requests()
         if not self._cancel_and_wait_for_async_tasks(6.0):
             self._quit_in_progress = False
             self.force_quit = False
@@ -3649,14 +3921,7 @@ class MainWindow(QMainWindow):
                 "AI、OCR 或图片处理任务仍在结束。ClipSave 暂时不会退出，请稍后再次退出。",
             )
             return False
-        self._expanded_search_request = None
-        self.expanded_search_button.setEnabled(True)
-        self.expanded_search_button.setText("扩大搜索")
-        self._ai_requests.clear()
-        self._ocr_requests.clear()
-        self._copy_request = None
-        self._delete_requests.clear()
-        self._pending_delete_item_ids.clear()
+        self._clear_background_request_state()
         if not (self.grid.wait_for_thumbnail_idle() and self.detail.wait_for_thumbnail_idle()):
             self.grid.resume_thumbnail_loader()
             self.detail.resume_thumbnail_loader()
@@ -3726,18 +3991,7 @@ class MainWindow(QMainWindow):
                 "仍有剪贴板内容正在写入本地磁盘。为避免数据丢失，ClipSave 暂时不会退出。请稍后再次退出。",
             )
             return False
-        self._closing = True
-        self._async_signals.clear()
-        shutdown_ai_ocr_task_executor(timeout=2.0)
-        self.grid.shutdown_thumbnail_loader()
-        self.detail.shutdown_thumbnail_loader()
-        if persistence_stopped:
-            self.database.close()
-        self.tray.hide()
-        application = QApplication.instance()
-        if application is not None:
-            application.exit(0)
-        return True
+        return self._finalize_shutdown(executor_timeout=2.0)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         tray_available = QSystemTrayIcon.isSystemTrayAvailable()

@@ -101,6 +101,27 @@ class FakeResponse:
         return self.read(limit)
 
 
+class BlockingResponse:
+    def __init__(self):
+        self.closed = threading.Event()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def close(self):
+        self.closed.set()
+
+    def read(self, _limit):
+        self.closed.wait(1.0)
+        raise OSError("response closed")
+
+    def read1(self, limit):
+        return self.read(limit)
+
+
 class ClipboardServiceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -822,14 +843,18 @@ class ClipboardServiceTests(unittest.TestCase):
             self.assertEqual(len(list(picture_dir.rglob("*.png"))), 2)
             self.assertEqual(len(self.database.query_items()), 2)
 
-            with patch.object(self.database, "add_image", side_effect=RuntimeError("db failed")):
+            with patch.object(
+                self.database,
+                "add_verified_image",
+                side_effect=RuntimeError("db failed"),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "db failed"):
                     self.service.save_image(image_b.copy())
             self.assertEqual(len(list(picture_dir.rglob("*.png"))), 2)
 
             image_c = QImage(16, 16, QImage.Format.Format_RGBA8888)
             image_c.fill(QColor("#00ff00"))
-            with patch.object(self.database, "add_image", return_value=None):
+            with patch.object(self.database, "add_verified_image", return_value=None):
                 with self.assertRaisesRegex(RuntimeError, "数据库未能保存"):
                     self.service.save_image(image_c)
             self.assertEqual(len(list(picture_dir.rglob("*.png"))), 2)
@@ -838,16 +863,16 @@ class ClipboardServiceTests(unittest.TestCase):
         picture_dir = Path(self.temp.name) / "Pictures"
         image = QImage(16, 16, QImage.Format.Format_RGBA8888)
         image.fill(QColor("#00aa55"))
-        real_add_image = self.database.add_image
+        real_add_image = self.database.add_verified_image
 
-        def scanner_wins(path, created_at=None):
+        def scanner_wins(path, **kwargs):
             self.assertTrue(self.database.import_file(path, "image"))
-            return real_add_image(path, created_at)
+            return real_add_image(path, **kwargs)
 
         captured = []
         self.service.captured.connect(captured.append)
         with patch("clipsave_app.services.PICTURE_DIR", picture_dir), patch.object(
-            self.database, "add_image", side_effect=scanner_wins
+            self.database, "add_verified_image", side_effect=scanner_wins
         ):
             self.assertTrue(self.service.save_image(image))
 
@@ -863,16 +888,16 @@ class ClipboardServiceTests(unittest.TestCase):
         original.fill(QColor("#00aa55"))
         replacement = QImage(16, 16, QImage.Format.Format_RGBA8888)
         replacement.fill(QColor("#aa0055"))
-        real_add_image = self.database.add_image
+        real_add_image = self.database.add_verified_image
         replacement_attempts = []
 
-        def scanner_wins(path, created_at=None):
+        def scanner_wins(path, **kwargs):
             replacement_attempts.append(replacement.save(str(path)))
             self.assertTrue(self.database.import_file(path, "image"))
-            return real_add_image(path, created_at)
+            return real_add_image(path, **kwargs)
 
         with patch("clipsave_app.services.PICTURE_DIR", picture_dir), patch.object(
-            self.database, "add_image", side_effect=scanner_wins
+            self.database, "add_verified_image", side_effect=scanner_wins
         ):
             self.assertTrue(self.service.save_image(original))
 
@@ -887,15 +912,15 @@ class ClipboardServiceTests(unittest.TestCase):
         original.fill(QColor("#009944"))
         replacement = QImage(16, 16, QImage.Format.Format_RGBA8888)
         replacement.fill(QColor("#990044"))
-        real_add_image = self.database.add_image
+        real_add_image = self.database.add_verified_image
         replacement_attempts = []
 
-        def attempt_replacement(path, created_at=None):
+        def attempt_replacement(path, **kwargs):
             replacement_attempts.append(replacement.save(str(path)))
-            return real_add_image(path, created_at)
+            return real_add_image(path, **kwargs)
 
         with patch("clipsave_app.services.PICTURE_DIR", picture_dir), patch.object(
-            self.database, "add_image", side_effect=attempt_replacement
+            self.database, "add_verified_image", side_effect=attempt_replacement
         ):
             self.assertTrue(self.service.save_image(original))
 
@@ -948,11 +973,25 @@ class AIServiceTests(unittest.TestCase):
         response = FakeResponse(b'{"ok": true}')
         with patch(
             "clipsave_app.services.time.monotonic",
-            side_effect=[100.0, 100.25, 100.5, 100.75],
+            side_effect=[100.0, 100.25, 100.5, 100.75, 101.0],
         ), patch.object(service, "_open_request", return_value=response) as open_request:
             self.assertEqual(service._post("/test", {}), {"ok": True})
 
         self.assertAlmostEqual(open_request.call_args.kwargs["timeout"], 89.75)
+
+    def test_ai_response_read_is_bounded_by_overall_deadline(self):
+        service = AIService("http://localhost/v1", "", "vision")
+        service.REQUEST_DEADLINE_SECONDS = 0.05
+        response = BlockingResponse()
+
+        started = time.monotonic()
+        with patch.object(service, "_open_request", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "超时"):
+                service._post("/test", {})
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(response.closed.is_set())
+        self.assertLess(elapsed, 0.5)
 
     def test_ai_response_size_and_shape_are_validated(self):
         service = AIService("http://localhost/v1", "", "vision")

@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import re
+import stat as stat_module
 import struct
 import sys
 import threading
@@ -127,16 +128,22 @@ class ImageFileSnapshot(FileSnapshot):
 def preflight_current_file(path: Path, *, max_file_bytes: int | None = None) -> FileSnapshot:
     resolved = Path(path).resolve()
     try:
-        stat = resolved.stat()
+        stat_result = resolved.stat()
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"文件不存在或已被移动: {resolved}") from exc
     except OSError as exc:
         raise OSError(f"无法访问文件: {resolved}") from exc
-    if not resolved.is_file():
+    if not stat_module.S_ISREG(stat_result.st_mode):
         raise ValueError(f"路径不是文件: {resolved}")
-    if max_file_bytes is not None and stat.st_size > max_file_bytes:
+    if max_file_bytes is not None and stat_result.st_size > max_file_bytes:
         raise ValueError("文件过大，已拒绝处理。")
-    return FileSnapshot(resolved, stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+    return FileSnapshot(
+        resolved,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_dev,
+        stat_result.st_ino,
+    )
 
 
 def preflight_image_file(
@@ -1209,13 +1216,20 @@ class ClipboardService(QObject):
                     owned_size += len(chunk)
                 if owned_size != len(payload) or owned_hash.hexdigest() != payload_hash:
                     raise RuntimeError("Captured image changed before it could be indexed")
-                item_id = self.database.add_image(path, now)
+                item_id = self.database.add_verified_image(
+                    path,
+                    content_hash=payload_hash,
+                    file_size=owned_size,
+                    width=image.width(),
+                    height=image.height(),
+                    created_at=now,
+                )
                 if item_id:
                     if not self._suppress_worker_signals:
                         self.captured.emit(item_id)
                     return True
                 owner = self._database_image_owner(payload_hash)
-                if owner is not None and owner["resolved_path"] == self.database._path_key(path):
+                if owner is not None and owner["resolved_path"] == self.database.path_key(path):
                     if not self._suppress_worker_signals:
                         self.captured.emit(owner["id"])
                     return True
@@ -1383,6 +1397,20 @@ class AIService:
             if remaining_timeout <= 0:
                 raise TimeoutError("AI service request timed out")
             with self._open_request(request, timeout=remaining_timeout) as response:
+                def close_response() -> None:
+                    close = getattr(response, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                response_deadline = deadline - time.monotonic()
+                if response_deadline <= 0:
+                    raise TimeoutError("AI service request timed out")
+                deadline_timer = threading.Timer(response_deadline, close_response)
+                deadline_timer.daemon = True
+                deadline_timer.start()
                 watcher_stop = threading.Event()
                 watcher = None
                 if cancel_event is not None:
@@ -1390,12 +1418,7 @@ class AIService:
                         while not watcher_stop.wait(0.02):
                             if not cancel_event.is_set():
                                 continue
-                            close = getattr(response, "close", None)
-                            if callable(close):
-                                try:
-                                    close()
-                                except Exception:
-                                    pass
+                            close_response()
                             return
 
                     watcher = threading.Thread(
@@ -1422,6 +1445,8 @@ class AIService:
                         raise RuntimeError("AI 服务响应过大，已停止读取。")
                 finally:
                     watcher_stop.set()
+                    deadline_timer.cancel()
+                    deadline_timer.join(0.2)
                     if watcher is not None:
                         watcher.join(0.2)
         except urllib.error.HTTPError as exc:

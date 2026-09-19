@@ -1183,7 +1183,7 @@ def validate_managed_write_path(path: Path, managed_root: Path = LIBRARY_DIR) ->
     try:
         candidate.parent.relative_to(root)
         candidate.parent.resolve(strict=False).relative_to(root.resolve(strict=False))
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError):
         raise RuntimeError(f"Write target is outside the managed local library: {candidate}")
     if path_has_reparse_ancestor(candidate.parent, root):
         raise RuntimeError(f"Write target contains a reparse point: {candidate}")

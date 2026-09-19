@@ -25,7 +25,7 @@ def format_local_timestamp(value) -> str:
     return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _human_size(value: int) -> str:
+def human_size(value: int) -> str:
     amount = float(value or 0)
     for suffix in ("B", "KB", "MB", "GB"):
         if amount < 1024 or suffix == "GB":
@@ -98,7 +98,7 @@ class AssetItemModel(QAbstractTableModel):
         if index.column() == 3:
             return format_local_timestamp(record["created_at"])
         if index.column() == 4:
-            return _human_size(record["file_size"])
+            return human_size(record["file_size"])
         return None
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):

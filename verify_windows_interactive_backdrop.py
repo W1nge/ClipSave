@@ -214,6 +214,27 @@ def _summarize(label: str, values: list[float]) -> None:
     )
 
 
+def _performance_failure_reason(label: str, values: list[float]) -> str | None:
+    if not values:
+        return f"{label}-no-samples"
+    p95 = _percentile(values, 0.95)
+    p99 = _percentile(values, 0.99)
+    if p95 > 16.7:
+        return f"{label}-p95-stall p95={p95:.3f}ms"
+    if p99 > 33.3:
+        return f"{label}-p99-stall p99={p99:.3f}ms"
+    return None
+
+
+def _backdrop_status_failure(values: dict[str, str]) -> str | None:
+    backend = values.get("backdrop_backend")
+    if backend != "win10_effect_acrylic":
+        return f"resting-backend actual={backend}"
+    if values.get("backdrop_success") != "True":
+        return f"backdrop-unsuccessful actual={values.get('backdrop_success')}"
+    return None
+
+
 def _geometry_samples(
     hwnd: int,
     *,
@@ -309,6 +330,24 @@ def verify(command: list[str], *, count: int, timeout: float) -> int:
                 )
                 return 2
 
+            while time.monotonic() < deadline and not status.is_file():
+                if process.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if not status.is_file():
+                print("interactive_backdrop=FAIL reason=status-missing")
+                return 4
+            status_values = _status_values(status)
+            print(
+                "resting_backend="
+                f"{status_values.get('backdrop_backend')} "
+                f"success={status_values.get('backdrop_success')}"
+            )
+            status_failure = _backdrop_status_failure(status_values)
+            if status_failure is not None:
+                print(f"interactive_backdrop=FAIL reason={status_failure}")
+                return 4
+
             time.sleep(0.5)
             backdrop_hwnd = _find_backdrop_window(hwnd)
             if not backdrop_hwnd:
@@ -347,11 +386,9 @@ def verify(command: list[str], *, count: int, timeout: float) -> int:
                     f"max_delta={max(deltas, default=0)}px "
                     f"nonzero={sum(delta != 0 for delta in deltas)}/{len(deltas)}"
                 )
-                if any(value > 33.3 for value in values):
-                    print(
-                        "interactive_backdrop=FAIL "
-                        f"reason={label}-stall"
-                    )
+                performance_failure = _performance_failure_reason(label, values)
+                if performance_failure is not None:
+                    print(f"interactive_backdrop=FAIL reason={performance_failure}")
                     return 3
                 if any(deltas):
                     print(
@@ -365,19 +402,6 @@ def verify(command: list[str], *, count: int, timeout: float) -> int:
             # the Win10 material itself stays attached continuously. This gate
             # therefore measures compositor cadence without changing backdrop
             # implementation mid-interaction.
-            if status.exists():
-                values = _status_values(status)
-                print(
-                    "resting_backend="
-                    f"{values.get('backdrop_backend')} "
-                    f"success={values.get('backdrop_success')}"
-                )
-                if values.get("backdrop_backend") != "win10_effect_acrylic":
-                    print(
-                        "interactive_backdrop=FAIL reason=resting-backend "
-                        f"actual={values.get('backdrop_backend')}"
-                    )
-                    return 4
             print("interactive_backdrop=PASS")
             return 0
         finally:

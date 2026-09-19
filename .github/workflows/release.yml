@@ -176,8 +176,6 @@ jobs:
           $match = [regex]::Match($text, "(?ms)^## $escaped - [^\r\n]+\r?\n\r?\n(.*?)(?=^## |\z)")
           if (-not $match.Success) { throw "Could not find CHANGELOG section for $version" }
           $body = @"
-          ClipSave $version focuses on Windows Acrylic quality and interactive window performance.
-
           ## Highlights
 
           $($match.Groups[1].Value.Trim())

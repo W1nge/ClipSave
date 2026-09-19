@@ -83,7 +83,12 @@ from PySide6.QtWidgets import (
 )
 
 from .constants import TYPE_LABELS
-from .item_models import AssetItemModel, format_local_timestamp, normalized_thumbnail_path
+from .item_models import (
+    AssetItemModel,
+    format_local_timestamp,
+    human_size,
+    normalized_thumbnail_path,
+)
 from lucide import _render_icon
 
 
@@ -493,15 +498,6 @@ class ThemedSelectableLabel(QLabel):
         finally:
             menu.deleteLater()
         event.accept()
-
-
-def human_size(value: int) -> str:
-    amount = float(value or 0)
-    for suffix in ("B", "KB", "MB", "GB"):
-        if amount < 1024 or suffix == "GB":
-            return f"{amount:.0f} {suffix}" if suffix == "B" else f"{amount:.1f} {suffix}"
-        amount /= 1024
-    return "0 B"
 
 
 def friendly_day(value: str) -> str:
@@ -4099,6 +4095,10 @@ class DetailPanel(QScrollArea):
             item_id: (self._note_draft_bases.get(item_id, ""), notes)
             for item_id, notes in self._note_drafts.items()
         }
+
+    @property
+    def loaded_notes(self) -> str:
+        return self._loaded_notes
 
 
 class MarkdownDialog(QDialog):

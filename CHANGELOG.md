@@ -7,6 +7,10 @@
 - Removed confirmed dead, test-only and compatibility-only code across database, clipboard, Windows backdrop, frame and installer paths without changing intended product behavior.
 - Simplified tests to exercise the real production paths directly instead of preserving helper APIs solely for test access.
 - Kept the Windows 10 Acrylic implementation and its safety/geometry guarantees intact while reducing the maintenance surface.
+- Moved user-triggered library search, navigation, pagination and mutation refresh queries off the GUI thread, with cancellation and stale-result protection.
+- Reduced repeated full-file hashing and image decoding in reconcile, import and clipboard image-save paths while preserving identity-locked safety checks.
+- Tightened smoke/interactive Windows release gates, AI request total deadlines, compare-and-set result persistence and shutdown task tracking.
+- Consolidated duplicated AI/OCR request orchestration and shared shutdown cancellation/finalization paths.
 
 ## 1.1.1 - 2026-09-19
 

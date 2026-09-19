@@ -86,6 +86,41 @@ class AppTests(unittest.TestCase):
             "uncaught_exception=ZeroDivisionError: division by zero",
         )
 
+    def test_smoke_backdrop_status_is_available_before_shutdown(self):
+        window = MagicMock()
+        window._native_backdrop_result.backend.value = "win10_effect_acrylic"
+        window._native_backdrop_result.success = True
+        window._native_backdrop_result.native_error = None
+
+        status = app._smoke_backdrop_status(window)
+
+        self.assertIn("backdrop_backend=win10_effect_acrylic\n", status)
+        self.assertIn("backdrop_success=True\n", status)
+
+    def test_smoke_background_idle_waits_for_startup_refresh_queries(self):
+        window = MagicMock()
+        window._startup_scan_request = None
+        window._library_refresh_request = None
+        window._item_search_request = None
+        window._item_page_request = None
+        self.assertTrue(app._smoke_background_idle(window))
+
+        for attribute in (
+            "_startup_scan_request",
+            "_library_refresh_request",
+            "_item_search_request",
+            "_item_page_request",
+        ):
+            setattr(window, attribute, object())
+            self.assertFalse(app._smoke_background_idle(window), attribute)
+            setattr(window, attribute, None)
+
+    def test_smoke_mode_has_bounded_ready_and_quit_attempts(self):
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        self.assertIn("if smoke_attempts < 80:", source)
+        self.assertIn("if smoke_quit_attempts < 80:", source)
+        self.assertIn('handle.write("smoke_quit_timeout=True\\n")', source)
+
     @unittest.skipUnless(os.name == "nt", "Windows DPI awareness is Windows-only")
     def test_dpi_awareness_prefers_per_monitor_v2(self):
         user32 = MagicMock()

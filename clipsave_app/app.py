@@ -202,6 +202,32 @@ def _smoke_failure(window, uncaught_exceptions: list[str]) -> str | None:
     return None
 
 
+def _smoke_backdrop_status(window) -> str:
+    backdrop_result = getattr(window, "_native_backdrop_result", None)
+    backdrop_backend = getattr(
+        getattr(backdrop_result, "backend", None), "value", "none"
+    )
+    backdrop_success = bool(getattr(backdrop_result, "success", False))
+    backdrop_error = getattr(backdrop_result, "native_error", None)
+    return (
+        f"backdrop_backend={backdrop_backend}\n"
+        f"backdrop_success={backdrop_success}\n"
+        f"backdrop_native_error={backdrop_error}\n"
+    )
+
+
+def _smoke_background_idle(window) -> bool:
+    return all(
+        getattr(window, attribute, None) is None
+        for attribute in (
+            "_startup_scan_request",
+            "_library_refresh_request",
+            "_item_search_request",
+            "_item_page_request",
+        )
+    )
+
+
 def create_app_icon() -> QIcon:
     icon = QIcon()
     for size in (32, 64, 128, 256):
@@ -526,30 +552,36 @@ def main() -> int:
     window.show()
     if smoke_ready_path is not None:
         smoke_attempts = 0
+        smoke_quit_attempts = 0
         smoke_status_path = smoke_ready_path.with_name(f"{smoke_ready_path.name}.status")
 
         def quit_smoke() -> None:
-            backdrop_result = getattr(window, "_native_backdrop_result", None)
-            backdrop_backend = getattr(
-                getattr(backdrop_result, "backend", None), "value", "none"
-            )
-            backdrop_success = bool(getattr(backdrop_result, "success", False))
-            backdrop_error = getattr(backdrop_result, "native_error", None)
+            nonlocal smoke_quit_attempts
+            smoke_quit_attempts += 1
             quit_started = window.quit_application()
             try:
                 smoke_status_path.write_text(
-                    f"backdrop_backend={backdrop_backend}\n"
-                    f"backdrop_success={backdrop_success}\n"
-                    f"backdrop_native_error={backdrop_error}\n"
-                    f"quit_returned={quit_started}\nclosing={window._closing}\n"
-                    f"quit_in_progress={window._quit_in_progress}\n",
-                    encoding="ascii",
+                    _smoke_backdrop_status(window)
+                    + f"quit_returned={quit_started}\nclosing={window._closing}\n"
+                    f"quit_in_progress={window._quit_in_progress}\n"
+                    f"quit_attempts={smoke_quit_attempts}\n",
+                    encoding="utf-8",
                     newline="\n",
                 )
             except OSError:
                 pass
             if not quit_started:
-                QTimer.singleShot(250, quit_smoke)
+                if smoke_quit_attempts < 80:
+                    QTimer.singleShot(250, quit_smoke)
+                    return
+                try:
+                    with smoke_status_path.open(
+                        "a", encoding="utf-8", newline="\n"
+                    ) as handle:
+                        handle.write("smoke_quit_timeout=True\n")
+                except OSError:
+                    pass
+                app.exit(1)
 
         def mark_smoke_ready() -> None:
             nonlocal smoke_attempts
@@ -568,10 +600,15 @@ def main() -> int:
                 check = database.connection.execute("PRAGMA quick_check").fetchone()[0]
                 if (
                     window.isVisible()
-                    and window._startup_scan_request is None
+                    and _smoke_background_idle(window)
                     and str(check).lower() == "ok"
                 ):
                     smoke_ready_path.parent.mkdir(parents=True, exist_ok=True)
+                    smoke_status_path.write_text(
+                        _smoke_backdrop_status(window) + "smoke_ready=True\n",
+                        encoding="utf-8",
+                        newline="\n",
+                    )
                     temporary = smoke_ready_path.with_name(f".{smoke_ready_path.name}.tmp")
                     temporary.write_text("ready\n", encoding="ascii", newline="\n")
                     os.replace(temporary, smoke_ready_path)
@@ -581,6 +618,17 @@ def main() -> int:
                 pass
             if smoke_attempts < 80:
                 QTimer.singleShot(250, mark_smoke_ready)
+                return
+            try:
+                smoke_status_path.write_text(
+                    _smoke_backdrop_status(window)
+                    + f"smoke_ready_timeout=True\nattempts={smoke_attempts}\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+            except OSError:
+                pass
+            app.exit(1)
 
         QTimer.singleShot(250, mark_smoke_ready)
     exit_code = app.exec()
@@ -589,7 +637,7 @@ def main() -> int:
         exit_code = exit_code or 1
     if smoke_ready_path is not None:
         try:
-            with smoke_status_path.open("a", encoding="ascii", newline="\n") as handle:
+            with smoke_status_path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(f"event_loop_exited={exit_code}\n")
         except OSError:
             pass

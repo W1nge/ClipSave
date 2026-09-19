@@ -76,6 +76,28 @@ class LibraryDatabaseTests(unittest.TestCase):
             )
         )
 
+    def test_add_verified_image_reuses_caller_verified_metadata(self):
+        path = self.root / "verified.png"
+        Image.new("RGB", (11, 7), "blue").save(path)
+        digest = self.database.file_hash(path)
+
+        with patch.object(
+            self.database,
+            "_stream_hash",
+            side_effect=AssertionError("verified insert must not rehash"),
+        ):
+            item_id = self.database.add_verified_image(
+                path,
+                content_hash=digest,
+                file_size=path.stat().st_size,
+                width=11,
+                height=7,
+            )
+
+        row = self.database.get_item(item_id)
+        self.assertEqual(row["content_hash"], digest)
+        self.assertEqual((row["width"], row["height"]), (11, 7))
+
     def test_embedding_batches_use_bounded_keyset_pagination(self):
         ids = []
         for index in range(5):
@@ -269,7 +291,7 @@ class LibraryDatabaseTests(unittest.TestCase):
 
         def flaky_open(path, mode="xb", managed_root=None, **kwargs):
             nonlocal source_opens
-            if LibraryDatabase._path_key(path) == LibraryDatabase._path_key(source) and mode == "rb":
+            if LibraryDatabase.path_key(path) == LibraryDatabase.path_key(source) and mode == "rb":
                 source_opens += 1
                 if source_opens == 2:
                     return FailingReader(source.read_bytes())
@@ -335,6 +357,51 @@ class LibraryDatabaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid or unreadable"):
             self.database.import_file(invalid, "image", strict=True)
 
+    def test_detailed_import_returns_verified_hash_and_inserted_item_id(self):
+        path = self.root / "detailed.png"
+        Image.new("RGB", (9, 5), "green").save(path)
+
+        result = self.database.import_file(
+            path,
+            "image",
+            strict=True,
+            detailed=True,
+        )
+
+        self.assertTrue(result.added)
+        self.assertFalse(result.localized)
+        self.assertFalse(result.duplicate)
+        self.assertIsNotNone(result.item_id)
+        row = self.database.get_item(result.item_id)
+        self.assertEqual(row["content_hash"], result.content_hash)
+        self.assertEqual((row["width"], row["height"]), (9, 5))
+
+    def test_external_copy_does_not_rehash_target_before_final_identity_check(self):
+        source = self.root / "outside.png"
+        Image.new("RGB", (9, 5), "green").save(source)
+        managed = self.root / "managed-pictures"
+
+        with patch(
+            "clipsave_app.database.PICTURE_DIR",
+            managed,
+        ), patch.object(
+            self.database,
+            "_stream_hash",
+            wraps=self.database._stream_hash,
+        ) as stream_hash:
+            self.assertTrue(
+                self.database.import_file(
+                    source,
+                    "image",
+                    copy_to_library=True,
+                    strict=True,
+                )
+            )
+
+        # Source snapshot + final identity-locked target. The copy loop computes
+        # its digest inline while writing, so it does not call _stream_hash.
+        self.assertEqual(stream_hash.call_count, 2)
+
     def test_import_rejects_replacement_between_snapshot_and_commit(self):
         path = self.root / "changing-import.bmp"
         Image.new("RGB", (10, 10), "red").save(path)
@@ -381,7 +448,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         path = self.root / "daily.md"
         path.write_text("version one", encoding="utf-8")
         self.assertTrue(self.database.import_file(path, "markdown"))
-        resolved_path = self.database._path_key(path)
+        resolved_path = self.database.path_key(path)
         timestamp = dt.datetime(2026, 7, 12, 8, 0).isoformat(timespec="seconds")
         inserted_ids = []
         with self.database._transaction():
@@ -619,6 +686,20 @@ class LibraryDatabaseTests(unittest.TestCase):
 
         self.assertEqual(self.database.get_item(item_id)["id"], item_id)
 
+    def test_mark_missing_files_hashes_unchanged_file_once(self):
+        path = self.root / "unchanged.png"
+        Image.new("RGB", (10, 10), "red").save(path)
+        self.assertTrue(self.database.import_file(path, "image"))
+
+        with patch.object(
+            self.database,
+            "_stream_hash",
+            wraps=self.database._stream_hash,
+        ) as stream_hash:
+            self.database.mark_missing_files()
+
+        stream_hash.assert_called_once()
+
     def test_restored_missing_duplicate_stays_hidden_without_aborting_scan(self):
         missing_path = self.root / "missing-copy.png"
         live_path = self.root / "live-copy.png"
@@ -722,8 +803,22 @@ class LibraryDatabaseTests(unittest.TestCase):
         first_id = self.database.add_text("same", when)
         second_id = self.database.add_text("other", when)
 
-        with patch.object(self.database, "query_items", side_effect=AssertionError("not used")):
-            self.assertEqual(self.database.get_item(first_id)["id"], first_id)
+        statements = []
+        self.database.connection.set_trace_callback(statements.append)
+        try:
+            with patch.object(
+                self.database,
+                "query_items",
+                side_effect=AssertionError("not used"),
+            ):
+                self.assertEqual(self.database.get_item(first_id)["id"], first_id)
+        finally:
+            self.database.connection.set_trace_callback(None)
+
+        get_item_sql = "\n".join(statements)
+        self.assertNotIn("LEFT JOIN item_tags it", get_item_sql)
+        self.assertNotIn("LEFT JOIN tags t", get_item_sql)
+        self.assertNotIn("GROUP BY i.id", get_item_sql)
         self.assertEqual(
             [row["id"] for row in self.database.query_items(sort="newest")],
             [second_id, first_id],
@@ -931,7 +1026,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         migrated = LibraryDatabase(path)
         try:
             row = migrated.connection.execute("SELECT * FROM items").fetchone()
-            self.assertEqual(row["resolved_path"], migrated._path_key(daily))
+            self.assertEqual(row["resolved_path"], migrated.path_key(daily))
             self.assertEqual(migrated.connection.execute("SELECT COUNT(*) FROM items").fetchone()[0], 1)
             self.assertEqual(
                 migrated.connection.execute("PRAGMA user_version").fetchone()[0],
@@ -1669,7 +1764,7 @@ class LibraryDatabaseTests(unittest.TestCase):
             """,
             (
                 str(legacy_file),
-                LibraryDatabase._path_key(legacy_file),
+                LibraryDatabase.path_key(legacy_file),
                 "text/markdown",
                 LibraryDatabase.text_hash("shared legacy content"),
                 timestamp,
@@ -1729,7 +1824,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         with self.database._transaction():
             self.database.connection.execute(
                 "UPDATE items SET missing=1 WHERE resolved_path=?",
-                (self.database._path_key(missing),),
+                (self.database.path_key(missing),),
             )
 
         current.write_text("new shared content", encoding="utf-8")
@@ -1764,7 +1859,7 @@ class LibraryDatabaseTests(unittest.TestCase):
             before = self.database.get_item(item_id)
 
             result = self.database.import_file(source, "markdown", copy_to_library=True)
-            self.assertFalse(result)
+            self.assertTrue(result)
             self.assertIs(result, ImportFileResult.LOCALIZED)
 
         after = self.database.get_item(item_id)
@@ -2117,6 +2212,29 @@ class LibraryDatabaseTests(unittest.TestCase):
             self.database.query_items(limit=-1)
         with self.assertRaises(ValueError):
             self.database.query_items(offset=-1)
+
+    def test_count_and_id_queries_avoid_full_item_projection(self):
+        first = self.database.add_text("first")
+        second = self.database.add_text("second")
+        image_path = self.root / "batch.png"
+        Image.new("RGB", (8, 8), "red").save(image_path)
+        image_id = self.database.add_image(image_path)
+        statements = []
+        self.database.connection.set_trace_callback(statements.append)
+        try:
+            self.assertEqual(self.database.count_items(kind="image"), 1)
+            self.assertEqual(
+                self.database.item_ids(kind="text", sort="oldest"),
+                [first, second],
+            )
+            self.assertEqual(self.database.item_ids(kind="image"), [image_id])
+        finally:
+            self.database.connection.set_trace_callback(None)
+
+        sql = "\n".join(statements)
+        self.assertNotIn("GROUP_CONCAT", sql)
+        self.assertNotIn("JOIN tags", sql)
+        self.assertNotIn("SELECT i.*", sql)
 
     def test_backup_generation_creates_time_separated_periodic_snapshots(self):
         initial_state = self.database.backup_state()
