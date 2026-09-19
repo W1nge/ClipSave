@@ -202,6 +202,16 @@ class DependencyLockTests(unittest.TestCase):
             "<Win2DPackageRoot>$(NuGetPackageRoot)",
             project,
         )
+        self.assertIn(
+            '<KnownILCompilerPack Update="Microsoft.DotNet.ILCompiler" '
+            'ILCompilerPackVersion="8.0.31" />',
+            project,
+        )
+        self.assertIn(
+            '<KnownILLinkPack Update="Microsoft.NET.ILLink.Tasks" '
+            'ILLinkPackVersion="8.0.31" />',
+            project,
+        )
 
 
 if __name__ == "__main__":
