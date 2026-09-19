@@ -52,7 +52,6 @@ from .services import (
     preflight_image_file,
     register_windows_power_saving_notification,
     release_windows_backdrop,
-    set_windows_backdrop_input_active,
     shutdown_ai_ocr_task_executor,
     unregister_windows_power_saving_notification,
 )
@@ -844,8 +843,6 @@ class MainWindow(QMainWindow):
             if msg.message in (0x001A, 0x031A, 0x031E):
                 # WM_SETTINGCHANGE / WM_THEMECHANGED / WM_DWMCOMPOSITIONCHANGED
                 self._schedule_material_refresh()
-            if msg.message == 0x0006:  # WM_ACTIVATE
-                set_windows_backdrop_input_active((int(msg.wParam) & 0xFFFF) != 0)
             if msg.message == 0x0218:  # WM_POWERBROADCAST
                 # Includes PBT_APMPOWERSTATUSCHANGE and the registered
                 # GUID_POWER_SAVING_STATUS PBT_POWERSETTINGCHANGE notification.

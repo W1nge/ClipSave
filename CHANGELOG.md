@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.1.2 - 2026-09-19
+
+- Removed confirmed dead, test-only and compatibility-only code across database, clipboard, Windows backdrop, frame and installer paths without changing intended product behavior.
+- Simplified tests to exercise the real production paths directly instead of preserving helper APIs solely for test access.
+- Kept the Windows 10 Acrylic implementation and its safety/geometry guarantees intact while reducing the maintenance surface.
+
 ## 1.1.1 - 2026-09-19
 
 - Rebuilt Windows 10 Acrylic around an always-on Windows.UI.Composition effect path so blur remains visually identical while moving and resizing the window.

@@ -2086,25 +2086,6 @@ class AssetGridDelegate(QStyledItemDelegate):
                     font,
                 )
 
-    def _paint_preview(
-        self,
-        painter: QPainter,
-        preview: QRect,
-        index: QModelIndex,
-        record,
-        dark: bool,
-        font: QFont,
-    ) -> None:
-        self._paint_preview_background(painter, preview, record, dark)
-        self._paint_preview_content(
-            painter,
-            preview,
-            index,
-            record,
-            dark,
-            font,
-        )
-
     @staticmethod
     def _transition_record_signature(record) -> tuple[object, ...]:
         try:

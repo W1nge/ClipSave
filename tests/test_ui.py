@@ -748,24 +748,6 @@ class MainWindowTests(unittest.TestCase):
                     )
                 schedule.assert_called_once_with()
 
-    def test_window_activation_updates_system_backdrop_configuration(self):
-        for w_param, expected in ((1, True), (0, False), (2, True)):
-            with self.subTest(w_param=w_param):
-                message = wintypes.MSG()
-                message.hWnd = int(self.window.winId())
-                message.message = 0x0006  # WM_ACTIVATE
-                message.wParam = w_param
-                with patch(
-                    "clipsave_app.main_window.set_windows_backdrop_input_active",
-                    return_value=True,
-                ) as active, patch(
-                    "PySide6.QtWidgets.QMainWindow.nativeEvent", return_value=(False, 0)
-                ):
-                    self.window.nativeEvent(
-                        b"windows_generic_MSG", ctypes.addressof(message)
-                    )
-                active.assert_called_once_with(expected)
-
     def test_power_saving_notification_follows_hwnd_and_is_released(self):
         with patch(
             "clipsave_app.main_window.is_windows_qt_platform", return_value=True

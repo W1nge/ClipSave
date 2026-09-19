@@ -581,8 +581,8 @@ class ClipboardServiceTests(unittest.TestCase):
         with patch("clipsave_app.services.os.name", "nt"), patch.object(
             self.service, "_native_clipboard_image_snapshot", return_value=None
         ):
-            with self.assertRaisesRegex(ValueError, "Unknown native"):
-                self.service._reject_oversized_native_clipboard("image")
+            with self.assertRaisesRegex(ValueError, "safely inspect"):
+                self.service._snapshot_clipboard_image(Mock())
 
     def test_clipboard_sequence_calls_configured_win32_api(self):
         user32 = Mock()
@@ -599,6 +599,7 @@ class ClipboardServiceTests(unittest.TestCase):
         user32.OpenClipboard.return_value = 1
         user32.EnumClipboardFormats.side_effect = [0xC001, 0]
         user32.GetClipboardData.return_value = 123
+        user32.IsClipboardFormatAvailable.return_value = 0
         kernel32.GlobalSize.return_value = MAX_CLIPBOARD_IMAGE_BYTES + 1
         kernel32.GetLastError.return_value = 0
 
@@ -611,7 +612,7 @@ class ClipboardServiceTests(unittest.TestCase):
             ClipboardService, "_windows_clipboard_apis", return_value=(user32, kernel32)
         ), patch("clipsave_app.services.ctypes.string_at") as string_at:
             with self.assertRaisesRegex(ValueError, "payload"):
-                self.service._native_registered_image_payloads()
+                self.service._native_clipboard_image_snapshot()
 
         kernel32.GlobalLock.assert_not_called()
         string_at.assert_not_called()
@@ -1373,7 +1374,6 @@ class BackdropTests(unittest.TestCase):
         self.assertEqual(policy, WindowsBackdropPolicy(False, True, True))
         self.assertTrue(policy.allows_transparency)
         self.assertFalse(policy.allows_app_managed_backdrop)
-        self.assertFalse(policy.allows_legacy_blur)
 
     def test_energy_saver_query_uses_system_power_status_flag(self):
         kernel32 = Mock()
@@ -1791,7 +1791,6 @@ class BoundedTaskExecutorTests(unittest.TestCase):
         self.assertTrue(first.wait(1))
         self.assertTrue(second.wait(1))
         self.assertFalse(queued_ran.is_set())
-        self.assertEqual(executor.reserved_bytes, 0)
         self.assertTrue(executor.shutdown())
 
     def test_memory_budget_is_global_across_active_and_queued_tasks(self):

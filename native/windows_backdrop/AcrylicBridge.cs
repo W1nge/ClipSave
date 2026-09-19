@@ -75,10 +75,8 @@ internal static class AcrylicBridge
     private static CompositionColorBrush? _tintBrush;
     private static nint _attachedHwnd;
     private static int _lastError;
-    private static int _lastStage;
 
     internal static int LastError => _lastError;
-    internal static int LastStage => _lastStage;
 
     private static int Failure(Exception exception)
     {
@@ -117,7 +115,6 @@ internal static class AcrylicBridge
         // directly instead: query ICompositorDesktopInterop and invoke its
         // CreateDesktopWindowTarget vtable slot.  The projected compositor
         // remains alive for the duration of this call.
-        _lastStage = 31;
         nint compositorPointer = ((IWinRTObject)_compositor!).NativeObject.ThisPtr;
         nint interopPointer = 0;
         Guid iid = CompositorDesktopInteropIid;
@@ -129,7 +126,6 @@ internal static class AcrylicBridge
 
         try
         {
-            _lastStage = 32;
             nint* interopVtable = *(nint**)interopPointer;
             var createDesktopWindowTarget =
                 (delegate* unmanaged[Stdcall]<nint, nint, int, nint*, int>)interopVtable[3];
@@ -148,7 +144,6 @@ internal static class AcrylicBridge
 
             try
             {
-                _lastStage = 33;
                 return DesktopWindowTarget.FromAbi(rawTarget);
             }
             finally
@@ -176,7 +171,6 @@ internal static class AcrylicBridge
         try
         {
             _lastError = 0;
-            _lastStage = 1;
             if (IsSupported() == 0)
             {
                 _lastError = unchecked((int)0x80004001); // E_NOTIMPL
@@ -189,9 +183,7 @@ internal static class AcrylicBridge
             }
 
             Detach();
-            _lastStage = 2;
             EnsureThreadRuntime();
-            _lastStage = 3;
 
             if (!SetHostBackdropEnabled(hwnd, true))
             {
@@ -203,12 +195,10 @@ internal static class AcrylicBridge
             // roll the window back to AccentDisabled.
             _attachedHwnd = hwnd;
 
-            _lastStage = 4;
             _desktopTarget = CreateDesktopTarget(hwnd);
             _root = _compositor!.CreateContainerVisual();
             _root.RelativeSizeAdjustment = Vector2.One;
             _desktopTarget.Root = _root;
-            _lastStage = 5;
 
             _hostBackdropBrush = _compositor.CreateHostBackdropBrush();
             GaussianBlurEffect blurEffect = new()
@@ -239,7 +229,6 @@ internal static class AcrylicBridge
             _tintVisual.Brush = _tintBrush;
             _root.Children.InsertAtTop(_tintVisual);
 
-            _lastStage = 6;
             return 1;
         }
         catch (Exception exception)
@@ -274,15 +263,6 @@ internal static class AcrylicBridge
         {
             return Failure(exception);
         }
-    }
-
-    internal static int SetInputActive(bool active)
-    {
-        // HostBackdropBrush itself does not require an activation state.
-        // Keep the exported contract so the Python layer can use the same API
-        // on Windows 10 and Windows 11.
-        _lastError = 0;
-        return 1;
     }
 
     internal static int Detach()

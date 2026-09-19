@@ -172,30 +172,6 @@ def preflight_image_file(
     )
 
 
-def require_snapshot_hash(
-    snapshot: FileSnapshot,
-    expected_sha256: str,
-    managed_root: Path = PICTURE_DIR,
-) -> None:
-    digest = hashlib.sha256()
-    with open_managed_binary(
-        snapshot.path, "rb", managed_root, identity_locked=True
-    ) as handle:
-        current = os.fstat(handle.fileno())
-        if (
-            current.st_size != snapshot.size_bytes
-            or current.st_mtime_ns != snapshot.modified_ns
-            or current.st_dev != snapshot.device
-            or current.st_ino != snapshot.inode
-        ):
-            raise RuntimeError("File changed before processing")
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    snapshot.require_current()
-    if digest.hexdigest() != expected_sha256:
-        raise RuntimeError("File content no longer matches the indexed item")
-
-
 @dataclass
 class TaskHandle:
     cancel_event: threading.Event
@@ -231,7 +207,6 @@ class BoundedTaskExecutor:
         self._lock = threading.Lock()
         self._reserved_bytes = 0
         self._pending_count = 0
-        self._active_count = 0
         self._accepting = True
         self._shutdown_sentinels_enqueued = 0
         self._workers = [
@@ -240,21 +215,6 @@ class BoundedTaskExecutor:
         ]
         for worker in self._workers:
             worker.start()
-
-    @property
-    def reserved_bytes(self) -> int:
-        with self._lock:
-            return self._reserved_bytes
-
-    @property
-    def active_count(self) -> int:
-        with self._lock:
-            return self._active_count
-
-    @property
-    def queued_count(self) -> int:
-        with self._lock:
-            return self._pending_count - self._active_count
 
     def submit(
         self,
@@ -289,8 +249,6 @@ class BoundedTaskExecutor:
             if task is None:
                 self._queue.task_done()
                 return
-            with self._lock:
-                self._active_count += 1
             try:
                 if not task.handle.cancelled:
                     task.target(task.handle.cancel_event)
@@ -299,7 +257,6 @@ class BoundedTaskExecutor:
             finally:
                 with self._lock:
                     self._reserved_bytes = max(0, self._reserved_bytes - task.reserved_bytes)
-                    self._active_count -= 1
                     self._pending_count -= 1
                 task.handle.done_event.set()
                 self._queue.task_done()
@@ -638,50 +595,6 @@ class ClipboardService(QObject):
         return shell32
 
     @staticmethod
-    def _native_clipboard_format_size(format_id: int) -> int | None:
-        if os.name != "nt":
-            return None
-        try:
-            user32, kernel32 = ClipboardService._windows_clipboard_apis()
-            if not user32.OpenClipboard(None):
-                raise _ClipboardBusy("Clipboard is temporarily busy")
-            try:
-                if not user32.IsClipboardFormatAvailable(format_id):
-                    return None
-                handle = user32.GetClipboardData(format_id)
-                if not handle:
-                    return None
-                size = int(kernel32.GlobalSize(handle))
-                return size or None
-            finally:
-                user32.CloseClipboard()
-        except (AttributeError, OSError, TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _native_registered_image_payloads() -> list[tuple[str, bytes]] | None:
-        if os.name != "nt":
-            return None
-        try:
-            user32, kernel32 = ClipboardService._windows_clipboard_apis()
-            if not user32.OpenClipboard(None):
-                raise _ClipboardBusy("Clipboard is temporarily busy")
-            try:
-                descriptors = ClipboardService._registered_image_descriptors_locked(user32, kernel32)
-                results = []
-                for name, handle, size in descriptors:
-                    payload = ClipboardService._copy_clipboard_payload_locked(kernel32, handle, size)
-                    ClipboardService._validate_registered_image_header(name, size, payload[:32])
-                    results.append((name, payload))
-                return results
-            finally:
-                user32.CloseClipboard()
-        except ValueError:
-            raise
-        except (AttributeError, OSError, TypeError):
-            return None
-
-    @staticmethod
     def _registered_image_descriptors_locked(user32, kernel32) -> list[tuple[str, object, int]]:
         results = []
         format_id = 0
@@ -980,15 +893,6 @@ class ClipboardService(QObject):
         if len(text.encode("utf-8")) > MAX_CLIPBOARD_TEXT_BYTES:
             raise ValueError("Clipboard file path list is too large")
         return text
-
-    def _reject_oversized_native_clipboard(self, kind: str) -> list[tuple[str, bytes]] | None:
-        if kind == "text":
-            self._native_clipboard_text_snapshot()
-            return
-        snapshot = self._native_clipboard_image_snapshot()
-        if snapshot is None and os.name == "nt":
-            raise ValueError("Unknown native clipboard image source")
-        return [snapshot] if snapshot is not None else None
 
     def poll(self) -> None:
         try:
@@ -1810,7 +1714,6 @@ class BackdropBackend(Enum):
     LEGACY_BLUR = "legacy_blur"
     WIN10_EFFECT_ACRYLIC = "win10_effect_acrylic"
     DESKTOP_ACRYLIC = "desktop_acrylic"
-    MICA = "mica"
 
 
 @dataclass(frozen=True)
@@ -1833,11 +1736,6 @@ class WindowsBackdropPolicy:
     @property
     def allows_app_managed_backdrop(self) -> bool:
         return self.allows_transparency and not self.energy_saver
-
-    @property
-    def allows_legacy_blur(self) -> bool:
-        return self.allows_app_managed_backdrop
-
 
 class _AccentPolicy(ctypes.Structure):
     _fields_ = [
@@ -2068,12 +1966,6 @@ def _disable_windows_backdrop(user32, dwmapi, hwnd: int, build: int) -> Backdrop
         success=modern_disabled and system_disabled and legacy_disabled,
         native_error=native_error,
     )
-
-
-def set_windows_backdrop_input_active(active: bool) -> bool:
-    if os.name != "nt":
-        return True
-    return True
 
 
 def release_windows_backdrop() -> bool:

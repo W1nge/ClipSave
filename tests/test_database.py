@@ -2,6 +2,7 @@ import datetime as dt
 import io
 import locale
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -413,8 +414,6 @@ class LibraryDatabaseTests(unittest.TestCase):
         orphan = self.root / "untracked-orphan.bin"
         orphan.write_bytes(b"do not delete")
 
-        report = self.database.repair_paths()
-        self.assertEqual(report, {"duplicate_path_groups": 1, "duplicate_path_rows": 4})
         self.assertTrue(orphan.exists())
         path.write_text("current daily content", encoding="utf-8")
         self.assertFalse(self.database.import_file(path, "markdown"))
@@ -1014,7 +1013,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         backup_dir = target.with_name(f"{target.name}.backups")
         backup_dir.mkdir()
         backup = backup_dir / "backup-00000000000000000001-source.db"
-        LibraryDatabase._backup_copy(self.database.create_backup(), backup)
+        shutil.copyfile(self.database.create_backup(), backup)
         attacker = self.root / "restore-attacker.db"
         attacker.write_bytes(b"not the validated restore")
         restorer = object.__new__(LibraryDatabase)
@@ -1052,7 +1051,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         backup_dir = target.with_name(f"{target.name}.backups")
         backup_dir.mkdir()
         backup = backup_dir / "backup-00000000000000000001-source.db"
-        LibraryDatabase._backup_copy(self.database.create_backup(), backup)
+        shutil.copyfile(self.database.create_backup(), backup)
         attacker = self.root / "restore-destination-attacker.db"
         attacker_payload = b"replacement after atomic restore"
         attacker.write_bytes(attacker_payload)
@@ -1440,7 +1439,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         database.close()
 
         outside = self.root / "outside-backup.db"
-        LibraryDatabase._backup_copy(valid_backup, outside)
+        shutil.copyfile(valid_backup, outside)
         linked_backup = path.with_name(f"{path.name}.backups") / (
             "backup-99999999999999999999-99990101T000000000000Z.db"
         )
@@ -1488,7 +1487,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         future_backups = []
         for index in range(3):
             future = backup_dir / f"backup-{90 + index:020d}-future-{index}.db"
-            LibraryDatabase._backup_copy(source_backup, future)
+            shutil.copyfile(source_backup, future)
             connection = sqlite3.connect(future)
             connection.execute(f"PRAGMA user_version = {LibraryDatabase.SCHEMA_VERSION + 1}")
             connection.commit()
@@ -1555,16 +1554,20 @@ class LibraryDatabaseTests(unittest.TestCase):
 
     def test_unindexed_image_scan_recovers_crash_orphan_only(self):
         pictures = self.root / "pictures"
+        markdown = self.root / "markdown"
         pictures.mkdir()
+        markdown.mkdir()
         indexed = pictures / "indexed.png"
         orphan = pictures / "orphan.png"
         Image.new("RGB", (10, 10), "#123456").save(indexed)
         Image.new("RGB", (12, 8), "#654321").save(orphan)
 
-        with patch("clipsave_app.database.PICTURE_DIR", pictures):
+        with patch("clipsave_app.database.PICTURE_DIR", pictures), patch(
+            "clipsave_app.database.MARKDOWN_DIR", markdown
+        ):
             self.assertTrue(self.database.import_file(indexed, "image"))
-            self.assertEqual(self.database.scan_unindexed_images(), 1)
-            self.assertEqual(self.database.scan_unindexed_images(), 0)
+            self.assertEqual(self.database.scan_unindexed_files(), 1)
+            self.assertEqual(self.database.scan_unindexed_files(), 0)
 
         paths = {Path(row["path"]) for row in self.database.query_items(kind="image")}
         self.assertEqual(paths, {indexed.resolve(), orphan.resolve()})
@@ -1714,7 +1717,6 @@ class LibraryDatabaseTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([(row["id"], row["missing"]) for row in rows], [(first_id, 1), (second_id, 0)])
         self.assertEqual(rows[0]["notes"], "preserve missing metadata")
-        self.assertTrue(self.database.has_content_hash(LibraryDatabase.text_hash("reusable"), "text"))
 
     def test_same_path_update_can_claim_hash_owned_only_by_missing_row(self):
         current = self.root / "current.md"
@@ -2123,7 +2125,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         self.assertIsNone(self.database.create_backup_if_changed())
 
         self.database.add_text("first periodic backup")
-        first_generation = self.database.mutation_generation
+        first_generation = self.database.backup_state()["generation"]
         first_backup = self.database.create_backup_if_changed()
         self.assertIsNotNone(first_backup)
         self.assertNotEqual(first_backup, initial_path)
@@ -2160,7 +2162,7 @@ class LibraryDatabaseTests(unittest.TestCase):
     def test_current_schema_backup_validation_rejects_missing_index_and_foreign_keys(self):
         valid = self.database.create_backup()
         invalid_index = self.root / "invalid-index.db"
-        LibraryDatabase._backup_copy(valid, invalid_index)
+        shutil.copyfile(valid, invalid_index)
         connection = sqlite3.connect(invalid_index)
         connection.execute("DROP INDEX idx_items_kind")
         connection.commit()
@@ -2169,7 +2171,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         self.assertFalse(LibraryDatabase._backup_is_usable(invalid_index))
 
         invalid_foreign_keys = self.root / "invalid-foreign-keys.db"
-        LibraryDatabase._backup_copy(valid, invalid_foreign_keys)
+        shutil.copyfile(valid, invalid_foreign_keys)
         connection = sqlite3.connect(invalid_foreign_keys)
         connection.execute("DROP TABLE item_tags")
         connection.execute(
@@ -2185,7 +2187,7 @@ class LibraryDatabaseTests(unittest.TestCase):
         self.assertFalse(LibraryDatabase._backup_is_usable(invalid_foreign_keys))
 
         invalid_global_hash = self.root / "invalid-global-hash.db"
-        LibraryDatabase._backup_copy(valid, invalid_global_hash)
+        shutil.copyfile(valid, invalid_global_hash)
         connection = sqlite3.connect(invalid_global_hash)
         connection.execute(
             "CREATE UNIQUE INDEX legacy_global_content_hash ON items(content_hash)"

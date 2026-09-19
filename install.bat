@@ -45,9 +45,6 @@ if errorlevel 1 (
 .venv\Scripts\python.exe -m pip install --require-hashes -r requirements-windows.lock --progress-bar off
 if errorlevel 1 goto :failed
 
-.venv\Scripts\python.exe -m pip uninstall --yes pyperclip
-if errorlevel 1 goto :failed
-
 .venv\Scripts\python.exe -m pip check
 if errorlevel 1 goto :failed
 

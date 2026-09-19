@@ -455,25 +455,6 @@ def delete_managed_file(
         _close_handle(handle)
 
 
-def verify_managed_file(
-    path: Path,
-    managed_root: Path = LIBRARY_DIR,
-    *,
-    expected_sha256: str | None = None,
-    expected_size: int | None = None,
-) -> None:
-    with open_managed_binary(path, "rb", managed_root) as source:
-        digest = hashlib.sha256()
-        total = 0
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-            total += len(chunk)
-    if expected_size is not None and total != expected_size:
-        raise RuntimeError("Managed file size changed before operation")
-    if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
-        raise RuntimeError("Managed file content changed before operation")
-
-
 def recycle_managed_file(
     path: Path,
     managed_root: Path,

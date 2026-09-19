@@ -346,7 +346,6 @@ class LibraryDatabase:
         self._last_backup_error: str | None = None
         self._database_leaf_lock: _SQLiteLeafLock | None = None
         self._sidecar_leaf_locks: list[_SQLiteLeafLock] = []
-        self.repair_report = {"duplicate_path_groups": 0, "duplicate_path_rows": 0}
         self.recovery_report = {
             "action": "none",
             "backup_path": None,
@@ -796,46 +795,6 @@ class LibraryDatabase:
                     f"Could not securely remove untrusted publication: {quarantine}"
                 )
 
-    @classmethod
-    def _backup_copy(cls, source_path: Path, destination_path: Path) -> None:
-        with storage.hold_managed_directory(source_path.parent), storage.hold_managed_directory(
-            destination_path.parent
-        ), storage.open_managed_binary(
-            source_path, "rb", source_path.parent, identity_locked=True
-        ) as source_file:
-            storage.validate_managed_write_path(source_path, source_path.parent)
-            storage.validate_managed_write_path(destination_path, destination_path.parent)
-            cls._verify_locked_file_identity(source_path, source_file)
-            destination_created = not destination_path.exists()
-            destination_lock = _SQLiteLeafLock.acquire(
-                destination_path,
-                destination_path.parent,
-                create=destination_created,
-                writable=True,
-            )
-            source = None
-            destination = None
-            copied = False
-            try:
-                source = sqlite3.connect(
-                    f"{source_path.resolve().as_uri()}?mode=ro", uri=True
-                )
-                cls._verify_locked_file_identity(source_path, source_file)
-                destination = sqlite3.connect(destination_path)
-                destination_lock.verify()
-                source.backup(destination)
-                destination_lock.verify()
-                cls._verify_locked_file_identity(source_path, source_file)
-                copied = True
-            finally:
-                if destination is not None:
-                    destination.close()
-                if source is not None:
-                    source.close()
-                destination_lock.close()
-                if destination_created and not copied:
-                    destination_lock.remove_created_path()
-
     def _restore_backup(self, backup_path: Path) -> None:
         temporary = self.path.with_name(f".{self.path.name}.restore-{self._timestamp()}.tmp")
         try:
@@ -1051,11 +1010,6 @@ class LibraryDatabase:
                 return None
         return self.create_backup()
 
-    @property
-    def mutation_generation(self) -> int:
-        with self._lock:
-            return self._mutation_generation
-
     def backup_state(self) -> dict[str, object]:
         with self._lock:
             return {
@@ -1150,7 +1104,7 @@ class LibraryDatabase:
                         self._migrate_v4_to_v5_locked()
                         version = 5
                     self.connection.execute(f"PRAGMA user_version = {version}")
-            self.repair_report = self._repair_resolved_paths_locked()
+            self._repair_resolved_paths_locked()
             self._validate_schema()
             self.connection.commit()
 
@@ -1576,38 +1530,18 @@ class LibraryDatabase:
             raise ValueError("Embedding metadata must include provider, model and a positive revision")
         return json.dumps(values), str(provider), str(model), len(values), revision
 
-    def _repair_resolved_paths_locked(self, refresh_all: bool = False) -> dict[str, int]:
-        where = "path IS NOT NULL" if refresh_all else "path IS NOT NULL AND resolved_path IS NULL"
+    def _repair_resolved_paths_locked(self) -> None:
         rows = self.connection.execute(
-            f"SELECT id, path, resolved_path FROM items WHERE {where}"
+            "SELECT id, path FROM items WHERE path IS NOT NULL AND resolved_path IS NULL"
         ).fetchall()
         for row in rows:
             try:
                 resolved_path = self._path_key(row["path"])
             except (OSError, RuntimeError, ValueError):
                 continue
-            if row["resolved_path"] != resolved_path:
-                self.connection.execute(
-                    "UPDATE items SET resolved_path=? WHERE id=?", (resolved_path, row["id"])
-                )
-        duplicates = self.connection.execute(
-            """
-            SELECT COUNT(*) amount
-            FROM items
-            WHERE resolved_path IS NOT NULL
-            GROUP BY resolved_path
-            HAVING COUNT(*) > 1
-            """
-        ).fetchall()
-        return {
-            "duplicate_path_groups": len(duplicates),
-            "duplicate_path_rows": sum(int(row["amount"]) for row in duplicates),
-        }
-
-    def repair_paths(self) -> dict[str, int]:
-        with self._transaction():
-            self.repair_report = self._repair_resolved_paths_locked(refresh_all=True)
-            return dict(self.repair_report)
+            self.connection.execute(
+                "UPDATE items SET resolved_path=? WHERE id=?", (resolved_path, row["id"])
+            )
 
     @staticmethod
     def file_hash(path: Path) -> str:
@@ -1620,38 +1554,6 @@ class LibraryDatabase:
     @staticmethod
     def text_hash(text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def _iter_safe_files(cls, root: Path, suffixes: Iterable[str]) -> Iterator[Path]:
-        safe_iterator = getattr(storage, "iter_safe_files", None)
-        if safe_iterator is not None:
-            yield from safe_iterator(root, suffixes)
-            return
-        normalized_suffixes = {suffix.lower() for suffix in suffixes}
-        pending = [Path(root)]
-        while pending:
-            directory = pending.pop()
-            try:
-                entries = list(os.scandir(directory))
-            except OSError:
-                continue
-            for entry in entries:
-                try:
-                    stat_result = entry.stat(follow_symlinks=False)
-                    is_reparse_point = bool(
-                        getattr(stat_result, "st_file_attributes", 0) & 0x0400
-                    )
-                    is_junction = bool(
-                        getattr(entry, "is_junction", lambda: False)()
-                    )
-                    if entry.is_symlink() or is_reparse_point or is_junction:
-                        continue
-                    if entry.is_dir(follow_symlinks=False):
-                        pending.append(Path(entry.path))
-                    elif entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in normalized_suffixes:
-                        yield Path(entry.path)
-                except OSError:
-                    continue
 
     @staticmethod
     def _remove_failed_copy(
@@ -1754,7 +1656,7 @@ class LibraryDatabase:
         scanned = 0
         failures = 0
         errors: list[str] = []
-        for path in self._iter_safe_files(PICTURE_DIR, self.IMAGE_SUFFIXES):
+        for path in storage.iter_safe_files(PICTURE_DIR, self.IMAGE_SUFFIXES):
             if cancel_event is not None and cancel_event.is_set():
                 self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
                 return added
@@ -1765,7 +1667,7 @@ class LibraryDatabase:
                 failures += 1
                 if len(errors) < 8:
                     errors.append(f"{path.name}: {exc}")
-        for path in self._iter_safe_files(MARKDOWN_DIR, (".md",)):
+        for path in storage.iter_safe_files(MARKDOWN_DIR, (".md",)):
             if cancel_event is not None and cancel_event.is_set():
                 self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
                 return added
@@ -1786,12 +1688,6 @@ class LibraryDatabase:
                 (MARKDOWN_DIR, (".md",), "markdown"),
             ),
             cancel_event,
-        )
-
-    def scan_unindexed_images(self, cancel_event: threading.Event | None = None) -> int:
-        """Compatibility wrapper that retains the original image-only behavior."""
-        return self._scan_unindexed_roots(
-            ((PICTURE_DIR, self.IMAGE_SUFFIXES, "image"),), cancel_event
         )
 
     def _scan_unindexed_roots(
@@ -1817,7 +1713,7 @@ class LibraryDatabase:
         failures = 0
         errors: list[str] = []
         for root, suffixes, kind in roots:
-            for path in self._iter_safe_files(root, suffixes):
+            for path in storage.iter_safe_files(root, suffixes):
                 if cancel_event is not None and cancel_event.is_set():
                     self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
                     return added
@@ -2153,15 +2049,6 @@ class LibraryDatabase:
                 ),
             )
             return int(cursor.lastrowid) if cursor.rowcount == 1 else None
-
-    def has_content_hash(self, content_hash: str, kind: str | None = None) -> bool:
-        with self._lock:
-            if kind is None:
-                return self.connection.execute(
-                    "SELECT 1 FROM items WHERE content_hash=? AND missing=0 LIMIT 1",
-                    (content_hash,),
-                ).fetchone() is not None
-            return self._live_hash_owner_locked(content_hash, kind) is not None
 
     def query_items(
         self,
@@ -2526,23 +2413,6 @@ class LibraryDatabase:
                 (text, item_id, expected_content_hash),
             )
             return cursor.rowcount == 1
-
-    def embedded_items(
-        self,
-        *,
-        embedding_provider: str | None = None,
-        embedding_model: str | None = None,
-        embedding_dimensions: int | None = None,
-        embedding_revision: int | None = None,
-    ) -> list[sqlite3.Row]:
-        clauses, parameters = self._embedding_filter(
-            embedding_provider, embedding_model, embedding_dimensions, embedding_revision
-        )
-        with self._lock:
-            return list(self.connection.execute(
-                f"SELECT id,embedding FROM items WHERE {' AND '.join(clauses)}",
-                parameters,
-            ).fetchall())
 
     @staticmethod
     def _embedding_filter(

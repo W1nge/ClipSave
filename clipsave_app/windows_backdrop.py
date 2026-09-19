@@ -50,10 +50,6 @@ class WindowsCompositionBackdropBridge:
         self._last_error: int | None = None
 
     @property
-    def attached_hwnd(self) -> int | None:
-        return self._attached_hwnd
-
-    @property
     def last_error(self) -> int | None:
         if self._bridge is not None:
             try:
@@ -62,15 +58,6 @@ class WindowsCompositionBackdropBridge:
             except (AttributeError, OSError, TypeError, ValueError):
                 pass
         return self._last_error
-
-    @property
-    def last_stage(self) -> int | None:
-        if self._bridge is None:
-            return None
-        try:
-            return int(self._bridge.clipsave_acrylic_last_stage())
-        except (AttributeError, OSError, TypeError, ValueError):
-            return None
 
     def _same_thread(self) -> bool:
         if self._owner_thread_id is None:
@@ -87,14 +74,10 @@ class WindowsCompositionBackdropBridge:
         bridge.clipsave_acrylic_attach.restype = ctypes.c_int
         bridge.clipsave_acrylic_set_theme.argtypes = [ctypes.c_int]
         bridge.clipsave_acrylic_set_theme.restype = ctypes.c_int
-        bridge.clipsave_acrylic_set_input_active.argtypes = [ctypes.c_int]
-        bridge.clipsave_acrylic_set_input_active.restype = ctypes.c_int
         bridge.clipsave_acrylic_detach.argtypes = []
         bridge.clipsave_acrylic_detach.restype = ctypes.c_int
         bridge.clipsave_acrylic_last_error.argtypes = []
         bridge.clipsave_acrylic_last_error.restype = ctypes.c_int
-        bridge.clipsave_acrylic_last_stage.argtypes = []
-        bridge.clipsave_acrylic_last_stage.restype = ctypes.c_int
 
     def _ensure_loaded(self) -> bool:
         if os.name != "nt":
@@ -177,22 +160,6 @@ class WindowsCompositionBackdropBridge:
             self._last_error = self.last_error
         return success
 
-    def set_input_active(self, active: bool) -> bool:
-        if self._bridge is None or self._attached_hwnd is None:
-            return True
-        if not self._same_thread():
-            return False
-        try:
-            success = bool(
-                self._bridge.clipsave_acrylic_set_input_active(1 if active else 0)
-            )
-        except (AttributeError, OSError, TypeError, ValueError) as exc:
-            self._last_error = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
-            return False
-        if not success:
-            self._last_error = self.last_error
-        return success
-
     def detach(self) -> bool:
         if self._bridge is None or self._attached_hwnd is None:
             self._attached_hwnd = None
@@ -215,20 +182,8 @@ class WindowsCompositionBackdropBridge:
 _WINDOWS_COMPOSITION_BACKDROP = WindowsCompositionBackdropBridge()
 
 
-def windows_composition_backdrop_supported() -> bool:
-    return _WINDOWS_COMPOSITION_BACKDROP.is_supported()
-
-
 def attach_windows_composition_backdrop(hwnd: int, dark: bool) -> bool:
     return _WINDOWS_COMPOSITION_BACKDROP.attach(hwnd, dark)
-
-
-def set_windows_composition_backdrop_theme(dark: bool) -> bool:
-    return _WINDOWS_COMPOSITION_BACKDROP.set_theme(dark)
-
-
-def set_windows_composition_backdrop_input_active(active: bool) -> bool:
-    return _WINDOWS_COMPOSITION_BACKDROP.set_input_active(active)
 
 
 def detach_windows_composition_backdrop() -> bool:
@@ -237,7 +192,3 @@ def detach_windows_composition_backdrop() -> bool:
 
 def windows_composition_backdrop_error() -> int | None:
     return _WINDOWS_COMPOSITION_BACKDROP.last_error
-
-
-def windows_composition_backdrop_stage() -> int | None:
-    return _WINDOWS_COMPOSITION_BACKDROP.last_stage
