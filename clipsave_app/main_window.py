@@ -36,6 +36,10 @@ from .constants import APP_NAME, LIBRARY_DIR
 from .database import LibraryDatabase
 from .detail_animation_controller import DetailAnimationController
 from .library_controller import LibraryController
+from .library_metadata_controller import (
+    LibraryMetadataController,
+    MetadataMutationResult,
+)
 from .library_models import LibraryQuery, LibraryViewState
 from .maintenance_controller import LibraryMaintenanceController
 from .image_task_controller import ImageTaskController
@@ -510,6 +514,7 @@ class MainWindow(QMainWindow):
             self._task_supervisor,
             parent=self,
         )
+        self.library_metadata_controller = LibraryMetadataController(database)
         self.library_controller.refresh_succeeded.connect(self._library_refresh_succeeded)
         self.library_controller.refresh_failed.connect(self._library_refresh_failed)
         self.library_controller.search_succeeded.connect(self._item_search_succeeded)
@@ -1906,8 +1911,10 @@ class MainWindow(QMainWindow):
         self.show_status("删除失败：内容未能删除")
 
     def set_favorite(self, item_id: int, value: bool) -> None:
-        if not self._run_database_action(
-            lambda: self.database.set_favorite(item_id, value), "收藏更新失败", "收藏状态未保存"
+        if not self._handle_metadata_result(
+            self.library_metadata_controller.set_favorite(item_id, value),
+            "收藏更新失败",
+            "收藏状态未保存",
         ):
             return
         self._refresh_after_mutation()
@@ -1915,8 +1922,10 @@ class MainWindow(QMainWindow):
             self.update_detail(item_id)
 
     def save_notes(self, item_id: int, notes: str) -> bool:
-        if not self._run_database_action(
-            lambda: self.database.set_notes(item_id, notes), "备注保存失败", "备注未保存"
+        if not self._handle_metadata_result(
+            self.library_metadata_controller.set_notes(item_id, notes),
+            "备注保存失败",
+            "备注未保存",
         ):
             return False
         self.detail.mark_notes_saved(item_id, notes)
@@ -1928,8 +1937,10 @@ class MainWindow(QMainWindow):
     def add_collection(self) -> None:
         name, ok = QInputDialog.getText(self, "新建集合", "集合名称")
         if ok and name.strip():
-            if not self._run_database_action(
-                lambda: self.database.create_collection(name.strip()), "集合创建失败", "集合未创建"
+            if not self._handle_metadata_result(
+                self.library_metadata_controller.create_collection(name.strip()),
+                "集合创建失败",
+                "集合未创建",
             ):
                 return
             self._refresh_after_mutation()
@@ -1950,8 +1961,8 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        if not self._run_database_action(
-            lambda: self.database.delete_collection(collection_id),
+        if not self._handle_metadata_result(
+            self.library_metadata_controller.delete_collection(collection_id),
             "集合删除失败",
             "集合未删除",
         ):
@@ -1971,8 +1982,8 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        if not self._run_database_action(
-            lambda: self.database.delete_tag(tag_id),
+        if not self._handle_metadata_result(
+            self.library_metadata_controller.delete_tag(tag_id),
             "标签删除失败",
             "标签未删除",
         ):
@@ -1992,16 +2003,20 @@ class MainWindow(QMainWindow):
     def add_tag_to_item(self, item_id: int) -> None:
         name, ok = QInputDialog.getText(self, "添加标签", "标签名称")
         if ok and name.strip():
-            if not self._run_database_action(
-                lambda: self.database.add_tag(item_id, name.strip()), "标签添加失败", "标签未添加"
+            if not self._handle_metadata_result(
+                self.library_metadata_controller.add_tag(item_id, name.strip()),
+                "标签添加失败",
+                "标签未添加",
             ):
                 return
             self._refresh_after_mutation()
             self.update_detail(item_id)
 
     def remove_tag_from_item(self, item_id: int, name: str) -> None:
-        if not self._run_database_action(
-            lambda: self.database.remove_tag(item_id, name), "标签移除失败", "标签未移除"
+        if not self._handle_metadata_result(
+            self.library_metadata_controller.remove_tag(item_id, name),
+            "标签移除失败",
+            "标签未移除",
         ):
             return
         self._refresh_after_mutation()
@@ -2009,8 +2024,10 @@ class MainWindow(QMainWindow):
             self.update_detail(item_id)
 
     def set_item_collection(self, item_id: int, collection_id) -> None:
-        if not self._run_database_action(
-            lambda: self.database.set_collection(item_id, collection_id), "集合更新失败", "集合未更新"
+        if not self._handle_metadata_result(
+            self.library_metadata_controller.set_collection(item_id, collection_id),
+            "集合更新失败",
+            "集合未更新",
         ):
             if self.current_item_id == item_id:
                 self.update_detail(item_id)
@@ -2021,14 +2038,17 @@ class MainWindow(QMainWindow):
     def _refresh_after_mutation(self) -> None:
         self._refresh_library_async()
 
-    def _run_database_action(self, action, title: str, status: str) -> bool:
-        try:
-            action()
+    def _handle_metadata_result(
+        self,
+        result: MetadataMutationResult,
+        title: str,
+        status: str,
+    ) -> bool:
+        if result.succeeded:
             return True
-        except Exception as exc:
-            QMessageBox.warning(self, title, str(exc))
-            self.show_status(status)
-            return False
+        QMessageBox.warning(self, title, str(result.error))
+        self.show_status(status)
+        return False
 
     def import_files(self, parent=None) -> None:
         if self._closing or self._quit_in_progress:
