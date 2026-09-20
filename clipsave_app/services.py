@@ -83,6 +83,8 @@ class AIService(_BaseAIService):
     """Compatibility facade retaining services-level dependency patch seams."""
 
     def _picture_root(self) -> Path:
+        if self.picture_root is not None:
+            return self.picture_root
         return PICTURE_DIR
 
     def _preflight_image(self, path: Path) -> ImageFileSnapshot:

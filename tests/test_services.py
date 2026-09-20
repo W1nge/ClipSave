@@ -316,11 +316,13 @@ class ClipboardServiceTests(unittest.TestCase):
         clipboard.text.return_value = "current"
         self.service.clipboard_sequence = lambda: 42
         self.service.notifier.start = Mock(return_value=True)
+        notifier_window = object()
+        self.service.set_notifier_window(notifier_window)
 
         with patch("clipsave_app.services.QApplication.clipboard", return_value=clipboard):
             self.service.start()
 
-        self.service.notifier.start.assert_called_once_with(self.service.parent())
+        self.service.notifier.start.assert_called_once_with(notifier_window)
         self.assertEqual(self.service.timer.interval(), self.service.EVENT_FALLBACK_INTERVAL_MS)
         self.assertTrue(self.service.timer.isActive())
 
@@ -933,6 +935,19 @@ class ClipboardServiceTests(unittest.TestCase):
 
 
 class AIServiceTests(unittest.TestCase):
+    def test_explicit_picture_root_overrides_compatibility_default(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            explicit_root = Path(temporary) / "Pictures"
+            service = AIService(
+                "http://localhost/v1",
+                "",
+                "vision",
+                picture_root=explicit_root,
+            )
+
+            with patch("clipsave_app.services.PICTURE_DIR", Path(temporary) / "Other"):
+                self.assertEqual(service._picture_root(), explicit_root)
+
     def test_preflight_rejects_truncated_image_payload(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "truncated.jpg"

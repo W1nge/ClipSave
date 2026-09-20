@@ -151,7 +151,11 @@ class MainWindowTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(self.window.detail.isVisible())
 
-        dialog = SettingsDialog(self.settings, self.window)
+        dialog = SettingsDialog(
+            self.settings,
+            self.window,
+            bulk_progress_provider=self.window.bulk_image_progress_snapshot,
+        )
         self.assertTrue(dialog.windowFlags() & Qt.WindowType.FramelessWindowHint)
         self.assertEqual(dialog.objectName(), "FluentDialog")
         self.assertEqual(dialog.layout().contentsMargins().left(), 1)
@@ -204,7 +208,11 @@ class MainWindowTests(unittest.TestCase):
         generate_description.assert_called_once_with(item_id, automatic=True)
 
     def test_settings_persist_automatic_image_options(self):
-        dialog = SettingsDialog(self.settings, self.window)
+        dialog = SettingsDialog(
+            self.settings,
+            self.window,
+            global_hotkey_registered=self.window.global_hotkey_registered,
+        )
         dialog.base_url.setText("http://localhost/v1")
         dialog.vision_model.setText("vision")
         dialog.auto_ocr.setChecked(True)
@@ -217,8 +225,18 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.settings.get("ai_base_url"), "http://localhost/v1")
         self.assertEqual(self.settings.get("ai_vision_model"), "vision")
 
+    def test_ai_service_uses_database_picture_root(self):
+        self.assertEqual(
+            self.window._ai_service()._picture_root(),
+            self.database.picture_dir,
+        )
+
     def test_settings_reject_automatic_image_options_without_vision_config(self):
-        dialog = SettingsDialog(self.settings, self.window)
+        dialog = SettingsDialog(
+            self.settings,
+            self.window,
+            bulk_progress_provider=self.window.bulk_image_progress_snapshot,
+        )
         dialog.auto_ocr.setChecked(True)
 
         with patch("clipsave_app.widgets.QMessageBox.warning") as warning:
@@ -234,7 +252,11 @@ class MainWindowTests(unittest.TestCase):
         image.fill(QColor("white"))
         self.assertTrue(image.save(str(image_path), "PNG"))
         self.database.add_image(image_path)
-        dialog = SettingsDialog(self.settings, self.window)
+        dialog = SettingsDialog(
+            self.settings,
+            self.window,
+            global_hotkey_registered=self.window.global_hotkey_registered,
+        )
         dialog.base_url.setText("http://localhost/v1")
         dialog.vision_model.setText("vision")
 
@@ -362,7 +384,11 @@ class MainWindowTests(unittest.TestCase):
             "error": "AI 服务返回 429",
         }
 
-        dialog = SettingsDialog(self.settings, self.window)
+        dialog = SettingsDialog(
+            self.settings,
+            self.window,
+            bulk_progress_provider=self.window.bulk_image_progress_snapshot,
+        )
         dialog._refresh_bulk_progress()
 
         self.assertEqual(dialog.bulk_progress.value(), 7)
@@ -1274,6 +1300,31 @@ class MainWindowTests(unittest.TestCase):
 
         collections.assert_called_once_with()
 
+    def test_navigation_uses_cached_metadata_without_gui_thread_database_queries(self):
+        item_id = self.window.current_items[0]["id"]
+        collection_id = self.database.create_collection("Cached collection")
+        tag_id = self.database.add_tag(item_id, "Cached tag")
+        self.window._refresh_navigation_metadata()
+
+        with patch.object(
+            self.database,
+            "collections",
+            side_effect=AssertionError("collections queried during navigation"),
+        ), patch.object(
+            self.database,
+            "tags",
+            side_effect=AssertionError("tags queried during navigation"),
+        ), patch.object(
+            self.database,
+            "days",
+            side_effect=AssertionError("days queried during navigation"),
+        ), patch.object(DateDialog, "exec", return_value=0):
+            self.window.navigate("collection", collection_id)
+            self.window.navigate("tag", tag_id)
+            self.window.navigate("date", None)
+
+        self.assertEqual(self.window.page_title.text(), "标签：Cached tag")
+
     def test_debounced_search_query_runs_off_the_gui_thread(self):
         second_id = self.database.add_text("asynchronous needle")
         started = threading.Event()
@@ -2152,10 +2203,32 @@ class MainWindowTests(unittest.TestCase):
 
     def test_settings_reports_global_hotkey_registration_failure(self):
         self.window.global_hotkey_registered = False
-        dialog = SettingsDialog(self.settings, self.window)
+        dialog = SettingsDialog(
+            self.settings,
+            self.window,
+            global_hotkey_registered=self.window.global_hotkey_registered,
+        )
 
         self.assertIn("注册失败", dialog.hotkey_status.text())
         dialog.close()
+
+    def test_open_settings_uses_active_storage_paths(self):
+        captured = {}
+
+        def inspect_dialog(dialog):
+            captured["library"] = dialog.library_path_label.text()
+            captured["data"] = dialog.data_path_label.text()
+            return 0
+
+        with patch.object(
+            self.window,
+            "_exec_transient_dialog",
+            side_effect=inspect_dialog,
+        ):
+            self.window.open_settings()
+
+        self.assertEqual(captured["library"], str(self.database.library_dir))
+        self.assertEqual(captured["data"], str(self.settings.path.parent))
 
     def test_settings_applies_start_with_windows_change(self):
         def enable_startup(dialog):
@@ -2200,7 +2273,7 @@ class MainWindowTests(unittest.TestCase):
         image.fill(QColor("#21a8fb"))
         self.assertTrue(image.save(str(image_path)))
         image_id = self.database.add_image(image_path)
-        with patch("clipsave_app.main_window.is_under_local_store", return_value=True), patch(
+        with patch.object(self.database, "is_managed_path", return_value=True), patch(
             "clipsave_app.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes
         ), patch(
             "clipsave_app.main_window.recycle_managed_file",
@@ -2239,7 +2312,7 @@ class MainWindowTests(unittest.TestCase):
             release.wait(2)
 
         try:
-            with patch("clipsave_app.main_window.is_under_local_store", return_value=True), patch(
+            with patch.object(self.database, "is_managed_path", return_value=True), patch(
                 "clipsave_app.main_window.QMessageBox.question",
                 return_value=QMessageBox.StandardButton.Yes,
             ), patch("clipsave_app.main_window.recycle_managed_file", side_effect=slow_recycle):
@@ -2266,7 +2339,7 @@ class MainWindowTests(unittest.TestCase):
         self.window.refresh_library()
         self.window.select_item(image_id)
 
-        with patch("clipsave_app.main_window.is_under_local_store", return_value=True), patch(
+        with patch.object(self.database, "is_managed_path", return_value=True), patch(
             "clipsave_app.main_window.QMessageBox.question",
             return_value=QMessageBox.StandardButton.Yes,
         ), patch(
@@ -2291,7 +2364,7 @@ class MainWindowTests(unittest.TestCase):
         self.window.image_task_controller.ai_requests[image_id] = ai_request
         self.window.image_task_controller.ocr_requests[image_id] = ocr_request
 
-        with patch("clipsave_app.main_window.is_under_local_store", return_value=True), patch(
+        with patch.object(self.database, "is_managed_path", return_value=True), patch(
             "clipsave_app.main_window.QMessageBox.question",
             return_value=QMessageBox.StandardButton.Yes,
         ), patch("clipsave_app.main_window.recycle_managed_file"), patch.object(
@@ -2317,7 +2390,7 @@ class MainWindowTests(unittest.TestCase):
         image_id = self.database.add_image(image_path)
         self.window.refresh_library()
 
-        with patch("clipsave_app.main_window.is_under_local_store", return_value=True), patch(
+        with patch.object(self.database, "is_managed_path", return_value=True), patch(
             "clipsave_app.main_window.QMessageBox.question",
             return_value=QMessageBox.StandardButton.Yes,
         ), patch("clipsave_app.main_window.recycle_managed_file"), patch.object(

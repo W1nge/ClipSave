@@ -10,7 +10,7 @@ from pathlib import Path
 
 from send2trash import send2trash
 
-from .constants import LIBRARY_DIR, MAINTENANCE_DIR
+from .constants import MAINTENANCE_DIR
 from .database import LibraryDatabase
 from .storage import delete_managed_file, is_under_local_store, iter_safe_files, recycle_managed_file
 
@@ -64,9 +64,23 @@ def _file_snapshot(path: Path) -> dict:
 
 def scan_orphans(
     database: LibraryDatabase,
-    library_dir: Path = LIBRARY_DIR,
-    output_dir: Path = MAINTENANCE_DIR,
+    library_dir: Path | None = None,
+    output_dir: Path | None = None,
 ) -> tuple[Path, dict]:
+    library_dir = (
+        Path(library_dir)
+        if library_dir is not None
+        else database.library_dir
+    )
+    output_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else (
+            database.paths.maintenance_dir
+            if database.paths is not None
+            else MAINTENANCE_DIR
+        )
+    )
     indexed = []
     referenced_paths = set()
     indexed_hashes = set()
@@ -147,6 +161,8 @@ def clean_indexed_duplicates(
     manifest_path: Path,
     confirmation: str,
     permanent: bool = False,
+    *,
+    library_dir: Path | None = None,
 ) -> dict:
     expected_confirmation = PERMANENT_CONFIRMATION_PHRASE if permanent else CONFIRMATION_PHRASE
     if confirmation != expected_confirmation:
@@ -175,10 +191,18 @@ def clean_indexed_duplicates(
         ):
             raise ValueError("Maintenance manifest contains an invalid deletion record")
 
+    expected_library = (
+        Path(library_dir)
+        if library_dir is not None
+        else database.library_dir
+    ).resolve()
     manifest_library = report.get("library_dir")
-    if not isinstance(manifest_library, str) or _path_key(manifest_library) != _path_key(LIBRARY_DIR):
+    if (
+        not isinstance(manifest_library, str)
+        or _path_key(manifest_library) != _path_key(expected_library)
+    ):
         raise ValueError("Maintenance manifest belongs to a different library")
-    library_root = Path(manifest_library).resolve()
+    library_root = expected_library
 
     result = {
         "mode": "permanent" if permanent else "recycle_bin",
@@ -193,7 +217,11 @@ def clean_indexed_duplicates(
         path_text = record["path"]
         try:
             path = Path(path_text)
-            if not is_under_local_store(path) or not path.is_file() or path.is_symlink():
+            if (
+                not is_under_local_store(path, library_root)
+                or not path.is_file()
+                or path.is_symlink()
+            ):
                 result["skipped"] += 1
                 continue
             stat = path.stat()
@@ -210,7 +238,7 @@ def clean_indexed_duplicates(
                     continue
                 indexed_path = indexed.path
                 if (
-                    not is_under_local_store(indexed_path)
+                    not is_under_local_store(indexed_path, library_root)
                     or _path_key(indexed_path) == _path_key(path)
                 ):
                     result["skipped"] += 1
@@ -218,7 +246,7 @@ def clean_indexed_duplicates(
                 final_stat = path.stat()
                 if (
                     indexed.size_bytes != record["size"]
-                    or not is_under_local_store(path)
+                    or not is_under_local_store(path, library_root)
                     or final_stat.st_size != stat.st_size
                     or final_stat.st_mtime_ns != stat.st_mtime_ns
                     or getattr(final_stat, "st_ino", None) != getattr(stat, "st_ino", None)

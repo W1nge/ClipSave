@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -31,6 +32,26 @@ class ImageOperationCompletion:
     error: str | None = None
 
 
+class ImageOperationPreparationState(Enum):
+    READY = "ready"
+    DATABASE_UNAVAILABLE = "database_unavailable"
+    INVALID_ITEM = "invalid_item"
+    SERVICE_UNCONFIGURED = "service_unconfigured"
+    MISSING_HASH = "missing_hash"
+    ALREADY_RUNNING = "already_running"
+
+
+@dataclass(frozen=True, slots=True)
+class ImageOperationPreparation:
+    state: ImageOperationPreparationState
+    item: object | None = None
+    estimated_bytes: int = 0
+
+    @property
+    def ready(self) -> bool:
+        return self.state is ImageOperationPreparationState.READY
+
+
 class ImageTaskController(QObject):
     ai_succeeded = Signal(object, object, int, str, str)
     ai_failed = Signal(object, object, int, str)
@@ -56,6 +77,84 @@ class ImageTaskController(QObject):
         self.automatic_ai_items: set[int] = set()
         self.automatic_ocr_items: set[int] = set()
         self.expanded_search_request: tuple[object, QObject] | None = None
+
+    def prepare_image_operation(
+        self,
+        item_id: int,
+        service: AIService,
+        *,
+        operation: str,
+        automatic: bool,
+    ) -> ImageOperationPreparation:
+        if self.database is None:
+            return ImageOperationPreparation(
+                ImageOperationPreparationState.DATABASE_UNAVAILABLE
+            )
+        item = self.database.get_item(item_id)
+        if not item or item["kind"] != "image" or not item["path"]:
+            return ImageOperationPreparation(ImageOperationPreparationState.INVALID_ITEM)
+        if not service.configured:
+            return ImageOperationPreparation(
+                ImageOperationPreparationState.SERVICE_UNCONFIGURED,
+                item=item,
+            )
+        if not item["content_hash"]:
+            return ImageOperationPreparation(
+                ImageOperationPreparationState.MISSING_HASH,
+                item=item,
+            )
+
+        requests = self.ai_requests if operation == "ai" else self.ocr_requests
+        if item_id in requests:
+            if automatic:
+                return ImageOperationPreparation(
+                    ImageOperationPreparationState.ALREADY_RUNNING,
+                    item=item,
+                )
+            self.cancel_operation(item_id, operation)
+
+        return ImageOperationPreparation(
+            ImageOperationPreparationState.READY,
+            item=item,
+            estimated_bytes=self._image_task_estimate(item),
+        )
+
+    def automatic_operations_for_item(
+        self,
+        item_id: int,
+        service: AIService,
+        *,
+        auto_ocr: bool,
+        auto_description: bool,
+    ) -> tuple[str, ...]:
+        if self.database is None or not service.configured:
+            return ()
+        item = self.database.get_item(item_id)
+        if not item or item["kind"] != "image" or not item["path"]:
+            return ()
+        operations: list[str] = []
+        if (
+            auto_ocr
+            and not str(item["ocr_text"] or "").strip()
+            and item_id not in self.ocr_requests
+        ):
+            operations.append("ocr")
+        if (
+            auto_description
+            and not str(item["ai_description"] or "").strip()
+            and item_id not in self.ai_requests
+        ):
+            operations.append("ai")
+        return tuple(operations)
+
+    @staticmethod
+    def _image_task_estimate(item) -> int:
+        try:
+            width = max(0, int(item["width"] or 0))
+            height = max(0, int(item["height"] or 0))
+            return width * height * 4
+        except (KeyError, TypeError, ValueError):
+            return 0
 
     def start_image_operation(
         self,

@@ -60,68 +60,81 @@ class ClipboardPersistenceWorker:
 
     def ensure_started(self) -> None:
         with self.lifecycle_lock:
-            worker = self.worker
-            if worker is not None and worker.is_alive():
-                return
             if self.shutdown_complete or not self.accepting_tasks:
                 raise RuntimeError("Clipboard persistence is shut down")
-            self.stop_requested = False
-            self.worker_exited = threading.Event()
-            worker = threading.Thread(
-                target=self._loop,
-                name="ClipSavePersistence",
-                daemon=True,
-            )
-            self.worker = worker
-            worker.start()
+            self._start_worker_locked()
+
+    def _start_worker_locked(self) -> None:
+        worker = self.worker
+        if worker is not None and worker.is_alive():
+            return
+        self.stop_requested = False
+        self.worker_exited = threading.Event()
+        worker = threading.Thread(
+            target=self._loop,
+            name="ClipSavePersistence",
+            daemon=True,
+        )
+        self.worker = worker
+        worker.start()
 
     def enqueue(self, kind: str, value: QImage | str, sequence: int | None) -> None:
-        if not self.accepting_tasks:
-            return
-        self.ensure_started()
-        if sequence is not None:
-            if sequence in self.pending_sequences:
-                return
-        elif self.pending_without_sequence:
-            return
         estimated_bytes = (
             max(value.sizeInBytes(), value.width() * value.height() * 4)
             if kind == "image"
             else len(value.encode("utf-8"))
         )
-        if self.pending_bytes + estimated_bytes > self.memory_budget_bytes:
-            self.report_failure(
-                "剪贴板保存队列占用内存过高；如果内容仍在剪贴板中，ClipSave 会稍后重试。"
-            )
-            return
-        task = ClipboardTask(
-            self.next_task_token,
-            kind,
-            value,
-            sequence,
-            estimated_bytes,
-        )
-        self.next_task_token += 1
-        with self.state_lock:
-            self.idle_event.clear()
-            if sequence is None:
-                self.pending_without_sequence = True
-            else:
-                self.pending_sequences.add(sequence)
-            self.pending_bytes += estimated_bytes
-            try:
-                self.tasks.put_nowait(task)
-            except queue.Full:
-                self.pending_bytes = max(0, self.pending_bytes - estimated_bytes)
-                if sequence is None:
-                    self.pending_without_sequence = False
+        failure_message: str | None = None
+        with self.lifecycle_lock:
+            if not self.accepting_tasks or self.shutdown_complete:
+                return
+            with self.state_lock:
+                if sequence is not None:
+                    if sequence in self.pending_sequences:
+                        return
+                elif self.pending_without_sequence:
+                    return
+                if self.pending_bytes + estimated_bytes > self.memory_budget_bytes:
+                    failure_message = (
+                        "剪贴板保存队列占用内存过高；如果内容仍在剪贴板中，"
+                        "ClipSave 会稍后重试。"
+                    )
                 else:
-                    self.pending_sequences.discard(sequence)
-                if self.tasks.unfinished_tasks == 0:
-                    self.idle_event.set()
-                self.report_failure(
-                    "剪贴板保存队列已满；如果内容仍在剪贴板中，ClipSave 会稍后重试。"
-                )
+                    task = ClipboardTask(
+                        self.next_task_token,
+                        kind,
+                        value,
+                        sequence,
+                        estimated_bytes,
+                    )
+                    self.next_task_token += 1
+                    self.idle_event.clear()
+                    if sequence is None:
+                        self.pending_without_sequence = True
+                    else:
+                        self.pending_sequences.add(sequence)
+                    self.pending_bytes += estimated_bytes
+                    try:
+                        self.tasks.put_nowait(task)
+                    except queue.Full:
+                        self.pending_bytes = max(
+                            0,
+                            self.pending_bytes - estimated_bytes,
+                        )
+                        if sequence is None:
+                            self.pending_without_sequence = False
+                        else:
+                            self.pending_sequences.discard(sequence)
+                        if self.tasks.unfinished_tasks == 0:
+                            self.idle_event.set()
+                        failure_message = (
+                            "剪贴板保存队列已满；如果内容仍在剪贴板中，"
+                            "ClipSave 会稍后重试。"
+                        )
+            if failure_message is None:
+                self._start_worker_locked()
+        if failure_message is not None:
+            self.report_failure(failure_message)
 
     def release_pending(self, task: ClipboardTask) -> None:
         with self.state_lock:
@@ -134,28 +147,17 @@ class ClipboardPersistenceWorker:
                 self.idle_event.set()
 
     def prepare_for_shutdown(self) -> None:
-        self.accepting_tasks = False
+        with self.lifecycle_lock:
+            self.accepting_tasks = False
 
     def resume_after_failed_shutdown(self) -> None:
-        if self.shutdown_complete:
-            return
         with self.lifecycle_lock:
+            if self.shutdown_complete:
+                return
             self.suppress_signals = False
             self.stop_requested = False
-            worker = self.worker
-            if (
-                worker is None
-                or self.worker_exited.is_set()
-                or not worker.is_alive()
-            ):
-                self.worker_exited = threading.Event()
-                self.worker = threading.Thread(
-                    target=self._loop,
-                    name="ClipSavePersistence",
-                    daemon=True,
-                )
-                self.worker.start()
-        self.accepting_tasks = True
+            self.accepting_tasks = True
+            self._start_worker_locked()
 
     def shutdown(
         self,
@@ -163,15 +165,15 @@ class ClipboardPersistenceWorker:
         *,
         wait_for_idle: Callable[[float], bool],
     ) -> bool:
-        if self.shutdown_complete:
-            return True
-        worker = self.worker
-        if worker is None or not worker.is_alive():
-            self.prepare_for_shutdown()
-            self.shutdown_complete = True
-            return True
+        with self.lifecycle_lock:
+            if self.shutdown_complete:
+                return True
+            self.accepting_tasks = False
+            worker = self.worker
+            if worker is None or not worker.is_alive():
+                self.shutdown_complete = True
+                return True
         deadline = time.monotonic() + max(timeout, 0.0)
-        self.prepare_for_shutdown()
         if not wait_for_idle(max(0.0, deadline - time.monotonic())):
             self.suppress_signals = True
             return False

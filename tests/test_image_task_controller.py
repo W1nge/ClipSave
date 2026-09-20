@@ -30,10 +30,14 @@ class FakeService:
 
 
 class FakeDatabase:
-    def __init__(self, *, saved=True, error=None):
+    def __init__(self, *, saved=True, error=None, item=None):
         self.saved = saved
         self.error = error
+        self.item = item
         self.calls = []
+
+    def get_item(self, _item_id):
+        return self.item
 
     def update_ai_if_current(self, item_id, expected_hash, text):
         self.calls.append(("ai", item_id, expected_hash, text))
@@ -292,3 +296,77 @@ class ImageTaskControllerTests(unittest.TestCase):
         self.assertTrue(failed_result.matched)
         self.assertEqual(failed_result.error, "db failed")
         self.assertNotIn(4, failed.ai_requests)
+
+    def test_prepare_image_operation_owns_validation_duplicate_and_estimate(self):
+        item = {
+            "id": 7,
+            "kind": "image",
+            "path": "image.png",
+            "content_hash": "a" * 64,
+            "width": 20,
+            "height": 10,
+        }
+        database = FakeDatabase(item=item)
+        controller = ImageTaskController(TaskSupervisor(), database=database)
+        service = FakeService()
+        service.configured = True
+
+        result = controller.prepare_image_operation(
+            7,
+            service,
+            operation="ai",
+            automatic=False,
+        )
+
+        self.assertTrue(result.ready)
+        self.assertIs(result.item, item)
+        self.assertEqual(result.estimated_bytes, 800)
+
+        token = object()
+        marker = QObject(controller)
+        controller.ai_requests[7] = (token, marker)
+        duplicate = controller.prepare_image_operation(
+            7,
+            service,
+            operation="ai",
+            automatic=True,
+        )
+        self.assertEqual(duplicate.state.value, "already_running")
+
+    def test_automatic_operations_for_item_owns_result_and_request_checks(self):
+        item = {
+            "id": 9,
+            "kind": "image",
+            "path": "image.png",
+            "content_hash": "b" * 64,
+            "ocr_text": "",
+            "ai_description": "",
+        }
+        controller = ImageTaskController(
+            TaskSupervisor(),
+            database=FakeDatabase(item=item),
+        )
+        service = FakeService()
+        service.configured = True
+
+        self.assertEqual(
+            controller.automatic_operations_for_item(
+                9,
+                service,
+                auto_ocr=True,
+                auto_description=True,
+            ),
+            ("ocr", "ai"),
+        )
+
+        controller.ocr_requests[9] = (object(), QObject(controller))
+        item["ai_description"] = "already done"
+        self.assertEqual(
+            controller.automatic_operations_for_item(
+                9,
+                service,
+                auto_ocr=True,
+                auto_description=True,
+            ),
+            (),
+        )

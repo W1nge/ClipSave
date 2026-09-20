@@ -97,17 +97,27 @@ class AIService:
 颜色与风格：说明主要颜色、对比、光线和视觉风格，只写明显事实。
 关键词：给出一行逗号分隔的检索关键词。"""
 
-    def __init__(self, base_url: str, api_key: str, vision_model: str):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        vision_model: str,
+        *,
+        picture_root: Path | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.vision_model = vision_model
+        self.picture_root = (
+            Path(picture_root) if picture_root is not None else None
+        )
 
     @property
     def configured(self) -> bool:
         return bool(self.base_url and self.vision_model)
 
     def _picture_root(self) -> Path:
-        return PICTURE_DIR
+        return self.picture_root if self.picture_root is not None else PICTURE_DIR
 
     def _preflight_image(self, path: Path) -> ImageFileSnapshot:
         return preflight_image_file(path)

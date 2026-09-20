@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QCoreApplication
 
 from clipsave_app.app import SingleInstance
+from clipsave_app.constants import APP_PATHS
 from clipsave_app.database import LibraryDatabase
 from clipsave_app.maintenance import (
     CONFIRMATION_PHRASE,
@@ -25,16 +26,16 @@ def main() -> int:
     parser.add_argument("--permanent", action="store_true", help="Permanently delete instead of using the Recycle Bin")
     args = parser.parse_args()
 
-    qt_app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+    QCoreApplication.instance() or QCoreApplication(sys.argv)
     single = SingleInstance()
     if single._endpoint_is_active() or not single.listen(lambda: None):
         print(json.dumps({"error": "Close ClipSave before running maintenance."}, ensure_ascii=False))
         return 3
 
-    ensure_storage_directories()
-    migrate_legacy_layout()
-    ensure_storage_directories()
-    database = LibraryDatabase()
+    ensure_storage_directories(APP_PATHS)
+    migrate_legacy_layout(APP_PATHS)
+    ensure_storage_directories(APP_PATHS)
+    database = LibraryDatabase(paths=APP_PATHS)
     try:
         if args.apply:
             if args.permanent and args.confirm != PERMANENT_CONFIRMATION_PHRASE:

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+
+from .atomic_files import sync_directory, write_json_temp
 
 
 CHECKPOINT_FILENAME = "bulk-image-job.json"
@@ -112,20 +113,17 @@ def load_checkpoint(path: Path) -> BulkImageCheckpoint | None:
 
 def save_checkpoint(path: Path, checkpoint: BulkImageCheckpoint) -> None:
     _validate_checkpoint(checkpoint)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(checkpoint)
     payload["image_ids"] = list(checkpoint.image_ids)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    temporary = write_json_temp(
+        path,
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
         os.replace(temporary, path)
+        sync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 

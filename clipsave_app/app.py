@@ -10,14 +10,19 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QByteArray, QTimer
+from PySide6.QtCore import QAbstractNativeEventFilter, QByteArray
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
-from PySide6.QtNetwork import QAbstractSocket, QLocalServer, QLocalSocket
+from PySide6.QtNetwork import QAbstractSocket as _QAbstractSocket, QLocalServer, QLocalSocket
+from .smoke_runtime import SmokeLifecycle
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .constants import APP_NAME, APP_PATHS, INSTANCE_SERVER
 from .main_window import MainWindow
 from .runtime import ApplicationRuntime
+from .single_instance import (
+    SingleInstance as _BaseSingleInstance,
+    windows_user_sid as _lookup_windows_user_sid,
+)
 from .storage import ensure_storage_directories, migrate_legacy_layout
 from .startup import set_start_with_windows
 
@@ -25,6 +30,7 @@ from .startup import set_start_with_windows
 SHOW_MESSAGE = b"show\n"
 SHOW_ACK = b"ok\n"
 GLOBAL_HOTKEY_ID = 0x051A
+QAbstractSocket = _QAbstractSocket
 
 
 def _configure_windows_dpi_awareness() -> bool:
@@ -73,75 +79,7 @@ def _current_user_identity() -> str:
 
 
 def _windows_user_sid() -> str:
-    token_query = 0x0008
-    token_user_class = 1
-
-    class SidAndAttributes(ctypes.Structure):
-        _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
-
-    class TokenUser(ctypes.Structure):
-        _fields_ = [("user", SidAndAttributes)]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32.GetCurrentProcess.argtypes = []
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    advapi32.OpenProcessToken.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.HANDLE),
-    ]
-    advapi32.OpenProcessToken.restype = wintypes.BOOL
-    advapi32.GetTokenInformation.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    advapi32.GetTokenInformation.restype = wintypes.BOOL
-    advapi32.ConvertSidToStringSidW.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(wintypes.LPWSTR),
-    ]
-    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
-    token = wintypes.HANDLE()
-    if not advapi32.OpenProcessToken(
-        kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        required = wintypes.DWORD()
-        advapi32.GetTokenInformation(
-            token, token_user_class, None, 0, ctypes.byref(required)
-        )
-        if not required.value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        buffer = ctypes.create_string_buffer(required.value)
-        if not advapi32.GetTokenInformation(
-            token,
-            token_user_class,
-            buffer,
-            required.value,
-            ctypes.byref(required),
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        token_user = ctypes.cast(buffer, ctypes.POINTER(TokenUser)).contents
-        sid_text = wintypes.LPWSTR()
-        if not advapi32.ConvertSidToStringSidW(token_user.user.sid, ctypes.byref(sid_text)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        try:
-            if not sid_text.value:
-                raise RuntimeError("Windows returned an empty current-user SID")
-            return sid_text.value
-        finally:
-            kernel32.LocalFree(sid_text)
-    finally:
-        kernel32.CloseHandle(token)
+    return _lookup_windows_user_sid()
 
 
 def _instance_server_name() -> str:
@@ -262,169 +200,20 @@ class GlobalHotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 
-class SingleInstance:
-    MAX_CLIENTS = 16
-    CLIENT_TIMEOUT_MS = 250
+class SingleInstance(_BaseSingleInstance):
+    """Compatibility facade preserving app-level QtNetwork patch seams."""
 
-    def __init__(self, server_name: str | None = None):
-        self.server_name = server_name or _instance_server_name()
-        self.server = None
-        self._mutex_handle = None
-        self._connections: dict[object, bytearray] = {}
+    @classmethod
+    def _default_server_name(cls) -> str:
+        return _instance_server_name()
 
-    @property
-    def mutex_name(self) -> str:
-        digest = hashlib.sha256(self.server_name.encode("utf-8")).hexdigest()[:32]
-        return f"Global\\ClipSave.Instance.{digest}"
+    @classmethod
+    def _server_api(cls):
+        return QLocalServer
 
-    def _acquire_mutex(self) -> bool:
-        if os.name != "nt":
-            return True
-        if self._mutex_handle is not None:
-            return True
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-        kernel32.CreateMutexW.restype = wintypes.HANDLE
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.CreateMutexW(None, False, self.mutex_name)
-        if not handle:
-            raise ctypes.WinError(ctypes.get_last_error())
-        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-            kernel32.CloseHandle(handle)
-            return False
-        self._mutex_handle = handle
-        return True
-
-    def _release_mutex(self) -> None:
-        if self._mutex_handle is None or os.name != "nt":
-            self._mutex_handle = None
-            return
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle(self._mutex_handle)
-        self._mutex_handle = None
-
-    def close(self) -> None:
-        for connection in list(self._connections):
-            self._close_connection(connection)
-        if self.server is not None:
-            self.server.close()
-            self.server = None
-        self._release_mutex()
-
-    def notify_existing(self) -> bool:
-        socket = QLocalSocket()
-        socket.connectToServer(self.server_name)
-        if not socket.waitForConnected(300):
-            return False
-        written = socket.write(SHOW_MESSAGE)
-        socket.flush()
-        delivered = written == len(SHOW_MESSAGE) and socket.waitForBytesWritten(300)
-        acknowledged = delivered and socket.waitForReadyRead(500) and bytes(socket.readAll()) == SHOW_ACK
-        socket.disconnectFromServer()
-        socket.waitForDisconnected(300)
-        return acknowledged
-
-    @staticmethod
-    def _configure_server(server: QLocalServer) -> None:
-        socket_options = getattr(QLocalServer, "SocketOption", QLocalServer)
-        user_access = getattr(socket_options, "UserAccessOption", None)
-        if user_access is not None:
-            server.setSocketOptions(user_access)
-
-    def _endpoint_is_active(self) -> bool:
-        socket = QLocalSocket()
-        socket.connectToServer(self.server_name)
-        connected = socket.waitForConnected(200)
-        if connected:
-            socket.disconnectFromServer()
-        return connected
-
-    @staticmethod
-    def _address_in_use(server: QLocalServer) -> bool:
-        errors = getattr(QAbstractSocket, "SocketError", QAbstractSocket)
-        address_in_use = getattr(errors, "AddressInUseError", None)
-        return address_in_use is not None and server.serverError() == address_in_use
-
-    @staticmethod
-    def _schedule_connection_delete(connection) -> None:
-        if connection.__dict__.get("_clipsave_delete_scheduled", False):
-            return
-        connection._clipsave_delete_scheduled = True
-        delete_later = getattr(connection, "deleteLater", None)
-        if delete_later is not None:
-            delete_later()
-
-    def _close_connection(self, connection) -> None:
-        if connection not in self._connections:
-            return
-        self._connections.pop(connection, None)
-        connection.disconnectFromServer()
-        self._schedule_connection_delete(connection)
-
-    def _accept_connection(self, connection, callback) -> None:
-        if len(self._connections) >= self.MAX_CLIENTS:
-            connection.disconnectFromServer()
-            self._schedule_connection_delete(connection)
-            return
-        buffer = bytearray()
-        self._connections[connection] = buffer
-
-        def ready_read() -> None:
-            if connection not in self._connections:
-                return
-            buffer.extend(bytes(connection.readAll()))
-            if len(buffer) > len(SHOW_MESSAGE):
-                self._close_connection(connection)
-                return
-            if len(buffer) == len(SHOW_MESSAGE):
-                if _is_show_message(bytes(buffer)):
-                    callback()
-                    connection.write(SHOW_ACK)
-                    connection.flush()
-                self._close_connection(connection)
-
-        connection.readyRead.connect(ready_read)
-        def disconnected() -> None:
-            self._connections.pop(connection, None)
-            self._schedule_connection_delete(connection)
-
-        connection.disconnected.connect(disconnected)
-        QTimer.singleShot(self.CLIENT_TIMEOUT_MS, lambda: self._close_connection(connection))
-        if connection.bytesAvailable():
-            ready_read()
-
-    def listen(self, callback) -> bool:
-        if not self._acquire_mutex():
-            return False
-        server = QLocalServer()
-        self._configure_server(server)
-        if not server.listen(self.server_name):
-            if not self._address_in_use(server) or self._endpoint_is_active():
-                self._release_mutex()
-                return False
-            if not QLocalServer.removeServer(self.server_name):
-                self._release_mutex()
-                return False
-            server = QLocalServer()
-            self._configure_server(server)
-            if not server.listen(self.server_name):
-                self._release_mutex()
-                return False
-        self.server = server
-        self.server.setMaxPendingConnections(self.MAX_CLIENTS)
-
-        def incoming() -> None:
-            while self.server.hasPendingConnections():
-                connection = self.server.nextPendingConnection()
-                if connection is None:
-                    break
-                self._accept_connection(connection, callback)
-
-        self.server.newConnection.connect(incoming)
-        return True
+    @classmethod
+    def _socket_api(cls):
+        return QLocalSocket
 
 
 def main() -> int:
@@ -487,9 +276,9 @@ def main() -> int:
     app.aboutToQuit.connect(single.close)
 
     try:
-        ensure_storage_directories()
-        migration_result = migrate_legacy_layout()
-        ensure_storage_directories()
+        ensure_storage_directories(APP_PATHS)
+        migration_result = migrate_legacy_layout(APP_PATHS)
+        ensure_storage_directories(APP_PATHS)
     except (OSError, RuntimeError) as exc:
         QMessageBox.critical(None, "ClipSave 无法启动", str(exc))
         return 1
@@ -544,110 +333,28 @@ def main() -> int:
     if os.name == "nt" and not registered:
         window.show_error_status("全局快捷键 Ctrl+Alt+V 注册失败，可能已被其他软件占用")
 
-    original_excepthook = sys.excepthook
-    smoke_uncaught_exceptions: list[str] = []
+    smoke_lifecycle = None
     if smoke_ready_path is not None:
-        def smoke_excepthook(exception_type, exception, traceback) -> None:
-            smoke_uncaught_exceptions.append(
-                f"{exception_type.__name__}: {exception}"
-            )
-            original_excepthook(exception_type, exception, traceback)
-
-        sys.excepthook = smoke_excepthook
+        smoke_lifecycle = SmokeLifecycle(
+            app,
+            window,
+            database,
+            smoke_ready_path,
+            smoke_hold_ms,
+            failure=_smoke_failure,
+            backdrop_status=_smoke_backdrop_status,
+            background_idle=_smoke_background_idle,
+        )
+        smoke_lifecycle.install()
 
     window.show()
-    if smoke_ready_path is not None:
-        smoke_attempts = 0
-        smoke_quit_attempts = 0
-        smoke_status_path = smoke_ready_path.with_name(f"{smoke_ready_path.name}.status")
-
-        def quit_smoke() -> None:
-            nonlocal smoke_quit_attempts
-            smoke_quit_attempts += 1
-            quit_started = window.quit_application()
-            try:
-                smoke_status_path.write_text(
-                    _smoke_backdrop_status(window)
-                    + f"quit_returned={quit_started}\nclosing={window._closing}\n"
-                    f"quit_in_progress={window._quit_in_progress}\n"
-                    f"quit_attempts={smoke_quit_attempts}\n",
-                    encoding="utf-8",
-                    newline="\n",
-                )
-            except OSError:
-                pass
-            if not quit_started:
-                if smoke_quit_attempts < 80:
-                    QTimer.singleShot(250, quit_smoke)
-                    return
-                try:
-                    with smoke_status_path.open(
-                        "a", encoding="utf-8", newline="\n"
-                    ) as handle:
-                        handle.write("smoke_quit_timeout=True\n")
-                except OSError:
-                    pass
-                app.exit(1)
-
-        def mark_smoke_ready() -> None:
-            nonlocal smoke_attempts
-            smoke_attempts += 1
-            failure = _smoke_failure(window, smoke_uncaught_exceptions)
-            if failure:
-                try:
-                    smoke_status_path.write_text(
-                        failure + "\n", encoding="utf-8", newline="\n"
-                    )
-                except OSError:
-                    pass
-                app.exit(1)
-                return
-            try:
-                check = database.connection.execute("PRAGMA quick_check").fetchone()[0]
-                if (
-                    window.isVisible()
-                    and _smoke_background_idle(window)
-                    and str(check).lower() == "ok"
-                ):
-                    smoke_ready_path.parent.mkdir(parents=True, exist_ok=True)
-                    smoke_status_path.write_text(
-                        _smoke_backdrop_status(window) + "smoke_ready=True\n",
-                        encoding="utf-8",
-                        newline="\n",
-                    )
-                    temporary = smoke_ready_path.with_name(f".{smoke_ready_path.name}.tmp")
-                    temporary.write_text("ready\n", encoding="ascii", newline="\n")
-                    os.replace(temporary, smoke_ready_path)
-                    QTimer.singleShot(smoke_hold_ms, quit_smoke)
-                    return
-            except (OSError, sqlite3.Error):
-                pass
-            if smoke_attempts < 80:
-                QTimer.singleShot(250, mark_smoke_ready)
-                return
-            try:
-                smoke_status_path.write_text(
-                    _smoke_backdrop_status(window)
-                    + f"smoke_ready_timeout=True\nattempts={smoke_attempts}\n",
-                    encoding="utf-8",
-                    newline="\n",
-                )
-            except OSError:
-                pass
-            app.exit(1)
-
-        QTimer.singleShot(250, mark_smoke_ready)
+    if smoke_lifecycle is not None:
+        smoke_lifecycle.start()
     exit_code = app.exec()
-    failure = _smoke_failure(window, smoke_uncaught_exceptions)
-    if failure:
+    if smoke_lifecycle is not None:
+        exit_code = smoke_lifecycle.finalize(exit_code)
+    elif _smoke_failure(window, []):
         exit_code = exit_code or 1
-    if smoke_ready_path is not None:
-        try:
-            with smoke_status_path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(f"event_loop_exited={exit_code}\n")
-        except OSError:
-            pass
-        sys.excepthook = original_excepthook
     if registered:
         _windows_hotkey_api().UnregisterHotKey(None, GLOBAL_HOTKEY_ID)
     if not runtime.close(timeout=2.0):

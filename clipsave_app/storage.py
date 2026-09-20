@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import io
 import ntpath
 import os
-import shutil
-import stat
+import shutil as _shutil
 import uuid
 from ctypes import wintypes
 from collections.abc import Iterator
@@ -15,11 +13,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable
 
+
+# Compatibility seam: tests and older callers patch ``storage.shutil.move`` to
+# prove migration never falls back to an unsafe cross-volume move.
+shutil = _shutil
+
+from .app_paths import AppPaths
 from .database_files import copy_database_snapshot
+from . import windows_storage as _windows_storage
 
 from .storage_migration import (
     StorageMigrationOps,
     StorageMigrationPaths,
+    copy_or_move_contents as _run_copy_or_move_contents,
+    copy_verify_delete_file as _run_copy_verify_delete_file,
     migrate_legacy_layout as _run_storage_migration,
 )
 
@@ -40,226 +47,36 @@ from .constants import (
 
 if os.name == "nt":
     import msvcrt
-    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
-else:
-    _KERNEL32 = None
 
 
-_GENERIC_READ = 0x80000000
-_GENERIC_WRITE = 0x40000000
-_DELETE = 0x00010000
-_FILE_READ_ATTRIBUTES = 0x00000080
-_FILE_SHARE_READ = 0x00000001
-_FILE_SHARE_WRITE = 0x00000002
-_FILE_SHARE_DELETE = 0x00000004
-_CREATE_NEW = 1
-_OPEN_EXISTING = 3
-_OPEN_ALWAYS = 4
-_FILE_ATTRIBUTE_NORMAL = 0x00000080
-_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
-_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
-_FILE_NAME_NORMALIZED = 0x0
-_VOLUME_NAME_DOS = 0x0
-_FILE_DISPOSITION_INFO_CLASS = 4
-_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_GENERIC_READ = _windows_storage._GENERIC_READ
+_GENERIC_WRITE = _windows_storage._GENERIC_WRITE
+_DELETE = _windows_storage._DELETE
+_FILE_READ_ATTRIBUTES = _windows_storage._FILE_READ_ATTRIBUTES
+_FILE_SHARE_READ = _windows_storage._FILE_SHARE_READ
+_FILE_SHARE_WRITE = _windows_storage._FILE_SHARE_WRITE
+_FILE_SHARE_DELETE = _windows_storage._FILE_SHARE_DELETE
+_CREATE_NEW = _windows_storage._CREATE_NEW
+_OPEN_EXISTING = _windows_storage._OPEN_EXISTING
+_OPEN_ALWAYS = _windows_storage._OPEN_ALWAYS
+_FILE_ATTRIBUTE_NORMAL = _windows_storage._FILE_ATTRIBUTE_NORMAL
+_FILE_ATTRIBUTE_REPARSE_POINT = _windows_storage._FILE_ATTRIBUTE_REPARSE_POINT
+_FILE_FLAG_BACKUP_SEMANTICS = _windows_storage._FILE_FLAG_BACKUP_SEMANTICS
+_FILE_FLAG_OPEN_REPARSE_POINT = _windows_storage._FILE_FLAG_OPEN_REPARSE_POINT
+_ByHandleFileInformation = _windows_storage._ByHandleFileInformation
+_FileDispositionInfo = _windows_storage._FileDispositionInfo
+_kernel32_function = _windows_storage._kernel32_function
+_create_file = _windows_storage._create_file
+_close_handle = _windows_storage._close_handle
+_final_path_from_handle = _windows_storage._final_path_from_handle
+_long_requested_path = _windows_storage._long_requested_path
+_normalized_requested_path = _windows_storage._normalized_requested_path
+normalized_absolute_path = _windows_storage.normalized_absolute_path
+_file_information = _windows_storage._file_information
+_truncate_handle = _windows_storage._truncate_handle
+_hash_handle = _windows_storage._hash_handle
+_mark_handle_for_delete = _windows_storage._mark_handle_for_delete
 
-
-class _ByHandleFileInformation(ctypes.Structure):
-    _fields_ = [
-        ("file_attributes", wintypes.DWORD),
-        ("creation_time", wintypes.FILETIME),
-        ("last_access_time", wintypes.FILETIME),
-        ("last_write_time", wintypes.FILETIME),
-        ("volume_serial_number", wintypes.DWORD),
-        ("file_size_high", wintypes.DWORD),
-        ("file_size_low", wintypes.DWORD),
-        ("number_of_links", wintypes.DWORD),
-        ("file_index_high", wintypes.DWORD),
-        ("file_index_low", wintypes.DWORD),
-    ]
-
-
-class _FileDispositionInfo(ctypes.Structure):
-    _fields_ = [("delete_file", wintypes.BOOL)]
-
-
-def _kernel32_function(name: str, argtypes: list[object], restype: object):
-    if _KERNEL32 is None:
-        raise OSError("Windows handle APIs are unavailable")
-    function = getattr(_KERNEL32, name)
-    function.argtypes = argtypes
-    function.restype = restype
-    return function
-
-
-def _create_file(
-    path: Path,
-    desired_access: int,
-    creation_disposition: int,
-    flags: int = _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
-    share_mode: int = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
-) -> int:
-    create_file = _kernel32_function(
-        "CreateFileW",
-        [
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        ],
-        wintypes.HANDLE,
-    )
-    handle = create_file(
-        str(path),
-        desired_access,
-        share_mode,
-        None,
-        creation_disposition,
-        flags,
-        None,
-    )
-    if handle == _INVALID_HANDLE_VALUE:
-        raise ctypes.WinError(ctypes.get_last_error())
-    return int(handle)
-
-
-def _close_handle(handle: int) -> None:
-    close_handle = _kernel32_function("CloseHandle", [wintypes.HANDLE], wintypes.BOOL)
-    close_handle(handle)
-
-
-def _final_path_from_handle(handle: int) -> str:
-    get_final_path = _kernel32_function(
-        "GetFinalPathNameByHandleW",
-        [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD],
-        wintypes.DWORD,
-    )
-    required = get_final_path(handle, None, 0, _FILE_NAME_NORMALIZED | _VOLUME_NAME_DOS)
-    if not required:
-        raise ctypes.WinError(ctypes.get_last_error())
-    buffer = ctypes.create_unicode_buffer(required + 1)
-    written = get_final_path(handle, buffer, len(buffer), _FILE_NAME_NORMALIZED | _VOLUME_NAME_DOS)
-    if not written or written >= len(buffer):
-        raise ctypes.WinError(ctypes.get_last_error())
-    path = buffer.value
-    if path.startswith("\\\\?\\UNC\\"):
-        path = "\\\\" + path[8:]
-    elif path.startswith("\\\\?\\"):
-        path = path[4:]
-    return ntpath.normcase(ntpath.abspath(path))
-
-
-def _long_requested_path(path: Path) -> str:
-    """Expand short names in an existing path without resolving reparse points."""
-    requested = ntpath.abspath(str(path))
-    if os.name != "nt":
-        return requested
-    get_long_path = _kernel32_function(
-        "GetLongPathNameW",
-        [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD],
-        wintypes.DWORD,
-    )
-    required = get_long_path(requested, None, 0)
-    if not required:
-        raise ctypes.WinError(ctypes.get_last_error())
-    buffer = ctypes.create_unicode_buffer(required + 1)
-    written = get_long_path(requested, buffer, len(buffer))
-    if not written or written >= len(buffer):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return ntpath.abspath(buffer.value)
-
-
-def _normalized_requested_path(path: Path) -> str:
-    return ntpath.normcase(_long_requested_path(path))
-
-
-def normalized_absolute_path(path: Path) -> Path:
-    """Expand Windows short names while preserving a non-existent leaf suffix."""
-    candidate = Path(os.path.abspath(path))
-    if os.name != "nt":
-        return candidate
-    existing = candidate
-    suffix: list[str] = []
-    while not existing.exists():
-        parent = existing.parent
-        if parent == existing:
-            return candidate
-        suffix.append(existing.name)
-        existing = parent
-    normalized = Path(_long_requested_path(existing))
-    return normalized.joinpath(*reversed(suffix))
-
-
-def _file_information(handle: int) -> _ByHandleFileInformation:
-    get_information = _kernel32_function(
-        "GetFileInformationByHandle",
-        [wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation)],
-        wintypes.BOOL,
-    )
-    information = _ByHandleFileInformation()
-    if not get_information(handle, ctypes.byref(information)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return information
-
-
-def _truncate_handle(handle: int) -> None:
-    set_file_pointer = _kernel32_function(
-        "SetFilePointerEx",
-        [wintypes.HANDLE, ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD],
-        wintypes.BOOL,
-    )
-    set_end_of_file = _kernel32_function("SetEndOfFile", [wintypes.HANDLE], wintypes.BOOL)
-    if not set_file_pointer(handle, 0, None, 0):
-        raise ctypes.WinError(ctypes.get_last_error())
-    if not set_end_of_file(handle):
-        raise ctypes.WinError(ctypes.get_last_error())
-
-
-def _hash_handle(handle: int) -> tuple[str, int]:
-    set_file_pointer = _kernel32_function(
-        "SetFilePointerEx",
-        [wintypes.HANDLE, ctypes.c_longlong, ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD],
-        wintypes.BOOL,
-    )
-    read_file = _kernel32_function(
-        "ReadFile",
-        [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID],
-        wintypes.BOOL,
-    )
-    if not set_file_pointer(handle, 0, None, 0):
-        raise ctypes.WinError(ctypes.get_last_error())
-    digest = hashlib.sha256()
-    total = 0
-    buffer = ctypes.create_string_buffer(1024 * 1024)
-    while True:
-        amount = wintypes.DWORD()
-        if not read_file(handle, buffer, len(buffer), ctypes.byref(amount), None):
-            raise ctypes.WinError(ctypes.get_last_error())
-        if amount.value == 0:
-            break
-        digest.update(buffer.raw[: amount.value])
-        total += amount.value
-    return digest.hexdigest(), total
-
-
-def _mark_handle_for_delete(handle: int) -> None:
-    set_information = _kernel32_function(
-        "SetFileInformationByHandle",
-        [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD],
-        wintypes.BOOL,
-    )
-    disposition = _FileDispositionInfo(True)
-    if not set_information(
-        handle,
-        _FILE_DISPOSITION_INFO_CLASS,
-        ctypes.byref(disposition),
-        ctypes.sizeof(disposition),
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _verified_windows_handle(
@@ -790,98 +607,17 @@ def _delete_source_if_identical(
 def _copy_verify_delete_file(
     source: Path, destination: Path, source_root: Path, destination_root: Path
 ) -> bool:
-    if _is_link_or_junction(source) or _is_link_or_junction(destination):
-        return False
-    copied_digest = hashlib.sha256()
-    copied_size = 0
-    created_destination = False
-    try:
-        with open_managed_binary(
-            source, "rb", source_root, identity_locked=True
-        ) as source_handle, open_managed_binary(
-            destination, "xb", destination_root
-        ) as destination_handle:
-            created_destination = True
-            source_stat = os.fstat(source_handle.fileno())
-            if not stat.S_ISREG(source_stat.st_mode):
-                raise RuntimeError(f"Migration source is not a regular file: {source}")
-            while chunk := source_handle.read(1024 * 1024):
-                destination_handle.write(chunk)
-                copied_digest.update(chunk)
-                copied_size += len(chunk)
-        try:
-            shutil.copystat(source, destination, follow_symlinks=False)
-        except OSError:
-            pass
-        if _delete_source_if_identical(source, destination, source_root, destination_root):
-            return True
-    except FileExistsError:
-        return _delete_source_if_identical(
-            source, destination, source_root, destination_root
-        )
-    except (OSError, RuntimeError):
-        if created_destination:
-            try:
-                delete_managed_file(
-                    destination,
-                    destination_root,
-                    expected_sha256=copied_digest.hexdigest(),
-                    expected_size=copied_size,
-                )
-            except (OSError, RuntimeError):
-                pass
-        return False
-    return False
+    return _run_copy_verify_delete_file(
+        source,
+        destination,
+        source_root,
+        destination_root,
+        _migration_ops(),
+    )
 
 
 def _copy_or_move_contents(source: Path, target: Path) -> int:
-    if _is_link_or_junction(source) or _is_link_or_junction(target) or _paths_overlap(source, target):
-        return 0
-    if not source.exists() or not source.is_dir():
-        return 0
-    if target.exists() and not target.is_dir():
-        return 0
-    target.mkdir(parents=True, exist_ok=True)
-    if _is_link_or_junction(target):
-        return 0
-    moved = 0
-    for child in list(source.iterdir()):
-        if _is_link_or_junction(child):
-            continue
-        destination = target / child.name
-        if _is_link_or_junction(destination):
-            continue
-        if destination.exists():
-            if child.is_dir():
-                moved += _copy_or_move_contents(child, destination)
-                try:
-                    child.rmdir()
-                except OSError:
-                    pass
-            else:
-                if destination.is_file() and _delete_source_if_identical(
-                    child, destination, source, target
-                ):
-                    moved += 1
-                    continue
-                # Keep both files if a same-named file already exists.
-                stem, suffix = child.stem, child.suffix
-                index = 2
-                while destination.exists():
-                    destination = target / f"{stem} (迁移 {index}){suffix}"
-                    index += 1
-                if _copy_verify_delete_file(child, destination, source, target):
-                    moved += 1
-        else:
-            if child.is_dir():
-                moved += _copy_or_move_contents(child, destination)
-            elif _copy_verify_delete_file(child, destination, source, target):
-                moved += 1
-    try:
-        source.rmdir()
-    except OSError:
-        pass
-    return moved
+    return _run_copy_or_move_contents(source, target, _migration_ops())
 
 
 def _copy_legacy_database_snapshot(source: Path, destination: Path) -> None:
@@ -898,9 +634,20 @@ def _path_key(path: Path | str) -> str:
     return os.path.normcase(os.path.normpath(str(value)))
 
 
-def migrate_legacy_layout() -> dict[str, int]:
-    return _run_storage_migration(
-        StorageMigrationPaths(
+def _migration_ops() -> StorageMigrationOps:
+    return StorageMigrationOps(
+        is_link_or_junction=_is_link_or_junction,
+        paths_overlap=_paths_overlap,
+        open_managed_binary=open_managed_binary,
+        delete_managed_file=delete_managed_file,
+        delete_source_if_identical=_delete_source_if_identical,
+        copy_legacy_database_snapshot=_copy_legacy_database_snapshot,
+    )
+
+
+def migrate_legacy_layout(paths: AppPaths | None = None) -> dict[str, int]:
+    if paths is None:
+        migration_paths = StorageMigrationPaths(
             base_dir=BASE_DIR,
             legacy_data_dir=LEGACY_DATA_DIR,
             legacy_picture_dir=LEGACY_PICTURE_DIR,
@@ -909,42 +656,83 @@ def migrate_legacy_layout() -> dict[str, int]:
             library_dir=LIBRARY_DIR,
             picture_dir=PICTURE_DIR,
             markdown_dir=MARKDOWN_DIR,
-        ),
-        StorageMigrationOps(
-            is_link_or_junction=_is_link_or_junction,
-            paths_overlap=_paths_overlap,
-            open_managed_binary=open_managed_binary,
-            delete_managed_file=delete_managed_file,
-            delete_source_if_identical=_delete_source_if_identical,
-            copy_verify_delete_file=_copy_verify_delete_file,
-            copy_or_move_contents=_copy_or_move_contents,
-            copy_legacy_database_snapshot=_copy_legacy_database_snapshot,
-        ),
+        )
+    else:
+        migration_paths = StorageMigrationPaths(
+            base_dir=paths.base_dir,
+            legacy_data_dir=paths.legacy_data_dir,
+            legacy_picture_dir=paths.legacy_picture_dir,
+            legacy_markdown_dir=paths.legacy_markdown_dir,
+            data_dir=paths.data_dir,
+            library_dir=paths.library_dir,
+            picture_dir=paths.picture_dir,
+            markdown_dir=paths.markdown_dir,
+        )
+    return _run_storage_migration(
+        migration_paths,
+        _migration_ops(),
     )
 
 
-def validate_storage_layout() -> None:
-    paths = (LOCAL_ROOT, DATA_DIR, LIBRARY_DIR, PICTURE_DIR, MARKDOWN_DIR, THUMB_DIR, MAINTENANCE_DIR)
-    if _is_remote_or_unc_path(LOCAL_ROOT):
-        raise RuntimeError(f"ClipSave local storage cannot use a network path: {LOCAL_ROOT}")
-    if path_has_reparse_ancestor(LOCAL_ROOT):
-        raise RuntimeError(f"ClipSave local storage cannot be below a symlink or Junction: {LOCAL_ROOT}")
-    for path in paths:
+def validate_storage_layout(paths: AppPaths | None = None) -> None:
+    if paths is None:
+        local_root = LOCAL_ROOT
+        layout_paths = (
+            LOCAL_ROOT,
+            DATA_DIR,
+            LIBRARY_DIR,
+            PICTURE_DIR,
+            MARKDOWN_DIR,
+            THUMB_DIR,
+            MAINTENANCE_DIR,
+        )
+    else:
+        local_root = paths.local_root
+        layout_paths = (
+            paths.local_root,
+            paths.data_dir,
+            paths.library_dir,
+            paths.picture_dir,
+            paths.markdown_dir,
+            paths.thumb_dir,
+            paths.maintenance_dir,
+        )
+    if _is_remote_or_unc_path(local_root):
+        raise RuntimeError(
+            f"ClipSave local storage cannot use a network path: {local_root}"
+        )
+    if path_has_reparse_ancestor(local_root):
+        raise RuntimeError(
+            f"ClipSave local storage cannot be below a symlink or Junction: {local_root}"
+        )
+    for path in layout_paths:
         if _is_link_or_junction(path):
             raise RuntimeError(f"ClipSave 本地存储路径不能是符号链接或 Junction：{path}")
-    root = Path(os.path.abspath(LOCAL_ROOT))
-    for path in paths[1:]:
+    root = Path(os.path.abspath(local_root))
+    for path in layout_paths[1:]:
         try:
             Path(os.path.abspath(path)).relative_to(root)
         except ValueError as exc:
             raise RuntimeError(f"ClipSave 本地存储路径超出预期目录：{path}") from exc
 
 
-def ensure_storage_directories() -> None:
-    validate_storage_layout()
-    for path in (DATA_DIR, LIBRARY_DIR, PICTURE_DIR, MARKDOWN_DIR, THUMB_DIR, MAINTENANCE_DIR):
+def ensure_storage_directories(paths: AppPaths | None = None) -> None:
+    validate_storage_layout(paths)
+    directories = (
+        (DATA_DIR, LIBRARY_DIR, PICTURE_DIR, MARKDOWN_DIR, THUMB_DIR, MAINTENANCE_DIR)
+        if paths is None
+        else (
+            paths.data_dir,
+            paths.library_dir,
+            paths.picture_dir,
+            paths.markdown_dir,
+            paths.thumb_dir,
+            paths.maintenance_dir,
+        )
+    )
+    for path in directories:
         path.mkdir(parents=True, exist_ok=True)
-    validate_storage_layout()
+    validate_storage_layout(paths)
 
 
 def is_under_local_store(path: Path, library_dir: Path | None = None) -> bool:

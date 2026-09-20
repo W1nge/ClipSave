@@ -6,7 +6,6 @@ from PySide6.QtCore import QEvent, QRectF, QSize, QSizeF, Qt, Signal, Slot
 from PySide6.QtGui import QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -18,6 +17,8 @@ from PySide6.QtWidgets import (
 )
 
 from .item_models import TYPE_LABELS, format_local_timestamp, human_size, normalized_thumbnail_path
+from .detail_tag_grid import DetailTagGrid
+from .detail_notes_state import DetailNotesState
 from .markdown_view import SafeMarkdownBrowser, set_markdown_content
 from .thumbnail_service import (
     ThumbnailDecodeQueue,
@@ -25,13 +26,13 @@ from .thumbnail_service import (
     cache_decoded_thumbnail,
     cached_thumbnail,
 )
+from .thumbnail_session import ThumbnailSession
 from .ui_primitives import (
     AutoHideScrollBar,
     FluentComboBox,
     IconButton,
     ThemedSelectableLabel,
     ThemedTextEdit,
-    color_dot,
     lucide_icon,
 )
 
@@ -137,16 +138,12 @@ class DetailPanel(QScrollArea):
         self.setMaximumWidth(340)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self.current_item = None
-        self._thumbnail_generation = 0
         self._thumbnail_loader = self._make_thumbnail_queue(self)
+        self._thumbnail_session = ThumbnailSession(self._thumbnail_loader)
         self._thumbnail_loader.decoded.connect(self._thumbnail_decoded)
         self._image_source_pixmap = QPixmap()
-        self._tag_names: list[str] = []
-        self._tag_colors: list[str] = []
-        self._tags_expanded = False
         self._width_transition_active = False
         self._width_transition_layout_frozen = False
-        self.tags_more_button: QPushButton | None = None
         self.content_widget = QWidget()
         self.content_widget.setObjectName("DetailPanelContent")
         self.content_widget.setMinimumWidth(0)
@@ -205,12 +202,12 @@ class DetailPanel(QScrollArea):
         add_tag.clicked.connect(lambda: self.current_item and self.add_tag_requested.emit(self.current_item["id"]))
         tag_title.addWidget(add_tag)
         layout.addLayout(tag_title)
-        self.tags_box = QGridLayout()
-        self.tags_box.setHorizontalSpacing(4)
-        self.tags_box.setVerticalSpacing(4)
-        self.tags_box.setColumnStretch(0, 1)
-        self.tags_box.setColumnStretch(1, 1)
-        layout.addLayout(self.tags_box)
+        self.tag_grid = DetailTagGrid()
+        self.tag_grid.remove_requested.connect(
+            lambda tag: self.current_item
+            and self.remove_tag_requested.emit(self.current_item["id"], tag)
+        )
+        layout.addWidget(self.tag_grid)
 
         ocr_row = QHBoxLayout()
         ocr_row.addWidget(QLabel("OCR 文字"))
@@ -252,9 +249,9 @@ class DetailPanel(QScrollArea):
         self.notes.setPlaceholderText("添加备注…")
         self.notes.setMaximumHeight(90)
         self.notes.installEventFilter(self)
-        self._loaded_notes = ""
-        self._note_drafts: dict[int, str] = {}
-        self._note_draft_bases: dict[int, str] = {}
+        self._notes_state = DetailNotesState()
+        self._note_drafts = self._notes_state.drafts
+        self._note_draft_bases = self._notes_state.bases
         layout.addWidget(self.notes)
         actions = QHBoxLayout()
         self.item_action_buttons = []
@@ -358,18 +355,17 @@ class DetailPanel(QScrollArea):
 
     def set_item(self, item) -> bool:
         previous_item_id = self.current_item["id"] if self.current_item else None
-        loaded_notes_before_flush = self._loaded_notes
+        loaded_notes_before_flush = self._notes_state.loaded_notes
         self.flush_notes()
         if previous_item_id is not None and (
             self.current_item is None or self.current_item["id"] != previous_item_id
         ):
             return False
-        if self._loaded_notes != loaded_notes_before_flush:
+        if self._notes_state.loaded_notes != loaded_notes_before_flush:
             return False
-        self._thumbnail_generation += 1
-        self._thumbnail_loader.cancel_queued()
+        self._thumbnail_session.invalidate()
         if previous_item_id != item["id"]:
-            self._tags_expanded = False
+            self.tag_grid.reset_expanded()
         self.current_item = item
         self._image_source_pixmap = QPixmap()
         self.image_preview.clear()
@@ -390,7 +386,7 @@ class DetailPanel(QScrollArea):
             if cached:
                 self._set_image_preview(pixmap)
             elif key is not None:
-                self._thumbnail_loader.request(key, self._thumbnail_generation)
+                self._thumbnail_session.request(key)
         else:
             if item["kind"] == "markdown":
                 set_markdown_content(self.text_preview, item["content"])
@@ -407,7 +403,7 @@ class DetailPanel(QScrollArea):
         self.collection_combo.blockSignals(False)
         self.collection_combo.setEnabled(True)
         self.add_tag_button.setEnabled(True)
-        self._set_tags(item["tag_names"] or "", item["tag_colors"] or "")
+        self.tag_grid.set_tags(item["tag_names"] or "", item["tag_colors"] or "")
         self.ai_description.setText(
             _wrap_detail_text(item["ai_description"]) if item["ai_description"] else "尚未生成"
         )
@@ -423,16 +419,16 @@ class DetailPanel(QScrollArea):
             button.setEnabled(True)
         self.notes.blockSignals(True)
         loaded_notes = item["notes"] or ""
-        self.notes.setPlainText(self._note_drafts.get(item["id"], loaded_notes))
+        self.notes.setPlainText(
+            self._notes_state.display_notes(item["id"], loaded_notes)
+        )
         self.notes.blockSignals(False)
         self.notes.setEnabled(True)
-        self._loaded_notes = loaded_notes
         return True
 
     def clear_item(self) -> None:
         self.flush_notes()
-        self._thumbnail_generation += 1
-        self._thumbnail_loader.cancel_queued()
+        self._thumbnail_session.invalidate()
         self.current_item = None
         self._image_source_pixmap = QPixmap()
         self.type_badge.setText("详情")
@@ -443,8 +439,7 @@ class DetailPanel(QScrollArea):
         self.preview_stack.setCurrentWidget(self.text_preview)
         self.meta.clear()
         self.meta.setToolTip("")
-        self._set_tags("", "")
-        self._tags_expanded = False
+        self.tag_grid.clear_tags()
         self.ai_description.setText("尚未生成")
         self.ocr_text.setText("尚未识别")
         self.ai_button.setEnabled(False)
@@ -460,31 +455,28 @@ class DetailPanel(QScrollArea):
         self.notes.clear()
         self.notes.blockSignals(False)
         self.notes.setEnabled(False)
-        self._loaded_notes = ""
+        self._notes_state.clear_current()
         for button in self.item_action_buttons:
             button.setEnabled(False)
 
     def closeEvent(self, event) -> None:
-        self._thumbnail_generation += 1
-        self._thumbnail_loader.close()
+        self._thumbnail_session.close()
         super().closeEvent(event)
 
     def shutdown_thumbnail_loader(self, timeout_ms: int = 2000) -> bool:
-        self._thumbnail_generation += 1
-        return self._thumbnail_loader.close(timeout_ms)
+        return self._thumbnail_session.close(timeout_ms)
 
     def wait_for_thumbnail_idle(self) -> bool:
-        self._thumbnail_generation += 1
-        return self._thumbnail_loader.pause_and_wait()
+        return self._thumbnail_session.pause_and_wait()
 
     def resume_thumbnail_loader(self) -> None:
-        self._thumbnail_loader.resume()
+        self._thumbnail_session.resume()
         if self.current_item is not None:
             self.set_item(self.current_item)
 
     @Slot(object, object, int)
     def _thumbnail_decoded(self, key: ThumbnailCacheKey, image: QImage, generation: int) -> None:
-        if generation != self._thumbnail_generation or self.current_item is None:
+        if not self._thumbnail_session.is_current(generation) or self.current_item is None:
             return
         if normalized_thumbnail_path(self.current_item["path"]) != key.path:
             return
@@ -528,43 +520,13 @@ class DetailPanel(QScrollArea):
         self.ocr_button.setEnabled(is_image and not busy)
         self.ocr_button.setText("识别中…" if busy else "重试" if failed else "识别文字")
 
-    def _set_tags(self, names: str, colors: str) -> None:
-        while self.tags_box.count():
-            item = self.tags_box.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._tag_names = names.split("\x1f") if names else []
-        self._tag_colors = colors.split("\x1f") if colors else []
-        self.tags_more_button = None
-        visible_names = self._tag_names if self._tags_expanded else self._tag_names[:4]
-        for index, name in enumerate(visible_names):
-            button = QPushButton()
-            button.setObjectName("TagChip")
-            button.setText(button.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, 108))
-            button.setMinimumWidth(0)
-            button.setMaximumWidth(130)
-            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            color = self._tag_colors[index] if index < len(self._tag_colors) else "#64748b"
-            button.setIcon(QIcon(color_dot(color)))
-            button.setToolTip(f"{name}\n点击移除标签")
-            button.clicked.connect(lambda _checked=False, tag=name: self.current_item and self.remove_tag_requested.emit(self.current_item["id"], tag))
-            self.tags_box.addWidget(button, index // 2, index % 2)
-        if len(self._tag_names) > 4:
-            more = QPushButton()
-            more.setObjectName("TagMoreButton")
-            if self._tags_expanded:
-                more.setText("收起标签")
-                more.setToolTip("仅显示前四个标签")
-            else:
-                more.setText(f"更多标签  +{len(self._tag_names) - 4}")
-                more.setToolTip("显示全部标签")
-            more.clicked.connect(self._toggle_tags_expanded)
-            self.tags_box.addWidget(more, (len(visible_names) + 1) // 2, 0, 1, 2)
-            self.tags_more_button = more
+    @property
+    def tags_box(self):
+        return self.tag_grid.grid
 
-    def _toggle_tags_expanded(self) -> None:
-        self._tags_expanded = not self._tags_expanded
-        self._set_tags("\x1f".join(self._tag_names), "\x1f".join(self._tag_colors))
+    @property
+    def tags_more_button(self) -> QPushButton | None:
+        return self.tag_grid.more_button
 
     def _collection_changed(self, _index: int) -> None:
         if self.current_item:
@@ -580,33 +542,31 @@ class DetailPanel(QScrollArea):
             return True
         item_id = self.current_item["id"]
         notes = self.notes.toPlainText()
-        if notes == self._loaded_notes:
-            self._note_drafts.pop(item_id, None)
-            self._note_draft_bases.pop(item_id, None)
+        if notes == self._notes_state.loaded_notes:
+            self._notes_state.stage(item_id, notes)
             return True
-        if notes != self._loaded_notes:
-            self._note_draft_bases.setdefault(item_id, self._loaded_notes)
-            self._note_drafts[item_id] = notes
+        if self._notes_state.stage(item_id, notes):
             self.notes_changed.emit(item_id, notes)
         return self._note_drafts.get(item_id) != notes
 
     def mark_notes_saved(self, item_id: int, notes: str) -> None:
-        if self.current_item and self.current_item["id"] == item_id and self.notes.toPlainText() == notes:
-            self._loaded_notes = notes
-        if self._note_drafts.get(item_id) == notes:
-            self._note_drafts.pop(item_id, None)
-            self._note_draft_bases.pop(item_id, None)
+        self._notes_state.mark_saved(
+            item_id,
+            notes,
+            update_loaded=bool(
+                self.current_item
+                and self.current_item["id"] == item_id
+                and self.notes.toPlainText() == notes
+            ),
+        )
 
     def pending_note_drafts(self) -> dict[int, str]:
-        return dict(self._note_drafts)
+        return self._notes_state.pending_drafts()
 
     def pending_note_updates(self) -> dict[int, tuple[str, str]]:
-        return {
-            item_id: (self._note_draft_bases.get(item_id, ""), notes)
-            for item_id, notes in self._note_drafts.items()
-        }
+        return self._notes_state.pending_updates()
 
     @property
     def loaded_notes(self) -> str:
-        return self._loaded_notes
+        return self._notes_state.loaded_notes
 

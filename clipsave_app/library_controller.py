@@ -17,6 +17,20 @@ class LibraryRequest:
     offset: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class LibraryNavigationSnapshot:
+    counts: object
+    collections: object
+    tags: object
+    days: object
+
+
+@dataclass(frozen=True, slots=True)
+class LibrarySnapshot:
+    navigation: LibraryNavigationSnapshot
+    items: object
+
+
 class LibraryController(QObject):
     refresh_succeeded = Signal(object, object, object)
     refresh_failed = Signal(object, str)
@@ -46,6 +60,20 @@ class LibraryController(QObject):
             offset=offset,
         )
 
+    def navigation_snapshot(self) -> LibraryNavigationSnapshot:
+        return LibraryNavigationSnapshot(
+            counts=self.database.counts(),
+            collections=self.database.collections(),
+            tags=self.database.tags(),
+            days=self.database.days(),
+        )
+
+    def snapshot(self, query: LibraryQuery, page_size: int) -> LibrarySnapshot:
+        return LibrarySnapshot(
+            navigation=self.navigation_snapshot(),
+            items=self.query_items(query, page_size, 0),
+        )
+
     def refresh(self, query: LibraryQuery, page_size: int) -> None:
         self.cancel_refresh()
         self.cancel_search()
@@ -55,12 +83,7 @@ class LibraryController(QObject):
 
         def work(cancel_event: threading.Event) -> None:
             try:
-                payload = {
-                    "counts": self.database.counts(),
-                    "collections": self.database.collections(),
-                    "tags": self.database.tags(),
-                    "items": self.query_items(query, page_size, 0),
-                }
+                payload = self.snapshot(query, page_size)
                 if not cancel_event.is_set():
                     self.refresh_succeeded.emit(request.token, query, payload)
             except Exception as exc:

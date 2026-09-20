@@ -11,9 +11,10 @@ from clipsave_app.task_supervisor import TaskSupervisor
 
 
 class FakeDatabase:
-    def __init__(self):
+    def __init__(self, *, dirty=True):
         self.scan_calls = []
         self.backups = 0
+        self.dirty = dirty
 
     def mark_missing_files(self, cancel_event):
         self.scan_calls.append("missing")
@@ -29,6 +30,9 @@ class FakeDatabase:
     def create_backup_if_changed(self):
         self.backups += 1
         return "backup.db"
+
+    def backup_state(self):
+        return {"dirty": self.dirty}
 
 
 class MaintenanceControllerTests(unittest.TestCase):
@@ -70,3 +74,16 @@ class MaintenanceControllerTests(unittest.TestCase):
         self.assertEqual(database.backups, 1)
         self.assertEqual(results[0][2], "backup.db")
         self.assertTrue(controller.finish_backup(*request))
+
+    def test_periodic_backup_starts_only_when_dirty_and_idle(self):
+        clean = FakeDatabase(dirty=False)
+        clean_controller = LibraryMaintenanceController(clean, TaskSupervisor())
+        self.assertIsNone(clean_controller.start_backup_if_dirty())
+        self.assertEqual(clean.backups, 0)
+
+        dirty = FakeDatabase(dirty=True)
+        dirty_controller = LibraryMaintenanceController(dirty, TaskSupervisor())
+        request = dirty_controller.start_backup_if_dirty()
+        self.assertIsNotNone(request)
+        self.assertIs(dirty_controller.start_backup_if_dirty(), None)
+        self.assertTrue(self.wait_for(lambda: dirty.backups == 1))

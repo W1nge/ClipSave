@@ -3,17 +3,12 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
-import mimetypes
 import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Iterable, Iterator
-
-from PIL import Image
 
 from . import storage
 from . import database_recovery as _database_recovery
@@ -27,6 +22,13 @@ from .constants import (
     PICTURE_DIR,
     TAG_COLORS,
 )
+from .database_file_index_store import (
+    DatabaseFileIndexStore,
+    ImportFileDetails as ImportFileDetails,
+    ImportFileResult as ImportFileResult,
+    VerifiedIndexedFile as VerifiedIndexedFile,
+)
+from .database_query_store import DatabaseQueryStore
 from .database_recovery import (
     BackupValidation as BackupValidation,
     DatabaseRecoveryManager,
@@ -44,38 +46,12 @@ from .database_schema import (
     migrate_v4_to_v5,
     validate_connection_schema,
 )
-from .import_staging import prepare_import
 from .library_models import CollectionSummary, LibraryItem, TagSummary
 from .sqlite_leaf_lock import SQLiteLeafLock
 from .storage import is_under_local_store
 
 
 _SQLiteLeafLock = SQLiteLeafLock
-
-
-class ImportFileResult(Enum):
-    LOCALIZED = "localized"
-
-    def __bool__(self) -> bool:
-        return True
-
-
-@dataclass(frozen=True)
-class ImportFileDetails:
-    added: bool
-    localized: bool
-    duplicate: bool
-    item_id: int | None
-    content_hash: str
-
-
-@dataclass(frozen=True, slots=True)
-class VerifiedIndexedFile:
-    item_id: int
-    path: Path
-    size_bytes: int
-
-
 
 
 class LibraryDatabase:
@@ -160,6 +136,31 @@ class LibraryDatabase:
             self.create_backup()
         except (OSError, RuntimeError, sqlite3.Error) as exc:
             self.record_backup_error(str(exc))
+        self._queries = DatabaseQueryStore(
+            connection=lambda: self.connection,
+            lock=self._lock,
+            utc_timestamp=self._utc_timestamp,
+            summary_content_limit=self.SUMMARY_CONTENT_LIMIT,
+            max_search_terms=self.MAX_SEARCH_TERMS,
+        )
+        self._file_index = DatabaseFileIndexStore(
+            connection=lambda: self.connection,
+            lock=self._lock,
+            transaction=lambda: self._transaction(),
+            picture_dir=lambda: self._picture_dir,
+            markdown_dir=lambda: self._markdown_dir,
+            library_dir=lambda: self._library_dir,
+            is_managed_path=self.is_managed_path,
+            path_key=self.path_key,
+            stream_hash=lambda handle: self._stream_hash(handle),
+            utc_timestamp=self._utc_timestamp,
+            set_scan_report=lambda report: setattr(self, "last_scan_report", report),
+            scan_import_file=lambda *args, **kwargs: self.import_file(*args, **kwargs),
+            image_suffixes=self.IMAGE_SUFFIXES,
+            max_import_bytes=lambda: MAX_IMPORT_BYTES,
+            max_markdown_bytes=lambda: MAX_MARKDOWN_BYTES,
+            max_image_pixels=lambda: MAX_IMAGE_PIXELS,
+        )
 
     @property
     def _picture_dir(self) -> Path:
@@ -172,6 +173,19 @@ class LibraryDatabase:
     @property
     def _library_dir(self) -> Path:
         return self.paths.library_dir if self.paths is not None else self._picture_dir.parent
+
+    @property
+    def library_dir(self) -> Path:
+        """Root directory whose files are managed by this database instance."""
+        return self._library_dir
+
+    @property
+    def picture_dir(self) -> Path:
+        return self._picture_dir
+
+    def is_managed_path(self, path: Path) -> bool:
+        """Return whether *path* belongs to this database's managed library."""
+        return self._is_under_local_store(path)
 
     def _is_under_local_store(self, path: Path) -> bool:
         if self.paths is None:
@@ -575,158 +589,14 @@ class LibraryDatabase:
             digest.update(chunk)
         return digest.hexdigest()
 
-    def _live_hash_owner_locked(
-        self, digest: str, kind: str, exclude_id: int | None = None
-    ) -> sqlite3.Row | None:
-        if kind == "text":
-            domain_clause = "kind='text'"
-        else:
-            domain_clause = "kind IN ('image','markdown')"
-        parameters: list[object] = [digest]
-        exclude_clause = ""
-        if exclude_id is not None:
-            exclude_clause = "AND id != ?"
-            parameters.append(exclude_id)
-        return self.connection.execute(
-            f"""
-            SELECT id,kind,path,resolved_path,external,missing
-            FROM items
-            WHERE content_hash=? AND missing=0 AND {domain_clause} {exclude_clause}
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            parameters,
-        ).fetchone()
 
-    def _update_file_record_locked(
-        self, item_id: int, values: tuple[object, ...], update_hash: bool = True
-    ) -> None:
-        (
-            kind,
-            title,
-            content,
-            path,
-            resolved_path,
-            mime,
-            content_hash,
-            _created_at,
-            updated_at,
-            file_size,
-            width,
-            height,
-            source,
-            external,
-        ) = values
-        hash_assignment = "content_hash=:content_hash," if update_hash else ""
-        self.connection.execute(
-            f"""
-            UPDATE items
-            SET kind=:kind, title=:title, content=:content, path=:path,
-                resolved_path=:resolved_path, mime=:mime, {hash_assignment}
-                updated_at=:updated_at, file_size=:file_size, width=:width, height=:height,
-                source=:source, external=:external, missing=0
-            WHERE id=:item_id
-            """,
-            {
-                "kind": kind,
-                "title": title,
-                "content": content,
-                "path": path,
-                "resolved_path": resolved_path,
-                "mime": mime,
-                "content_hash": content_hash,
-                "updated_at": updated_at,
-                "file_size": file_size,
-                "width": width,
-                "height": height,
-                "source": source,
-                "external": external,
-                "item_id": item_id,
-            },
-        )
 
     def scan_legacy_files(self, cancel_event: threading.Event | None = None) -> int:
-        added = 0
-        scanned = 0
-        failures = 0
-        errors: list[str] = []
-        for path in storage.iter_safe_files(self._picture_dir, self.IMAGE_SUFFIXES):
-            if cancel_event is not None and cancel_event.is_set():
-                self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
-                return added
-            scanned += 1
-            try:
-                if self.import_file(path, "image"):
-                    added += 1
-            except Exception as exc:
-                failures += 1
-                if len(errors) < 8:
-                    errors.append(f"{path.name}: {exc}")
-        for path in storage.iter_safe_files(self._markdown_dir, (".md",)):
-            if cancel_event is not None and cancel_event.is_set():
-                self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
-                return added
-            scanned += 1
-            try:
-                if self.import_file(path, "markdown"):
-                    added += 1
-            except Exception as exc:
-                failures += 1
-                if len(errors) < 8:
-                    errors.append(f"{path.name}: {exc}")
-        self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
-        return added
+        return self._file_index.scan_legacy_files(cancel_event)
 
     def scan_unindexed_files(self, cancel_event: threading.Event | None = None) -> int:
-        return self._scan_unindexed_roots(
-            (
-                (self._picture_dir, self.IMAGE_SUFFIXES, "image"),
-                (self._markdown_dir, (".md",), "markdown"),
-            ),
-            cancel_event,
-        )
+        return self._file_index.scan_unindexed_files(cancel_event)
 
-    def _scan_unindexed_roots(
-        self,
-        roots: tuple[tuple[Path, tuple[str, ...], str], ...],
-        cancel_event: threading.Event | None,
-    ) -> int:
-        kinds = tuple(kind for _root, _suffixes, kind in roots)
-        placeholders = ",".join("?" for _kind in kinds)
-        with self._lock:
-            indexed_paths = {
-                row[0]
-                for row in self.connection.execute(
-                    f"""
-                    SELECT resolved_path FROM items
-                    WHERE kind IN ({placeholders}) AND resolved_path IS NOT NULL
-                    """,
-                    kinds,
-                ).fetchall()
-            }
-        added = 0
-        scanned = 0
-        failures = 0
-        errors: list[str] = []
-        for root, suffixes, kind in roots:
-            for path in storage.iter_safe_files(root, suffixes):
-                if cancel_event is not None and cancel_event.is_set():
-                    self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
-                    return added
-                scanned += 1
-                try:
-                    path_key = self.path_key(path)
-                    if path_key in indexed_paths:
-                        continue
-                    if self.import_file(path, kind):
-                        added += 1
-                        indexed_paths.add(path_key)
-                except Exception as exc:
-                    failures += 1
-                    if len(errors) < 8:
-                        errors.append(f"{path.name}: {exc}")
-        self.last_scan_report = {"scanned": scanned, "added": added, "failed": failures, "errors": errors}
-        return added
 
     def import_file(
         self,
@@ -737,151 +607,13 @@ class LibraryDatabase:
         strict: bool = False,
         detailed: bool = False,
     ) -> bool | ImportFileResult | ImportFileDetails:
-        staged = None
-        try:
-            staged = prepare_import(
-                path,
-                kind,
-                copy_to_library,
-                strict=strict,
-                picture_dir=self._picture_dir,
-                markdown_dir=self._markdown_dir,
-                is_local=self._is_under_local_store,
-                stream_hash=self._stream_hash,
-                max_import_bytes=MAX_IMPORT_BYTES,
-                max_markdown_bytes=MAX_MARKDOWN_BYTES,
-                max_image_pixels=MAX_IMAGE_PIXELS,
-            )
-            if staged is None:
-                return False
-            created = self._utc_timestamp(staged.created_at)
-            resolved_path = self.path_key(staged.path)
-            values = (
-                staged.kind,
-                staged.path.name,
-                staged.content,
-                str(staged.path),
-                resolved_path,
-                staged.mime,
-                staged.content_hash,
-                created,
-                created,
-                staged.file_size,
-                staged.width,
-                staged.height,
-                staged.source,
-                staged.external,
-            )
-
-            added = False
-            localized = False
-            duplicate_copy = False
-            result_item_id: int | None = None
-            with self._transaction():
-                existing_path = self.connection.execute(
-                    """
-                    SELECT i.id, i.content_hash, i.external, i.missing
-                    FROM items i
-                    WHERE i.resolved_path = ?
-                    ORDER BY
-                        CASE WHEN i.content_hash = ? THEN 0 ELSE 1 END,
-                        CASE WHEN i.missing = 0 THEN 0 ELSE 1 END,
-                        CASE WHEN i.favorite = 1 THEN 0 ELSE 1 END,
-                        CASE WHEN i.notes != '' THEN 0 ELSE 1 END,
-                        CASE WHEN i.collection_id IS NOT NULL THEN 0 ELSE 1 END,
-                        CASE WHEN EXISTS(
-                            SELECT 1 FROM item_tags it WHERE it.item_id = i.id
-                        ) THEN 0 ELSE 1 END,
-                        i.updated_at DESC,
-                        i.id DESC
-                    LIMIT 1
-                    """,
-                    (resolved_path, staged.content_hash),
-                ).fetchone()
-                if existing_path:
-                    existing_hash = self._live_hash_owner_locked(
-                        staged.content_hash,
-                        staged.kind,
-                        int(existing_path["id"]),
-                    )
-                    if existing_hash:
-                        self.connection.execute(
-                            "UPDATE items SET path=NULL, resolved_path=NULL, missing=1 WHERE id=?",
-                            (existing_path["id"],),
-                        )
-                        if (
-                            copy_to_library
-                            and existing_hash["external"]
-                            and staged.managed_local
-                        ):
-                            self._update_file_record_locked(int(existing_hash["id"]), values)
-                            localized = True
-                            result_item_id = int(existing_hash["id"])
-                        else:
-                            duplicate_copy = staged.created_copy
-                    else:
-                        result_item_id = int(existing_path["id"])
-                        self._update_file_record_locked(
-                            int(existing_path["id"]),
-                            values,
-                            update_hash=(
-                                existing_path["content_hash"] != staged.content_hash
-                            ),
-                        )
-                else:
-                    existing_hash = self._live_hash_owner_locked(
-                        staged.content_hash,
-                        staged.kind,
-                    )
-                    if existing_hash:
-                        if (
-                            copy_to_library
-                            and existing_hash["external"]
-                            and staged.managed_local
-                        ):
-                            self._update_file_record_locked(int(existing_hash["id"]), values)
-                            localized = True
-                            result_item_id = int(existing_hash["id"])
-                        else:
-                            duplicate_copy = staged.created_copy
-                    else:
-                        cursor = self.connection.execute(
-                            """
-                            INSERT OR IGNORE INTO items(
-                                kind,title,content,path,resolved_path,mime,content_hash,
-                                created_at,updated_at,file_size,width,height,source,external
-                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                            """,
-                            values,
-                        )
-                        added = cursor.rowcount == 1
-                        if added:
-                            result_item_id = int(cursor.lastrowid)
-                        duplicate_copy = not added and staged.created_copy
-            if duplicate_copy:
-                staged.discard_created_copy()
-            if detailed:
-                return ImportFileDetails(
-                    added=added,
-                    localized=localized,
-                    duplicate=not added and not localized,
-                    item_id=result_item_id if added or localized else None,
-                    content_hash=staged.content_hash,
-                )
-            return ImportFileResult.LOCALIZED if localized else added
-        except (OSError, ValueError):
-            if staged is not None:
-                staged.discard_created_copy()
-            if strict:
-                raise
-            return False
-        except BaseException:
-            if staged is not None:
-                staged.discard_created_copy()
-            raise
-        finally:
-            if staged is not None:
-                staged.close()
+        return self._file_index.import_file(
+            path,
+            kind,
+            copy_to_library,
+            strict=strict,
+            detailed=detailed,
+        )
 
     def add_text(self, text: str, created_at: dt.datetime | None = None) -> int | None:
         created_at = created_at or dt.datetime.now(dt.timezone.utc)
@@ -900,40 +632,7 @@ class LibraryDatabase:
             return int(cursor.lastrowid) if cursor.rowcount == 1 else None
 
     def add_image(self, path: Path, created_at: dt.datetime | None = None) -> int | None:
-        created_at = created_at or dt.datetime.now(dt.timezone.utc)
-        try:
-            if self._is_under_local_store(path):
-                source = storage.open_managed_binary(
-                    path, "rb", storage.LIBRARY_DIR, identity_locked=True
-                )
-            else:
-                source = path.open("rb")
-            with source:
-                initial_stat = os.fstat(source.fileno())
-                digest = self._stream_hash(source)
-                source.seek(0)
-                with Image.open(source) as image:
-                    width, height = image.size
-                    if width * height > MAX_IMAGE_PIXELS:
-                        return None
-                    image.load()
-                final_stat = os.fstat(source.fileno())
-                identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
-                if any(
-                    getattr(initial_stat, field, None) != getattr(final_stat, field, None)
-                    for field in identity_fields
-                ):
-                    return None
-        except (OSError, ValueError):
-            return None
-        return self.add_verified_image(
-            path,
-            content_hash=digest,
-            file_size=final_stat.st_size,
-            width=width,
-            height=height,
-            created_at=created_at,
-        )
+        return self._file_index.add_image(path, created_at)
 
     def add_verified_image(
         self,
@@ -945,40 +644,14 @@ class LibraryDatabase:
         height: int,
         created_at: dt.datetime | None = None,
     ) -> int | None:
-        if (
-            len(content_hash) != 64
-            or any(character not in "0123456789abcdefABCDEF" for character in content_hash)
-            or file_size < 0
-            or width <= 0
-            or height <= 0
-            or width * height > MAX_IMAGE_PIXELS
-        ):
-            raise ValueError("Invalid verified image metadata")
-        created_at = created_at or dt.datetime.now(dt.timezone.utc)
-        timestamp = self._utc_timestamp(created_at)
-        resolved_path = self.path_key(path)
-        with self._transaction():
-            cursor = self.connection.execute(
-                """
-                INSERT OR IGNORE INTO items(
-                    kind,title,path,resolved_path,mime,content_hash,created_at,updated_at,
-                    file_size,width,height
-                ) VALUES('image',?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    path.name,
-                    str(path.resolve()),
-                    resolved_path,
-                    mimetypes.guess_type(path.name)[0] or "image/png",
-                    content_hash.lower(),
-                    timestamp,
-                    timestamp,
-                    file_size,
-                    width,
-                    height,
-                ),
-            )
-            return int(cursor.lastrowid) if cursor.rowcount == 1 else None
+        return self._file_index.add_verified_image(
+            path,
+            content_hash=content_hash,
+            file_size=file_size,
+            width=width,
+            height=height,
+            created_at=created_at,
+        )
 
     def query_items(
         self,
@@ -995,204 +668,39 @@ class LibraryDatabase:
         offset: int = 0,
         query_terms: Iterable[str] | None = None,
     ) -> list[LibraryItem]:
-        if limit is not None and (not isinstance(limit, int) or limit < 0):
-            raise ValueError("limit must be a non-negative integer or None")
-        if not isinstance(offset, int) or offset < 0:
-            raise ValueError("offset must be a non-negative integer")
-        clauses = ["i.missing = 0"]
-        parameters: list[object] = []
-        joins = ""
-        if query_terms is None:
-            search_terms = [query] if query else []
-        else:
-            if isinstance(query_terms, (str, bytes)):
-                raise TypeError("query_terms must be an iterable of strings")
-            search_terms = []
-            seen_terms: set[str] = set()
-            for value in query_terms:
-                if not isinstance(value, str):
-                    raise TypeError("query_terms must contain only strings")
-                term = value.strip()
-                if not term:
-                    continue
-                key = term.casefold()
-                if key in seen_terms:
-                    continue
-                seen_terms.add(key)
-                search_terms.append(term)
-                if len(search_terms) > self.MAX_SEARCH_TERMS:
-                    raise ValueError(f"query_terms cannot contain more than {self.MAX_SEARCH_TERMS} terms")
-            if not search_terms and query:
-                search_terms.append(query)
-        if search_terms:
-            term_clauses = []
-            for term in search_terms:
-                term_clauses.append(
-                    """(
-                        i.title LIKE ? ESCAPE '\\' OR i.content LIKE ? ESCAPE '\\'
-                        OR i.ocr_text LIKE ? ESCAPE '\\' OR i.ai_description LIKE ? ESCAPE '\\'
-                        OR i.notes LIKE ? ESCAPE '\\'
-                        OR EXISTS(
-                            SELECT 1
-                            FROM item_tags search_link
-                            JOIN tags search_tag ON search_tag.id=search_link.tag_id
-                            WHERE search_link.item_id=i.id AND search_tag.name LIKE ? ESCAPE '\\'
-                        )
-                    )"""
-                )
-                escaped_term = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-                token = f"%{escaped_term}%"
-                parameters.extend([token] * 6)
-            clauses.append(f"({' OR '.join(term_clauses)})")
-        if kind:
-            clauses.append("i.kind = ?")
-            parameters.append(kind)
-        if favorite:
-            clauses.append("i.favorite = 1")
-        if day:
-            clauses.append("date(i.created_at, 'localtime') = ?")
-            parameters.append(day)
-        if recent_days:
-            cutoff = self._utc_timestamp(
-                dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=recent_days)
-            )
-            clauses.append("i.created_at >= ?")
-            parameters.append(cutoff)
-        if collection_id is not None:
-            clauses.append("i.collection_id = ?")
-            parameters.append(collection_id)
-        if tag_id is not None:
-            joins += " JOIN item_tags filter_tags ON filter_tags.item_id = i.id "
-            clauses.append("filter_tags.tag_id = ?")
-            parameters.append(tag_id)
-        projection = "i.*"
-        if summary_only:
-            projection = f"""
-                i.id, i.kind, i.title, substr(i.content,1,{self.SUMMARY_CONTENT_LIMIT}) AS content,
-                i.path, i.resolved_path, i.mime, i.content_hash, i.created_at, i.updated_at,
-                i.file_size, i.width, i.height, i.source, i.favorite, '' AS notes,
-                '' AS ocr_text, '' AS ai_description, NULL AS embedding,
-                i.embedding_provider, i.embedding_model, i.embedding_dimensions,
-                i.embedding_revision, i.collection_id,
-                i.external, i.missing
-            """
-        pagination = ""
-        if limit is not None:
-            pagination = "LIMIT ? OFFSET ?"
-            parameters.extend((limit, offset))
-        elif offset:
-            pagination = "LIMIT -1 OFFSET ?"
-            parameters.append(offset)
-        sql = f"""
-            SELECT {projection}, c.name AS collection_name,
-                   (SELECT GROUP_CONCAT(name, char(31)) FROM (
-                       SELECT tag.name AS name
-                       FROM item_tags link JOIN tags tag ON tag.id=link.tag_id
-                       WHERE link.item_id=i.id ORDER BY tag.id
-                   )) AS tag_names,
-                   (SELECT GROUP_CONCAT(color, char(31)) FROM (
-                       SELECT tag.color AS color
-                       FROM item_tags link JOIN tags tag ON tag.id=link.tag_id
-                       WHERE link.item_id=i.id ORDER BY tag.id
-                   )) AS tag_colors
-            FROM items i
-            LEFT JOIN collections c ON c.id = i.collection_id
-            {joins}
-            WHERE {' AND '.join(clauses)}
-            ORDER BY {self._item_order(sort)}
-            {pagination}
-        """
-        with self._lock:
-            rows = self.connection.execute(sql, parameters).fetchall()
-        return [LibraryItem.from_mapping(row) for row in rows]
+        return self._queries.query_items(
+            query=query,
+            kind=kind,
+            favorite=favorite,
+            day=day,
+            recent_days=recent_days,
+            collection_id=collection_id,
+            tag_id=tag_id,
+            sort=sort,
+            summary_only=summary_only,
+            limit=limit,
+            offset=offset,
+            query_terms=query_terms,
+        )
 
     @staticmethod
     def _item_order(sort: str) -> str:
-        orders = {
-            "newest": "i.created_at DESC, i.id DESC",
-            "oldest": "i.created_at ASC, i.id ASC",
-            "name": "i.title COLLATE NOCASE ASC, i.id ASC",
-            "size": "i.file_size DESC, i.id DESC",
-            "type": "i.kind ASC, i.created_at DESC, i.id DESC",
-        }
-        return orders.get(sort, orders["newest"])
+        return DatabaseQueryStore.item_order(sort)
 
     def count_items(self, *, kind: str | None = None) -> int:
-        clauses = ["missing = 0"]
-        parameters: list[object] = []
-        if kind is not None:
-            clauses.append("kind = ?")
-            parameters.append(kind)
-        with self._lock:
-            return int(
-                self.connection.execute(
-                    f"SELECT COUNT(*) FROM items WHERE {' AND '.join(clauses)}",
-                    parameters,
-                ).fetchone()[0]
-            )
+        return self._queries.count_items(kind=kind)
 
     def item_ids(self, *, kind: str | None = None, sort: str = "newest") -> list[int]:
-        clauses = ["i.missing = 0"]
-        parameters: list[object] = []
-        if kind is not None:
-            clauses.append("i.kind = ?")
-            parameters.append(kind)
-        with self._lock:
-            return [
-                int(row[0])
-                for row in self.connection.execute(
-                    f"""
-                    SELECT i.id
-                    FROM items i
-                    WHERE {' AND '.join(clauses)}
-                    ORDER BY {self._item_order(sort)}
-                    """,
-                    parameters,
-                ).fetchall()
-            ]
+        return self._queries.item_ids(kind=kind, sort=sort)
 
     def get_item(self, item_id: int) -> LibraryItem | None:
-        with self._lock:
-            row = self.connection.execute(
-                """
-                SELECT i.*, c.name AS collection_name,
-                       (SELECT GROUP_CONCAT(name, char(31)) FROM (
-                           SELECT tag.name AS name
-                           FROM item_tags link JOIN tags tag ON tag.id=link.tag_id
-                           WHERE link.item_id=i.id ORDER BY tag.id
-                       )) AS tag_names,
-                       (SELECT GROUP_CONCAT(color, char(31)) FROM (
-                           SELECT tag.color AS color
-                           FROM item_tags link JOIN tags tag ON tag.id=link.tag_id
-                           WHERE link.item_id=i.id ORDER BY tag.id
-                       )) AS tag_colors
-                FROM items i
-                LEFT JOIN collections c ON c.id = i.collection_id
-                WHERE i.id = ? AND i.missing = 0
-                """,
-                (item_id,),
-            ).fetchone()
-        return None if row is None else LibraryItem.from_mapping(row)
+        return self._queries.get_item(item_id)
 
     def counts(self) -> dict[str, int]:
-        with self._lock:
-            rows = self.connection.execute(
-                "SELECT kind, COUNT(*) amount FROM items WHERE missing=0 GROUP BY kind"
-            ).fetchall()
-            result = {"all": 0, "image": 0, "text": 0, "markdown": 0, "favorite": 0}
-            for row in rows:
-                result[row["kind"]] = row["amount"]
-                result["all"] += row["amount"]
-            result["favorite"] = self.connection.execute(
-                "SELECT COUNT(*) FROM items WHERE favorite=1 AND missing=0"
-            ).fetchone()[0]
-            return result
+        return self._queries.counts()
 
     def days(self) -> list[tuple[str, int]]:
-        with self._lock:
-            return [(row["day"], row["amount"]) for row in self.connection.execute(
-                "SELECT date(created_at, 'localtime') day, COUNT(*) amount FROM items WHERE missing=0 GROUP BY day ORDER BY day DESC"
-            ).fetchall()]
+        return self._queries.days()
 
     def set_favorite(self, item_id: int, value: bool) -> None:
         with self._transaction():
@@ -1230,17 +738,7 @@ class LibraryDatabase:
             return row is not None and (row["notes"] or "") == new_notes
 
     def collections(self) -> list[CollectionSummary]:
-        with self._lock:
-            rows = self.connection.execute(
-                """
-                SELECT c.*, COUNT(i.id) amount
-                FROM collections c
-                LEFT JOIN items i ON i.collection_id=c.id AND i.missing=0
-                GROUP BY c.id
-                ORDER BY c.name COLLATE NOCASE, c.id
-                """
-            ).fetchall()
-        return [CollectionSummary.from_mapping(row) for row in rows]
+        return self._queries.collections()
 
     def create_collection(self, name: str) -> int:
         with self._transaction():
@@ -1259,18 +757,7 @@ class LibraryDatabase:
             self.connection.execute("DELETE FROM collections WHERE id=?", (collection_id,))
 
     def tags(self) -> list[TagSummary]:
-        with self._lock:
-            rows = self.connection.execute(
-                """
-                SELECT t.*, COUNT(i.id) amount
-                FROM tags t
-                LEFT JOIN item_tags it ON it.tag_id=t.id
-                LEFT JOIN items i ON i.id=it.item_id AND i.missing=0
-                GROUP BY t.id
-                ORDER BY t.name COLLATE NOCASE, t.id
-                """
-            ).fetchall()
-        return [TagSummary.from_mapping(row) for row in rows]
+        return self._queries.tags()
 
     def add_tag(self, item_id: int, name: str) -> int:
         name = name.strip()
@@ -1305,8 +792,7 @@ class LibraryDatabase:
             self.connection.execute("DELETE FROM items WHERE id=?", (item_id,))
 
     def mark_item_missing(self, item_id: int) -> None:
-        with self._transaction():
-            self.connection.execute("UPDATE items SET missing=1 WHERE id=?", (item_id,))
+        self._file_index.mark_item_missing(item_id)
 
     def update_ai(
         self,
@@ -1452,28 +938,10 @@ class LibraryDatabase:
             )
 
     def indexed_files(self) -> list[sqlite3.Row]:
-        with self._lock:
-            return list(
-                self.connection.execute(
-                    """
-                    SELECT id,path,resolved_path,content_hash,file_size,updated_at
-                    FROM items
-                    WHERE path IS NOT NULL AND content_hash IS NOT NULL AND missing=0
-                    """
-                ).fetchall()
-            )
+        return self._file_index.indexed_files()
 
     def indexed_file_for_hash(self, digest: str) -> sqlite3.Row | None:
-        with self._lock:
-            return self.connection.execute(
-                """
-                SELECT id,path,resolved_path,content_hash,file_size,updated_at
-                FROM items
-                WHERE content_hash=? AND path IS NOT NULL AND missing=0
-                LIMIT 1
-                """,
-                (digest,),
-            ).fetchone()
+        return self._file_index.indexed_file_for_hash(digest)
 
     @contextmanager
     def hold_verified_indexed_file(
@@ -1481,105 +949,14 @@ class LibraryDatabase:
         digest: str,
         managed_root: Path,
     ) -> Iterator[VerifiedIndexedFile | None]:
-        """Hold the DB owner stable while verifying its managed file by identity and hash."""
-        with self._lock:
-            indexed = self.indexed_file_for_hash(digest)
-            if indexed is None:
-                yield None
-                return
-            indexed_path = Path(indexed["path"])
-            try:
-                with storage.open_managed_binary(
-                    indexed_path,
-                    "rb",
-                    managed_root,
-                    identity_locked=True,
-                ) as keeper:
-                    keeper_stat = os.fstat(keeper.fileno())
-                    if self._stream_hash(keeper) != digest:
-                        yield None
-                        return
-                    current = self.indexed_file_for_hash(digest)
-                    if (
-                        current is None
-                        or current["id"] != indexed["id"]
-                        or self.path_key(current["path"]) != self.path_key(indexed_path)
-                    ):
-                        yield None
-                        return
-                    yield VerifiedIndexedFile(
-                        item_id=int(indexed["id"]),
-                        path=indexed_path,
-                        size_bytes=int(keeper_stat.st_size),
-                    )
-            except (OSError, RuntimeError):
-                yield None
+        with self._file_index.hold_verified_indexed_file(
+            digest,
+            managed_root,
+        ) as verified:
+            yield verified
 
     def mark_missing_files(self, cancel_event: threading.Event | None = None) -> None:
-        with self._lock:
-            rows = self.connection.execute(
-                """
-                SELECT id,path,kind,content_hash,file_size
-                FROM items WHERE path IS NOT NULL
-                """
-            ).fetchall()
-        replacements: list[tuple[int, Path, str]] = []
-        for row in rows:
-            if cancel_event is not None and cancel_event.is_set():
-                return
-            path = Path(row["path"])
-            item_id = int(row["id"])
-            kind = str(row["kind"])
-            expected_hash = row["content_hash"]
-            root = (
-                self._markdown_dir if kind == "markdown" else self._picture_dir
-            ) if self._is_under_local_store(path) else path.parent
-            try:
-                with storage.open_managed_binary(
-                    path, "rb", root, identity_locked=True
-                ) as current_file:
-                    stat = os.fstat(current_file.fileno())
-                    if stat.st_size > MAX_IMPORT_BYTES:
-                        raise OSError("file is no longer importable")
-                    current_hash = self._stream_hash(current_file)
-            except (OSError, RuntimeError):
-                self.mark_item_missing(item_id)
-                continue
-            if current_hash != expected_hash:
-                replacements.append((item_id, path, kind))
-                continue
-            with self._transaction():
-                owner = self._live_hash_owner_locked(expected_hash, kind, item_id)
-                self.connection.execute(
-                    "UPDATE items SET missing=? WHERE id=?",
-                    (1 if owner is not None else 0, item_id),
-                )
-        for item_id, path, kind in replacements:
-            if cancel_event is not None and cancel_event.is_set():
-                return
-            self.import_file(path, kind)
-            root = (
-                self._markdown_dir if kind == "markdown" else self._picture_dir
-            ) if self._is_under_local_store(path) else path.parent
-            try:
-                with storage.open_managed_binary(
-                    path, "rb", root, identity_locked=True
-                ) as current_file:
-                    stat = os.fstat(current_file.fileno())
-                    if stat.st_size > MAX_IMPORT_BYTES:
-                        raise OSError("replacement is no longer importable")
-                    current_disk_hash = self._stream_hash(current_file)
-                    with self._lock:
-                        current = self.connection.execute(
-                            "SELECT content_hash,missing FROM items WHERE id=?", (item_id,)
-                        ).fetchone()
-            except (OSError, RuntimeError):
-                self.mark_item_missing(item_id)
-                continue
-            if current is not None and (
-                current["missing"] or current["content_hash"] != current_disk_hash
-            ):
-                self.mark_item_missing(item_id)
+        return self._file_index.mark_missing_files(cancel_event)
 
     def close(self) -> None:
         with self._lock:

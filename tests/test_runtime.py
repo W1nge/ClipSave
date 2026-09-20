@@ -18,6 +18,7 @@ class ApplicationRuntimeTests(unittest.TestCase):
                 self.assertIs(runtime.clipboard_service.paths, paths)
                 self.assertIsNone(runtime.clipboard_service._worker)
                 self.assertIsNone(runtime.clipboard_service.parent())
+                self.assertIsNone(runtime.clipboard_service._notifier_window)
             finally:
                 self.assertTrue(runtime.close())
 

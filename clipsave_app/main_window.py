@@ -30,26 +30,21 @@ from PySide6.QtWidgets import (
 from send2trash import send2trash
 
 from .ai_service import AIService
-from .bulk_checkpoint import checkpoint_path
-from .bulk_image_controller import BulkImageCompletion, BulkImageController
+from .bulk_image_controller import BulkImageCompletion
 from .app_paths import AppPaths
 from .clipboard_service import ClipboardService
-from .constants import APP_NAME, LIBRARY_DIR
+from .constants import APP_NAME
 from .database import LibraryDatabase
 from .detail_animation_controller import DetailAnimationController
-from .library_controller import LibraryController
+from .image_task_controller import ImageOperationPreparationState
 from .library_metadata_controller import (
-    LibraryMetadataController,
     MetadataMutationResult,
 )
+from .library_controller import LibrarySnapshot
 from .library_models import LibraryQuery, LibraryViewState
-from .maintenance_controller import LibraryMaintenanceController
-from .image_task_controller import ImageTaskController
-from .monitoring_controller import MonitoringController
-from .mutation_controller import LibraryMutationController
+from .main_window_backend import MainWindowBackend, ShutdownFailure
 from .native_window_controller import NativeWindowController, windows_resize_hit_test
 from .file_preflight import preflight_image_file
-from .shutdown_coordinator import ShutdownCoordinator, ShutdownFailure
 from .services import (
     BackdropResult,
     apply_windows_backdrop,
@@ -58,12 +53,12 @@ from .services import (
     unregister_windows_power_saving_notification,
 )
 from .settings import Settings
+from .settings_workflow import SettingsWorkflow
 from .sidebar_interaction_controller import SidebarInteractionController
 from .startup import set_start_with_windows
-from .storage import is_under_local_store, recycle_managed_file
+from .storage import recycle_managed_file
 from .styles import stylesheet_for_theme
 from .task_executor import TaskCapacityExceeded, ai_ocr_task_executor
-from .task_supervisor import TaskSupervisor
 from .window_effects_controller import WindowEffectsController
 from .windows_frame import (
     enable_native_resize_frame,
@@ -249,6 +244,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.database = database
         self.settings = settings
+        self.settings_workflow = SettingsWorkflow(settings)
         self.paths = paths
         self.runtime = runtime
         self.app_icon = app_icon
@@ -260,44 +256,44 @@ class MainWindow(QMainWindow):
         self._table_dirty = True
         self._expanded_search_query = ""
         self._expanded_search_terms: tuple[str, ...] = ()
+        self._collections_metadata: list[object] = []
+        self._tags_metadata: list[object] = []
+        self._collections_by_id: dict[int, object] = {}
+        self._tags_by_id: dict[int, object] = {}
+        self._days_metadata: tuple[tuple[str, int], ...] = ()
         self._session_hidden_item_ids: set[int] = set()
         self.startup_scan_error: str | None = None
-        self._task_supervisor = TaskSupervisor()
-        # Compatibility views while callers/tests migrate to TaskSupervisor.
-        self._async_tasks = self._task_supervisor.regular_tasks
-        self._bounded_tasks = self._task_supervisor.bounded_tasks
-        self._async_tasks_lock = self._task_supervisor.lock
-        self.library_controller = LibraryController(
+        self.backend = MainWindowBackend(
             database,
-            self._task_supervisor,
+            settings,
             parent=self,
-        )
-        self.library_metadata_controller = LibraryMetadataController(database)
-        self.library_controller.refresh_succeeded.connect(self._library_refresh_succeeded)
-        self.library_controller.refresh_failed.connect(self._library_refresh_failed)
-        self.library_controller.search_succeeded.connect(self._item_search_succeeded)
-        self.library_controller.search_failed.connect(self._item_search_failed)
-        self.library_controller.page_succeeded.connect(self._item_page_succeeded)
-        self.library_controller.page_failed.connect(self._item_page_failed)
-        self.maintenance_controller = LibraryMaintenanceController(
-            database,
-            self._task_supervisor,
-            parent=self,
-        )
-        self.maintenance_controller.scan_succeeded.connect(self._startup_scan_finished)
-        self.maintenance_controller.scan_failed.connect(self._startup_scan_failed)
-        self.maintenance_controller.backup_succeeded.connect(self._periodic_backup_finished)
-        self.maintenance_controller.backup_failed.connect(self._periodic_backup_failed)
-        self.image_task_controller = ImageTaskController(
-            self._task_supervisor,
-            parent=self,
-            database=database,
+            start_regular=lambda token, target: self._start_async_task(token, target),
+            cancel_regular=lambda token: self._cancel_async_token(token),
             start_bounded=lambda token, target, **kwargs: self._start_bounded_task(
                 token,
                 target,
                 **kwargs,
             ),
         )
+        self._task_supervisor = self.backend.tasks
+        # Compatibility views while callers/tests migrate to TaskSupervisor.
+        self._async_tasks = self._task_supervisor.regular_tasks
+        self._bounded_tasks = self._task_supervisor.bounded_tasks
+        self._async_tasks_lock = self._task_supervisor.lock
+        self.library_controller = self.backend.library
+        self.library_metadata_controller = self.backend.metadata
+        self.library_controller.refresh_succeeded.connect(self._library_refresh_succeeded)
+        self.library_controller.refresh_failed.connect(self._library_refresh_failed)
+        self.library_controller.search_succeeded.connect(self._item_search_succeeded)
+        self.library_controller.search_failed.connect(self._item_search_failed)
+        self.library_controller.page_succeeded.connect(self._item_page_succeeded)
+        self.library_controller.page_failed.connect(self._item_page_failed)
+        self.maintenance_controller = self.backend.maintenance
+        self.maintenance_controller.scan_succeeded.connect(self._startup_scan_finished)
+        self.maintenance_controller.scan_failed.connect(self._startup_scan_failed)
+        self.maintenance_controller.backup_succeeded.connect(self._periodic_backup_finished)
+        self.maintenance_controller.backup_failed.connect(self._periodic_backup_failed)
+        self.image_task_controller = self.backend.images
         self.image_task_controller.ai_succeeded.connect(self._ai_succeeded)
         self.image_task_controller.ai_failed.connect(self._ai_failed)
         self.image_task_controller.ocr_succeeded.connect(self._ocr_succeeded)
@@ -308,24 +304,14 @@ class MainWindow(QMainWindow):
         self.image_task_controller.expanded_search_failed.connect(
             self._expanded_search_failed
         )
-        self.mutation_controller = LibraryMutationController(
-            database,
-            self._task_supervisor,
-            parent=self,
-        )
+        self.mutation_controller = self.backend.mutations
         self.mutation_controller.import_finished.connect(self._import_finished)
         self.mutation_controller.import_failed.connect(self._import_failed)
         self.mutation_controller.copy_succeeded.connect(self._copy_image_succeeded)
         self.mutation_controller.copy_failed.connect(self._copy_image_failed)
         self.mutation_controller.delete_finished.connect(self._delete_finished)
         self.mutation_controller.delete_failed.connect(self._delete_failed)
-        self.bulk_image_controller = BulkImageController(
-            database,
-            checkpoint_path(Path(settings.path)),
-            start_task=lambda token, target: self._start_async_task(token, target),
-            cancel_task=lambda token: self._cancel_async_token(token),
-            parent=self,
-        )
+        self.bulk_image_controller = self.backend.bulk_images
         self.bulk_image_controller.progress_changed.connect(self._bulk_image_progress)
         self.bulk_image_controller.finished.connect(self._bulk_image_finished)
         self._closing = False
@@ -430,20 +416,19 @@ class MainWindow(QMainWindow):
             self.clipboard_service = ClipboardService(database, self, paths=paths)
         else:
             self.clipboard_service = clipboard_service
-        self.monitoring_controller = MonitoringController(
-            self.settings,
-            self.clipboard_service,
-        )
-        self.clipboard_service.captured.connect(self.on_captured)
-        self.clipboard_service.failed.connect(self.show_error_status)
-        self.clipboard_service.state_changed.connect(self.update_monitor_button)
-        self.shutdown_coordinator = ShutdownCoordinator(
-            database,
+        self.clipboard_service.set_notifier_window(self)
+        (
+            self.monitoring_controller,
+            self.shutdown_coordinator,
+        ) = self.backend.attach_runtime(
             self.clipboard_service,
             self.grid,
             self.detail,
             runtime=runtime,
         )
+        self.clipboard_service.captured.connect(self.on_captured)
+        self.clipboard_service.failed.connect(self.show_error_status)
+        self.clipboard_service.state_changed.connect(self.update_monitor_button)
         if settings.get("monitoring", False):
             self.clipboard_service.start()
         else:
@@ -976,10 +961,32 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
 
     def refresh_library(self) -> None:
-        self._refresh_navigation_metadata()
-        self.refresh_items()
+        self._cancel_item_search_request()
+        self._cancel_item_page_request()
+        self._items_offset = 0
+        self._items_loading = False
+        snapshot = self.library_controller.snapshot(
+            self._current_item_query_spec(),
+            self.ITEM_PAGE_SIZE,
+        )
+        navigation = snapshot.navigation
+        self._apply_navigation_metadata(
+            navigation.counts,
+            navigation.collections,
+            navigation.tags,
+            navigation.days,
+        )
+        self._apply_first_page(snapshot.items)
 
-    def _apply_navigation_metadata(self, counts, collections, tags) -> None:
+    def _apply_navigation_metadata(self, counts, collections, tags, days=None) -> None:
+        collections = list(collections)
+        tags = list(tags)
+        self._collections_metadata = collections
+        self._tags_metadata = tags
+        self._collections_by_id = {int(row["id"]): row for row in collections}
+        self._tags_by_id = {int(row["id"]): row for row in tags}
+        if days is not None:
+            self._days_metadata = tuple((str(day), int(amount)) for day, amount in days)
         self.sidebar.set_primary(counts)
         self.sidebar.set_collections(collections)
         self.sidebar.set_tags(tags)
@@ -1000,9 +1007,13 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_navigation_metadata(self) -> None:
-        counts = self.database.counts()
-        collections = self.database.collections()
-        self._apply_navigation_metadata(counts, collections, self.database.tags())
+        navigation = self.library_controller.navigation_snapshot()
+        self._apply_navigation_metadata(
+            navigation.counts,
+            navigation.collections,
+            navigation.tags,
+            navigation.days,
+        )
 
     def _refresh_library_async(self) -> None:
         if self._closing or self._quit_in_progress:
@@ -1020,16 +1031,22 @@ class MainWindow(QMainWindow):
     ) -> None:
         if not self.library_controller.finish_refresh(token):
             return
-        if self._closing or self._quit_in_progress or not isinstance(payload, dict):
+        if (
+            self._closing
+            or self._quit_in_progress
+            or not isinstance(payload, LibrarySnapshot)
+        ):
             return
+        navigation = payload.navigation
         self._apply_navigation_metadata(
-            payload.get("counts", {}),
-            payload.get("collections", []),
-            payload.get("tags", []),
+            navigation.counts,
+            navigation.collections,
+            navigation.tags,
+            navigation.days,
         )
         if spec != self._current_item_query_spec():
             return
-        items = payload.get("items")
+        items = payload.items
         if not isinstance(items, list):
             self.show_error_status("资料库刷新失败：返回结果无效")
             return
@@ -1243,7 +1260,7 @@ class MainWindow(QMainWindow):
 
     def navigate(self, key: str, value) -> None:
         if key == "date":
-            dialog = DateDialog(self.database.days(), self)
+            dialog = DateDialog(list(self._days_metadata), self)
             dialog.day_selected.connect(self.open_day)
             self._exec_transient_dialog(dialog)
             return
@@ -1262,11 +1279,11 @@ class MainWindow(QMainWindow):
             self.current_recent = True
         elif key == "collection":
             self.current_collection = int(value)
-            row = next((row for row in self.database.collections() if row["id"] == value), None)
+            row = self._collections_by_id.get(self.current_collection)
             titles[key] = row["name"] if row else "集合"
         elif key == "tag":
             self.current_tag = int(value)
-            row = next((row for row in self.database.tags() if row["id"] == value), None)
+            row = self._tags_by_id.get(self.current_tag)
             titles[key] = f"标签：{row['name']}" if row else "标签"
         self.page_title.setText(titles.get(key, "全部内容"))
         active_key = f"{key}:{value}" if key in ("collection", "tag") else key
@@ -1547,7 +1564,10 @@ class MainWindow(QMainWindow):
         if not item:
             return
         message = f"要从 ClipSave 中删除“{item['title']}”吗？"
-        managed_file = bool(item["path"] and is_under_local_store(Path(item["path"])))
+        managed_file = bool(
+            item["path"]
+            and self.database.is_managed_path(Path(item["path"]))
+        )
         if managed_file:
             message += "\n\n对应文件将移入 Windows 回收站。"
         elif item["path"]:
@@ -1564,12 +1584,12 @@ class MainWindow(QMainWindow):
         item_snapshot = dict(item)
         was_selected = self.current_item_id == item_id
         detail_was_visible = self.detail.isVisible()
-        library_root = self.paths.library_dir if self.paths is not None else LIBRARY_DIR
+        library_root = self.database.library_dir
         request = self.mutation_controller.start_delete(
             item_snapshot,
             was_selected=was_selected,
             detail_was_visible=detail_was_visible,
-            is_managed=lambda path: is_under_local_store(path),
+            is_managed=self.database.is_managed_path,
             recycle=lambda path, root, **kwargs: recycle_managed_file(
                 path,
                 root,
@@ -1731,7 +1751,9 @@ class MainWindow(QMainWindow):
         ):
             return
         self._refresh_after_classification_delete(
-            active=self.current_collection == collection_id
+            active=self.current_collection == collection_id,
+            kind="collection",
+            item_id=collection_id,
         )
         self.show_status("集合已删除")
 
@@ -1751,13 +1773,39 @@ class MainWindow(QMainWindow):
             "标签未删除",
         ):
             return
-        self._refresh_after_classification_delete(active=self.current_tag == tag_id)
+        self._refresh_after_classification_delete(
+            active=self.current_tag == tag_id,
+            kind="tag",
+            item_id=tag_id,
+        )
         self.show_status("标签已删除")
 
-    def _refresh_after_classification_delete(self, active: bool) -> None:
+    def _remove_cached_classification(self, kind: str, item_id: int) -> None:
+        if kind == "collection":
+            self._collections_by_id.pop(item_id, None)
+            self._collections_metadata = [
+                row for row in self._collections_metadata if int(row["id"]) != item_id
+            ]
+            self.sidebar.set_collections(self._collections_metadata)
+            self.detail.set_collections(self._collections_metadata)
+            return
+        self._tags_by_id.pop(item_id, None)
+        self._tags_metadata = [
+            row for row in self._tags_metadata if int(row["id"]) != item_id
+        ]
+        self.sidebar.set_tags(self._tags_metadata)
+
+    def _refresh_after_classification_delete(
+        self,
+        active: bool,
+        *,
+        kind: str,
+        item_id: int,
+    ) -> None:
+        self._remove_cached_classification(kind, item_id)
         if active:
-            self._refresh_navigation_metadata()
             self.navigate("all", None)
+            self._refresh_library_async()
         else:
             self._refresh_after_mutation()
         if self.detail.isVisible() and self.current_item_id is not None:
@@ -1869,62 +1917,40 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "文件导入失败", message)
 
     def open_settings(self) -> None:
-        previous_follow_system = self.settings.get("follow_system_theme", True)
-        previous_theme_mode = self.settings.get("theme_mode", "light")
-        previous_start_with_windows = self.settings.get("start_with_windows", False)
-        previous_auto_ocr = self.settings.get("auto_ocr", False)
-        previous_auto_description = self.settings.get("auto_description", False)
-        dialog = SettingsDialog(self.settings, self)
+        previous = self.settings_workflow.snapshot()
+        dialog = SettingsDialog(
+            self.settings,
+            self,
+            global_hotkey_registered=self.global_hotkey_registered,
+            bulk_progress_provider=self.bulk_image_progress_snapshot,
+            data_dir=self.settings.path.parent,
+            library_dir=self.database.library_dir,
+        )
         dialog.import_requested.connect(lambda: self.import_files(dialog))
         dialog.bulk_processing_requested.connect(
             lambda: self._confirm_bulk_image_processing(dialog)
         )
         result = self._exec_transient_dialog(dialog)
-        if result:
-            start_with_windows = self.settings.get("start_with_windows", False)
-            if start_with_windows != previous_start_with_windows:
-                try:
-                    set_start_with_windows(start_with_windows)
-                except OSError as exc:
-                    try:
-                        self.settings.set("start_with_windows", previous_start_with_windows)
-                    except OSError:
-                        pass
-                    QMessageBox.warning(self, "开机自启动设置失败", str(exc))
-        if result and (
-            self.settings.get("follow_system_theme", True) != previous_follow_system
-            or self.settings.get("theme_mode", "light") != previous_theme_mode
-        ):
-            self.apply_theme(force=True)
-        if result:
-            if previous_auto_ocr and not self.settings.get("auto_ocr", False):
-                self._cancel_automatic_requests("ocr")
-            if previous_auto_description and not self.settings.get("auto_description", False):
-                self._cancel_automatic_requests("ai")
-
-    @staticmethod
-    def _bulk_progress_state(
-        checkpoint,
-        *,
-        active: bool = False,
-        phase: str = "",
-        error: str = "",
-    ) -> dict[str, object]:
-        return BulkImageController.progress_state_for(
-            checkpoint,
-            active=active,
-            phase=phase,
-            error=error,
+        effects = self.settings_workflow.reconcile(
+            previous,
+            accepted=bool(result),
+            set_startup=set_start_with_windows,
         )
-
-    def _initial_bulk_image_progress_state(self) -> dict[str, object]:
-        return self.bulk_image_controller.snapshot()
+        if effects.startup_error:
+            QMessageBox.warning(
+                self,
+                "开机自启动设置失败",
+                effects.startup_error,
+            )
+        if effects.theme_changed:
+            self.apply_theme(force=True)
+        if effects.cancel_auto_ocr:
+            self._cancel_automatic_requests("ocr")
+        if effects.cancel_auto_description:
+            self._cancel_automatic_requests("ai")
 
     def bulk_image_progress_snapshot(self) -> dict[str, object]:
         return self.bulk_image_controller.snapshot()
-
-    def _load_bulk_image_checkpoint(self):
-        return self.bulk_image_controller.load_checkpoint()
 
     def _confirm_bulk_image_processing(self, dialog: SettingsDialog) -> None:
         if self.bulk_image_controller.request is not None:
@@ -1939,7 +1965,7 @@ class MainWindow(QMainWindow):
                 "请先填写 Base URL 和视觉模型名称，再开始批量处理。",
             )
             return
-        checkpoint = self._load_bulk_image_checkpoint()
+        checkpoint = self.bulk_image_controller.load_checkpoint()
         if checkpoint is not None and checkpoint.processed >= checkpoint.total:
             checkpoint = None
         image_count = (
@@ -2064,16 +2090,8 @@ class MainWindow(QMainWindow):
             self.settings.get("ai_base_url", ""),
             self.settings.get("ai_api_key", ""),
             self.settings.get("ai_vision_model", ""),
+            picture_root=self.database.picture_dir,
         )
-
-    @staticmethod
-    def _image_task_estimate(item) -> int:
-        try:
-            width = max(0, int(item["width"] or 0))
-            height = max(0, int(item["height"] or 0))
-            return width * height * 4
-        except (KeyError, TypeError, ValueError):
-            return 0
 
     def _cancel_automatic_requests(self, operation: str) -> None:
         for item_id in self.image_task_controller.cancel_automatic(operation):
@@ -2087,39 +2105,27 @@ class MainWindow(QMainWindow):
     def _schedule_auto_image_tasks(self, item_id: int) -> None:
         if self._closing or self._quit_in_progress:
             return
-        item = self.database.get_item(item_id)
-        if not item or item["kind"] != "image" or not item["path"]:
-            return
         service = self._ai_service()
-        if not service.configured:
-            return
-        if (
-            self.settings.get("auto_ocr", False)
-            and not str(item["ocr_text"] or "").strip()
-            and item_id not in self.image_task_controller.ocr_requests
-        ):
-            self.generate_ocr(item_id, automatic=True)
-        if (
-            self.settings.get("auto_description", False)
-            and not str(item["ai_description"] or "").strip()
-            and item_id not in self.image_task_controller.ai_requests
-        ):
-            self.generate_ai_description(item_id, automatic=True)
+        operations = self.image_task_controller.automatic_operations_for_item(
+            item_id,
+            service,
+            auto_ocr=bool(self.settings.get("auto_ocr", False)),
+            auto_description=bool(self.settings.get("auto_description", False)),
+        )
+        for operation in operations:
+            if operation == "ocr":
+                self.generate_ocr(item_id, automatic=True)
+            else:
+                self.generate_ai_description(item_id, automatic=True)
 
     def _start_startup_scan(self, full_scan: bool, reconcile_images: bool) -> None:
         self.startup_scan_error = None
         self.maintenance_controller.start_scan(full_scan, reconcile_images)
 
     def _start_periodic_backup(self) -> None:
-        if (
-            self._closing
-            or self._quit_in_progress
-            or self.maintenance_controller.backup_request is not None
-        ):
+        if self._closing or self._quit_in_progress:
             return
-        if not self.database.backup_state()["dirty"]:
-            return
-        self.maintenance_controller.start_backup()
+        self.maintenance_controller.start_backup_if_dirty()
 
     def _periodic_backup_finished(self, token: object, signals: QObject, _path: str) -> None:
         self.maintenance_controller.finish_backup(token, signals)
@@ -2165,10 +2171,10 @@ class MainWindow(QMainWindow):
         self.show_error_status(f"启动扫描失败：{message}")
 
     def _cancel_async_token(self, token: object) -> None:
-        self._task_supervisor.cancel(token)
+        self.backend.cancel_token(token)
 
     def _finish_async_token(self, token: object) -> None:
-        self._task_supervisor.finish_bounded(token)
+        self.backend.finish_bounded(token)
 
     def _schedule_cancelled_request_cleanup(self, cancelled_tokens: set[object]) -> None:
         if not cancelled_tokens:
@@ -2199,28 +2205,16 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, poll)
 
     def _cancel_request(self, request: tuple[object, QObject] | None) -> None:
-        if request is None:
-            return
-        token, signals = request
-        self._cancel_async_token(token)
+        self.backend.cancel_request(request)
 
     def _cancel_item_requests(self, item_id: int) -> None:
         self.image_task_controller.cancel_item(item_id)
 
     def _cancel_background_requests(self) -> set[object]:
-        self._cancel_library_refresh_request()
-        self._cancel_item_search_request()
-        self._cancel_item_page_request()
-        cancelled_tokens = self.image_task_controller.cancel_for_shutdown()
-        cancelled_tokens.update(self.mutation_controller.cancel_for_shutdown())
-        bulk_token = self.bulk_image_controller.cancel()
-        if bulk_token is not None:
-            cancelled_tokens.add(bulk_token)
-        return cancelled_tokens
+        return self.backend.cancel_background_requests()
 
     def _clear_background_request_state(self) -> None:
-        self.image_task_controller.clear_state()
-        self.mutation_controller.clear_background_state()
+        self.backend.clear_background_request_state()
         self.expanded_search_button.setEnabled(True)
         self.expanded_search_button.setText("扩大搜索")
 
@@ -2233,11 +2227,10 @@ class MainWindow(QMainWindow):
     ) -> bool:
         if request is None:
             return True
-        token, _signals = request
         app = QApplication.instance()
         pump_events = app.processEvents if process_events and app is not None else None
-        return self._task_supervisor.wait_for_token(
-            token,
+        return self.backend.wait_for_request(
+            request,
             timeout,
             pump_events=pump_events,
         )
@@ -2251,7 +2244,7 @@ class MainWindow(QMainWindow):
     ) -> bool:
         app = QApplication.instance()
         pump_events = app.processEvents if process_events and app is not None else None
-        return self._task_supervisor.cancel_all_and_wait(
+        return self.backend.cancel_all_and_wait(
             timeout,
             require_bounded=require_bounded,
             pump_events=pump_events,
@@ -2271,11 +2264,6 @@ class MainWindow(QMainWindow):
         operation: str,
     ) -> bool:
         is_ai = operation == "ai"
-        requests = (
-            self.image_task_controller.ai_requests
-            if is_ai
-            else self.image_task_controller.ocr_requests
-        )
         invalid_title = "AI 描述" if is_ai else "OCR"
         invalid_message = (
             "当前只支持为图片生成 AI 描述。"
@@ -2288,13 +2276,18 @@ class MainWindow(QMainWindow):
             "自动生成描述暂时无法启动" if is_ai else "自动 OCR 暂时无法启动"
         )
 
-        item = self.database.get_item(item_id)
-        if not item or item["kind"] != "image" or not item["path"]:
+        service = self._ai_service()
+        preparation = self.image_task_controller.prepare_image_operation(
+            item_id,
+            service,
+            operation=operation,
+            automatic=automatic,
+        )
+        if preparation.state is ImageOperationPreparationState.INVALID_ITEM:
             if not automatic:
                 QMessageBox.information(self, invalid_title, invalid_message)
             return False
-        service = self._ai_service()
-        if not service.configured:
+        if preparation.state is ImageOperationPreparationState.SERVICE_UNCONFIGURED:
             if not automatic:
                 QMessageBox.information(
                     self,
@@ -2309,8 +2302,7 @@ class MainWindow(QMainWindow):
                 )
                 self.open_settings()
             return False
-        expected_content_hash = item["content_hash"]
-        if not expected_content_hash:
+        if preparation.state is ImageOperationPreparationState.MISSING_HASH:
             if not automatic:
                 QMessageBox.warning(
                     self,
@@ -2318,10 +2310,14 @@ class MainWindow(QMainWindow):
                     "图片索引缺少内容校验值，请重新导入后再试。",
                 )
             return False
-        if item_id in requests:
-            if automatic:
-                return False
-            self.image_task_controller.cancel_operation(item_id, operation)
+        if preparation.state in {
+            ImageOperationPreparationState.ALREADY_RUNNING,
+            ImageOperationPreparationState.DATABASE_UNAVAILABLE,
+        }:
+            return False
+        item = preparation.item
+        if item is None:
+            return False
         if self.current_item_id == item_id:
             if is_ai:
                 self.detail.set_ai_busy(True)
@@ -2333,7 +2329,7 @@ class MainWindow(QMainWindow):
                 service,
                 operation=operation,
                 automatic=automatic,
-                estimated_bytes=self._image_task_estimate(item),
+                estimated_bytes=preparation.estimated_bytes,
             )
         except (TaskCapacityExceeded, RuntimeError) as exc:
             if self.current_item_id == item_id:

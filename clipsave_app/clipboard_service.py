@@ -1,28 +1,27 @@
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import os
 import time
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QBuffer, QEventLoop, QIODevice, QObject, QTimer, Signal
+from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
 from .app_paths import AppPaths
+from .clipboard_capture_store import ClipboardCaptureStore, validate_clipboard_image
 from .clipboard_persistence import ClipboardPersistenceWorker, ClipboardTask
 from .constants import (
     MARKDOWN_DIR,
     MAX_CLIPBOARD_IMAGE_BYTES,
     MAX_CLIPBOARD_TEXT_BYTES,
-    MAX_IMAGE_PIXELS,
     PICTURE_DIR,
 )
 from .database import LibraryDatabase
 from .native_clipboard_reader import ClipboardBusy as _ClipboardBusy, NativeClipboardReader
-from .storage import delete_managed_file, open_managed_binary, validate_managed_write_path
+from .storage import open_managed_binary
 from .windows_clipboard import WindowsClipboardNotifier
 
 
@@ -54,6 +53,7 @@ class ClipboardService(QObject):
         super().__init__(parent)
         self.database = database
         self.paths = paths
+        self._notifier_window = parent
         self.timer = QTimer(self)
         self.timer.setInterval(self.POLL_INTERVAL_MS)
         self.timer.timeout.connect(self._poll_if_monitoring)
@@ -78,6 +78,34 @@ class ClipboardService(QObject):
             on_failure=self._persistence_failed.emit,
             on_suppressed_finish=self._finish_task_without_signal,
             report_failure=self.failed.emit,
+        )
+        self._capture_store = ClipboardCaptureStore(
+            database,
+            picture_dir=lambda: self.picture_dir,
+            markdown_dir=lambda: self.markdown_dir,
+            open_managed_binary=lambda *args, **kwargs: self._open_managed_binary(
+                *args,
+                **kwargs,
+            ),
+        )
+
+    def set_notifier_window(self, window) -> None:
+        """Bind the window used to register native clipboard notifications.
+
+        This is intentionally independent of QObject ownership: process-lifetime
+        services may be owned by ApplicationRuntime while listening on a window HWND.
+        """
+        if self._notifier_window is window:
+            return
+        self._notifier_window = window
+        if not self._monitoring_enabled:
+            return
+        self.notifier.stop()
+        notifier_active = self.notifier.start(window)
+        self.timer.setInterval(
+            self.EVENT_FALLBACK_INTERVAL_MS
+            if notifier_active
+            else self.POLL_INTERVAL_MS
         )
 
     @property
@@ -179,8 +207,7 @@ class ClipboardService(QObject):
 
     def _start_monitoring(self) -> None:
         self._monitoring_enabled = True
-        notifier_window = self.parent()
-        notifier_active = self.notifier.start(notifier_window)
+        notifier_active = self.notifier.start(self._notifier_window)
         self.timer.setInterval(self.EVENT_FALLBACK_INTERVAL_MS if notifier_active else self.POLL_INTERVAL_MS)
         self.timer.start()
         self.state_changed.emit(True)
@@ -202,14 +229,7 @@ class ClipboardService(QObject):
 
     @staticmethod
     def _validate_image(image: QImage) -> None:
-        if image.isNull() or image.width() <= 0 or image.height() <= 0:
-            raise ValueError("剪贴板图片无效，已拒绝保存。")
-        pixels = image.width() * image.height()
-        if pixels > MAX_IMAGE_PIXELS:
-            raise ValueError("图片尺寸过大，已拒绝保存。")
-        normalized_bytes = pixels * 4
-        if normalized_bytes > MAX_CLIPBOARD_IMAGE_BYTES or image.sizeInBytes() > MAX_CLIPBOARD_IMAGE_BYTES:
-            raise ValueError("图片占用内存过大，已拒绝保存。")
+        validate_clipboard_image(image)
 
     @classmethod
     def image_key(cls, image: QImage) -> str:
@@ -488,123 +508,18 @@ class ClipboardService(QObject):
             return snapshot[0], snapshot[1], sequence
         raise RuntimeError("读取剪贴板时内容持续变化，请稍后重试。")
 
-    def _remove_new_image(
-        self,
-        path: Path,
-        original_error: BaseException | None = None,
-        *,
-        expected_sha256: str | None = None,
-        expected_size: int | None = None,
-    ) -> None:
-        try:
-            if path.exists():
-                delete_managed_file(
-                    path,
-                    self.picture_dir,
-                    expected_sha256=expected_sha256,
-                    expected_size=expected_size,
-                )
-        except (OSError, RuntimeError) as cleanup_error:
-            if original_error is not None:
-                return
-            raise OSError(f"无法清理重复图片文件: {path}") from cleanup_error
-
-    def _database_image_owner(self, digest: str):
-        return self.database.indexed_file_for_hash(digest)
-
     def save_image(self, image: QImage) -> bool:
-        self._validate_image(image)
-        now = dt.datetime.now().astimezone()
-        folder = self.picture_dir / f"{now:%Y-%m-%d}"
-        validate_managed_write_path(folder / "capture.tmp", self.picture_dir)
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"image_{now:%Y%m%d_%H%M%S_%f}.png"
-        payload: bytes | None = None
-        payload_hash: str | None = None
-        owner = None
-        try:
-            encoded = QByteArray()
-            buffer = QBuffer(encoded)
-            if not buffer.open(QIODevice.OpenModeFlag.WriteOnly) or not image.save(buffer, "PNG"):
-                raise OSError(f"无法保存图片: {path}")
-            buffer.close()
-            payload = bytes(encoded)
-            if len(payload) > MAX_CLIPBOARD_IMAGE_BYTES:
-                raise ValueError("图片 PNG 数据过大，已拒绝保存。")
-            with self._open_managed_binary(path, "xb", self.picture_dir) as handle:
-                handle.write(payload)
-            payload_hash = hashlib.sha256(payload).hexdigest()
-            with self._open_managed_binary(
-                path, "rb", self.picture_dir, identity_locked=True
-            ) as owned_file:
-                owned_hash = hashlib.sha256()
-                owned_size = 0
-                while chunk := owned_file.read(1024 * 1024):
-                    owned_hash.update(chunk)
-                    owned_size += len(chunk)
-                if owned_size != len(payload) or owned_hash.hexdigest() != payload_hash:
-                    raise RuntimeError("Captured image changed before it could be indexed")
-                item_id = self.database.add_verified_image(
-                    path,
-                    content_hash=payload_hash,
-                    file_size=owned_size,
-                    width=image.width(),
-                    height=image.height(),
-                    created_at=now,
-                )
-                if item_id:
-                    if not self._suppress_worker_signals:
-                        self.captured.emit(item_id)
-                    return True
-                owner = self._database_image_owner(payload_hash)
-                if owner is not None and owner["resolved_path"] == self.database.path_key(path):
-                    if not self._suppress_worker_signals:
-                        self.captured.emit(owner["id"])
-                    return True
-        except BaseException as exc:
-            self._remove_new_image(
-                path,
-                exc,
-                expected_sha256=payload_hash,
-                expected_size=len(payload) if payload is not None else None,
-            )
-            raise
-        self._remove_new_image(
-            path,
-            expected_sha256=payload_hash,
-            expected_size=len(payload),
-        )
-        if owner is not None:
-            if not self._suppress_worker_signals:
-                self.captured.emit(owner["id"])
-            return True
-        raise RuntimeError("图片文件已写入，但数据库未能保存该记录。")
+        result = self._capture_store.save_image(image)
+        if result.item_id is not None and not self._suppress_worker_signals:
+            self.captured.emit(result.item_id)
+        return True
 
     def save_text(self, text: str) -> bool:
-        byte_size = len(text.encode("utf-8"))
-        if byte_size > MAX_CLIPBOARD_TEXT_BYTES:
-            raise ValueError(f"剪贴板文字超过 {MAX_CLIPBOARD_TEXT_BYTES // (1024 * 1024)} MiB，已拒绝保存。")
-        now = dt.datetime.now().astimezone()
-        item_id = self.database.add_text(text, now)
-        if not item_id:
-            return True
-        daily = self.markdown_dir / f"clipboard_{now:%Y-%m-%d}.md"
-        warning = ""
-        try:
-            entry = f"\n\n---\n\n**{now:%H:%M:%S}**\n\n{text}\n".encode("utf-8")
-            try:
-                with self._open_managed_binary(daily, "xb", self.markdown_dir) as handle:
-                    handle.write(f"# ClipSave {now:%Y-%m-%d}\n".encode("utf-8"))
-                    handle.write(entry)
-            except FileExistsError:
-                with self._open_managed_binary(daily, "ab", self.markdown_dir) as handle:
-                    handle.write(entry)
-        except (OSError, RuntimeError, UnicodeError) as exc:
-            warning = f"文字已保存到数据库，但写入每日 Markdown 失败: {exc}"
-        if not self._suppress_worker_signals:
-            self.captured.emit(item_id)
-        if warning and not self._suppress_worker_signals:
-            self.failed.emit(warning)
+        result = self._capture_store.save_text(text)
+        if result.item_id is not None and not self._suppress_worker_signals:
+            self.captured.emit(result.item_id)
+        if result.warning and not self._suppress_worker_signals:
+            self.failed.emit(result.warning)
         return True
 
     def suppress_text(self, text: str) -> None:

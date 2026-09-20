@@ -49,6 +49,13 @@ class LibraryMaintenanceController(QObject):
         self.supervisor.start_thread(token, work)
         return request
 
+    def start_backup_if_dirty(self) -> tuple[object, QObject] | None:
+        if self.backup_request is not None:
+            return None
+        if not self.database.backup_state()["dirty"]:
+            return None
+        return self.start_backup()
+
     def start_backup(self) -> tuple[object, QObject]:
         token = object()
         marker = QObject(self)

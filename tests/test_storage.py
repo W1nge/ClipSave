@@ -11,6 +11,7 @@ from ctypes import wintypes
 from unittest.mock import Mock, patch
 
 from clipsave_app import storage
+from clipsave_app.app_paths import AppPaths
 
 
 class StorageTests(unittest.TestCase):
@@ -475,6 +476,44 @@ class StorageTests(unittest.TestCase):
             storage.ensure_storage_directories()
         for path in paths.values():
             self.assertTrue(path.is_dir())
+
+    def test_storage_directories_honor_explicit_app_paths(self):
+        paths = AppPaths.build(
+            base_dir=self.root / "portable-app",
+            local_root=self.root / "custom-profile",
+        )
+
+        storage.ensure_storage_directories(paths)
+
+        for path in (
+            paths.data_dir,
+            paths.library_dir,
+            paths.picture_dir,
+            paths.markdown_dir,
+            paths.thumb_dir,
+            paths.maintenance_dir,
+        ):
+            self.assertTrue(path.is_dir())
+
+    def test_legacy_migration_honors_explicit_app_paths(self):
+        paths = AppPaths.build(
+            base_dir=self.root / "portable-app",
+            local_root=self.root / "custom-profile",
+        )
+        paths.base_dir.mkdir(parents=True)
+        legacy = paths.legacy_data_dir
+        legacy.mkdir(parents=True)
+        history = legacy / "clipsave_history.json"
+        history.write_text('{"profile": true}', encoding="utf-8")
+
+        result = storage.migrate_legacy_layout(paths)
+
+        self.assertEqual(result["data"], 1)
+        self.assertFalse(history.exists())
+        self.assertEqual(
+            (paths.data_dir / history.name).read_text(encoding="utf-8"),
+            '{"profile": true}',
+        )
 
     def test_safe_file_iteration_prunes_reparse_directories(self):
         library = self.root / "Library"

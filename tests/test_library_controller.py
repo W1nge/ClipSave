@@ -25,6 +25,9 @@ class FakeDatabase:
     def tags(self):
         return []
 
+    def days(self):
+        return [("2026-09-20", 1)]
+
 
 class LibraryControllerTests(unittest.TestCase):
     @classmethod
@@ -80,3 +83,13 @@ class LibraryControllerTests(unittest.TestCase):
         self.assertIsNone(controller.search_request)
         release.set()
         self.assertTrue(supervisor.wait_for_token(request.token, 1.0))
+
+    def test_snapshot_is_shared_by_sync_and_async_refresh_paths(self):
+        controller = LibraryController(FakeDatabase(), TaskSupervisor())
+        query = LibraryQuery(query="needle")
+
+        snapshot = controller.snapshot(query, 10)
+
+        self.assertEqual(snapshot.navigation.counts, {"all": 1})
+        self.assertEqual(snapshot.navigation.days, [("2026-09-20", 1)])
+        self.assertEqual(snapshot.items, [("needle", 0)])

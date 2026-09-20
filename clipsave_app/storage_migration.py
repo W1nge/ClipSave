@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -32,9 +33,143 @@ class StorageMigrationOps:
     open_managed_binary: Callable[..., object]
     delete_managed_file: Callable[..., None]
     delete_source_if_identical: Callable[[Path, Path, Path, Path], bool]
-    copy_verify_delete_file: Callable[[Path, Path, Path, Path], bool]
-    copy_or_move_contents: Callable[[Path, Path], int]
     copy_legacy_database_snapshot: Callable[[Path, Path], None]
+
+
+def copy_verify_delete_file(
+    source: Path,
+    destination: Path,
+    source_root: Path,
+    destination_root: Path,
+    ops: StorageMigrationOps,
+) -> bool:
+    if ops.is_link_or_junction(source) or ops.is_link_or_junction(destination):
+        return False
+    copied_digest = hashlib.sha256()
+    copied_size = 0
+    created_destination = False
+    try:
+        with ops.open_managed_binary(
+            source,
+            "rb",
+            source_root,
+            identity_locked=True,
+        ) as source_handle, ops.open_managed_binary(
+            destination,
+            "xb",
+            destination_root,
+        ) as destination_handle:
+            created_destination = True
+            source_stat = os.fstat(source_handle.fileno())
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise RuntimeError(f"Migration source is not a regular file: {source}")
+            while chunk := source_handle.read(1024 * 1024):
+                destination_handle.write(chunk)
+                copied_digest.update(chunk)
+                copied_size += len(chunk)
+        try:
+            shutil.copystat(source, destination, follow_symlinks=False)
+        except OSError:
+            pass
+        if ops.delete_source_if_identical(
+            source,
+            destination,
+            source_root,
+            destination_root,
+        ):
+            return True
+    except FileExistsError:
+        return ops.delete_source_if_identical(
+            source,
+            destination,
+            source_root,
+            destination_root,
+        )
+    except (OSError, RuntimeError):
+        if created_destination:
+            try:
+                ops.delete_managed_file(
+                    destination,
+                    destination_root,
+                    expected_sha256=copied_digest.hexdigest(),
+                    expected_size=copied_size,
+                )
+            except (OSError, RuntimeError):
+                pass
+        return False
+    return False
+
+
+def copy_or_move_contents(
+    source: Path,
+    target: Path,
+    ops: StorageMigrationOps,
+) -> int:
+    if (
+        ops.is_link_or_junction(source)
+        or ops.is_link_or_junction(target)
+        or ops.paths_overlap(source, target)
+    ):
+        return 0
+    if not source.exists() or not source.is_dir():
+        return 0
+    if target.exists() and not target.is_dir():
+        return 0
+    target.mkdir(parents=True, exist_ok=True)
+    if ops.is_link_or_junction(target):
+        return 0
+    moved = 0
+    for child in list(source.iterdir()):
+        if ops.is_link_or_junction(child):
+            continue
+        destination = target / child.name
+        if ops.is_link_or_junction(destination):
+            continue
+        if destination.exists():
+            if child.is_dir():
+                moved += copy_or_move_contents(child, destination, ops)
+                try:
+                    child.rmdir()
+                except OSError:
+                    pass
+            else:
+                if destination.is_file() and ops.delete_source_if_identical(
+                    child,
+                    destination,
+                    source,
+                    target,
+                ):
+                    moved += 1
+                    continue
+                stem, suffix = child.stem, child.suffix
+                index = 2
+                while destination.exists():
+                    destination = target / f"{stem} (迁移 {index}){suffix}"
+                    index += 1
+                if copy_verify_delete_file(
+                    child,
+                    destination,
+                    source,
+                    target,
+                    ops,
+                ):
+                    moved += 1
+        else:
+            if child.is_dir():
+                moved += copy_or_move_contents(child, destination, ops)
+            elif copy_verify_delete_file(
+                child,
+                destination,
+                source,
+                target,
+                ops,
+            ):
+                moved += 1
+    try:
+        source.rmdir()
+    except OSError:
+        pass
+    return moved
 
 
 def _archive_identical_legacy_database(
@@ -304,9 +439,10 @@ def migrate_legacy_layout(
     )
     result["pictures"] = len(picture_moves)
     result["markdown"] = len(markdown_moves)
-    result["data"] = ops.copy_or_move_contents(
+    result["data"] = copy_or_move_contents(
         paths.legacy_data_dir,
         paths.data_dir,
+        ops,
     )
 
     legacy_history = paths.base_dir / "clipsave_history.json"
@@ -318,11 +454,12 @@ def migrate_legacy_layout(
         and not ops.paths_overlap(legacy_history, history_target)
         and not history_target.exists()
     ):
-        if ops.copy_verify_delete_file(
+        if copy_verify_delete_file(
             legacy_history,
             history_target,
             paths.base_dir,
             paths.data_dir,
+            ops,
         ):
             result["data"] += 1
     return result

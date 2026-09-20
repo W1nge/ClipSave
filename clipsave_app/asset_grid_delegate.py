@@ -1,40 +1,31 @@
 from __future__ import annotations
 
-import re
 from collections import OrderedDict
 
-from PySide6.QtCore import QModelIndex, QPointF, QRect, QRectF, QSize, QSizeF, Qt
+from PySide6.QtCore import QModelIndex, QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout,
     QColor,
     QFont,
-    QFontMetricsF,
     QPainter,
     QPalette,
     QPen,
     QPixmap,
     QTextDocument,
-    QTextLayout,
     QTextOption,
 )
+from .asset_grid_transition_renderer import AssetGridTransitionRenderer
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
 from .constants import TYPE_LABELS
+from .asset_text_layout import (
+    plain_text_layout,
+    plain_text_layout_signature,
+    plain_text_layout_source,
+    plain_text_wrap_mode,
+)
 from .item_models import AssetItemModel, format_local_timestamp
 from .ui_primitives import dark_theme_active, lucide_icon
-
-
-_MACHINE_TEXT_SPAN_RE = re.compile(
-    r"(?:[A-Za-z][A-Za-z0-9+.-]*://|www\.)"
-    r"[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+"
-    r"|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-    r"|(?:[A-Za-z]:[\\/]|\\\\)[^\s\r\n]+"
-    r"|(?:\.{0,2}/|~/|/)?(?:[A-Za-z0-9._-]+[\\/])+[A-Za-z0-9._-]+"
-    r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-    r"|[0-9a-fA-F]{20,}"
-    r"|[A-Za-z0-9_+/=-]{20,}"
-)
 
 
 class AssetGridDelegate(QStyledItemDelegate):
@@ -46,16 +37,12 @@ class AssetGridDelegate(QStyledItemDelegate):
         self.favorite_on = lucide_icon("star", "#f4a100", 18, "#f4a100").pixmap(18, 18)
         self.favorite_off = lucide_icon("star", "#f4a100", 18).pixmap(18, 18)
         self._markdown_documents: OrderedDict[tuple[object, ...], QTextDocument] = OrderedDict()
-        self._transition_preview_caches: OrderedDict[
-            tuple[object, ...], QPixmap
-        ] = OrderedDict()
-        self._transition_layout_signatures: OrderedDict[
-            tuple[object, ...], tuple[object, ...]
-        ] = OrderedDict()
+        self._transition_renderer = AssetGridTransitionRenderer(self)
+        self._transition_preview_caches = self._transition_renderer.preview_caches
+        self._transition_layout_signatures = self._transition_renderer.layout_signatures
 
     def clear_transition_caches(self) -> None:
-        self._transition_preview_caches.clear()
-        self._transition_layout_signatures.clear()
+        self._transition_renderer.clear()
 
     def sizeHint(self, option, index) -> QSize:
         return self.view.gridSize()
@@ -147,57 +134,13 @@ class AssetGridDelegate(QStyledItemDelegate):
 
     @staticmethod
     def _plain_text_wrap_mode(content: str) -> QTextOption.WrapMode:
-        value = content.strip()
-        if not value:
-            return QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
-        machine_text = (
-            re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*://\S+", value)
-            or re.fullmatch(r"www\.\S+", value, re.IGNORECASE)
-            or re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value)
-            or re.fullmatch(r"(?:[A-Za-z]:[\\/]|\\\\|/|\./|\.\./|~/).+", value)
-            or re.fullmatch(r"\S*[\\/]\S*", value)
-            or re.fullmatch(
-                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
-                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-                value,
-            )
-            or re.fullmatch(r"[0-9a-fA-F]{20,}", value)
-            or re.fullmatch(r"[A-Za-z0-9_+/=-]{20,}", value)
-            or re.fullmatch(
-                r"(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]{2,}(?:/\S*)?",
-                value,
-            )
-        )
-        if machine_text:
-            return QTextOption.WrapMode.WrapAnywhere
-        return QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere
+        return plain_text_wrap_mode(content)
 
     @staticmethod
     def _plain_text_layout_source(
         content: str,
     ) -> tuple[str, tuple[int, ...]]:
-        source = content[:330]
-        if (
-            AssetGridDelegate._plain_text_wrap_mode(source)
-            == QTextOption.WrapMode.WrapAnywhere
-        ):
-            return source, tuple(range(len(source) + 1))
-        machine_positions = [False] * len(source)
-        for match in _MACHINE_TEXT_SPAN_RE.finditer(source):
-            machine_positions[match.start() : match.end()] = [True] * (
-                match.end() - match.start()
-            )
-        if not any(machine_positions):
-            return source, tuple(range(len(source) + 1))
-        transformed: list[str] = []
-        original_boundaries = [0]
-        for index, character in enumerate(source):
-            transformed.append(character)
-            original_boundaries.append(index + 1)
-            if machine_positions[index]:
-                transformed.append("\u200b")
-                original_boundaries.append(index + 1)
-        return "".join(transformed), tuple(original_boundaries)
+        return plain_text_layout_source(content)
 
     @staticmethod
     def _plain_text_layout(
@@ -205,77 +148,8 @@ class AssetGridDelegate(QStyledItemDelegate):
         width: int,
         height: int,
         font: QFont,
-    ) -> tuple[list[QTextLayout], tuple[tuple[int, int], ...]]:
-        source, original_boundaries = (
-            AssetGridDelegate._plain_text_layout_source(content)
-        )
-        layouts: list[QTextLayout] = []
-        lines: list[tuple[int, int]] = []
-        transformed_offset = 0
-        y = 0.0
-        segments = source.splitlines(keepends=True) or [source]
-        for segment in segments:
-            if y >= max(1, height):
-                break
-            newline_length = len(segment) - len(segment.rstrip("\r\n"))
-            paragraph = (
-                segment[:-newline_length] if newline_length else segment
-            )
-            layout = QTextLayout(paragraph, font)
-            option = QTextOption()
-            option.setWrapMode(
-                AssetGridDelegate._plain_text_wrap_mode(content)
-            )
-            layout.setTextOption(option)
-            layout.beginLayout()
-            paragraph_line_indexes: list[int] = []
-            completed = False
-            while y < max(1, height):
-                line = layout.createLine()
-                if not line.isValid():
-                    completed = True
-                    break
-                line.setLineWidth(max(1, width))
-                line.setPosition(QPointF(0.0, y))
-                transformed_start = (
-                    transformed_offset + line.textStart()
-                )
-                transformed_end = transformed_start + line.textLength()
-                original_start = original_boundaries[transformed_start]
-                original_end = original_boundaries[transformed_end]
-                paragraph_line_indexes.append(len(lines))
-                lines.append(
-                    (original_start, original_end - original_start)
-                )
-                y += line.height()
-            layout.endLayout()
-            layouts.append(layout)
-            if not paragraph:
-                y += QFontMetricsF(font).height()
-                completed = True
-            if completed and newline_length:
-                newline_start = transformed_offset + len(paragraph)
-                newline_end = newline_start + newline_length
-                original_newline_length = (
-                    original_boundaries[newline_end]
-                    - original_boundaries[newline_start]
-                )
-                if paragraph_line_indexes:
-                    line_index = paragraph_line_indexes[-1]
-                    start, length = lines[line_index]
-                    lines[line_index] = (
-                        start,
-                        length + original_newline_length,
-                    )
-                else:
-                    lines.append(
-                        (
-                            original_boundaries[newline_start],
-                            original_newline_length,
-                        )
-                    )
-            transformed_offset += len(segment)
-        return layouts, tuple(lines)
+    ):
+        return plain_text_layout(content, width, height, font)
 
     @staticmethod
     def _plain_text_layout_signature(
@@ -284,13 +158,7 @@ class AssetGridDelegate(QStyledItemDelegate):
         height: int,
         font: QFont,
     ) -> tuple[tuple[int, int], ...]:
-        _layouts, lines = AssetGridDelegate._plain_text_layout(
-            content,
-            width,
-            height,
-            font,
-        )
-        return lines
+        return plain_text_layout_signature(content, width, height, font)
 
     @staticmethod
     def _draw_plain_text_preview(
@@ -311,93 +179,12 @@ class AssetGridDelegate(QStyledItemDelegate):
             layout.draw(painter, QPointF(rect.left(), rect.top()))
         painter.restore()
 
-    def _markdown_layout_signature(
-        self,
-        content: str,
-        width: int,
-        height: int,
-        dark: bool,
-        font: QFont,
-    ) -> tuple[tuple[int, int], ...]:
-        document = self._markdown_document(content, width, dark, font)
-        document.documentLayout().documentSize()
-        lines: list[tuple[int, int]] = []
-        block = document.begin()
-        while block.isValid():
-            layout = block.layout()
-            block_top = layout.position().y()
-            for line_index in range(layout.lineCount()):
-                line = layout.lineAt(line_index)
-                if block_top + line.y() >= height:
-                    return tuple(lines)
-                lines.append(
-                    (
-                        block.position() + line.textStart(),
-                        line.textLength(),
-                    )
-                )
-            block = block.next()
-        return tuple(lines)
-
     def transition_layout_signature(
         self,
         index: QModelIndex,
         cell_size: QSize,
     ) -> tuple[object, ...]:
-        record = index.data(AssetItemModel.ItemRole)
-        if record is None or cell_size.isEmpty():
-            return ("empty",)
-        preview = self.preview_rect(
-            QRect(0, 0, cell_size.width(), cell_size.height())
-        )
-        content_rect = preview.adjusted(10, 9, -10, -9)
-        kind = str(record["kind"])
-        if kind == "image":
-            return (
-                "image",
-                max(1, content_rect.width()),
-                max(1, content_rect.height()),
-            )
-        content = str(record["content"] or "").strip() or str(record["title"])
-        dark = dark_theme_active()
-        font = self.view.font()
-        cache_key = (
-            kind,
-            content[:2000] if kind == "markdown" else content[:330],
-            max(1, content_rect.width()),
-            max(1, content_rect.height()),
-            dark,
-            font.toString(),
-        )
-        cached = self._transition_layout_signatures.pop(cache_key, None)
-        if cached is not None:
-            self._transition_layout_signatures[cache_key] = cached
-            return cached
-        if kind == "markdown":
-            signature = (
-                "markdown",
-                self._markdown_layout_signature(
-                    content,
-                    max(1, content_rect.width()),
-                    max(1, content_rect.height()),
-                    dark,
-                    font,
-                ),
-            )
-        else:
-            signature = (
-                "text",
-                self._plain_text_layout_signature(
-                    content,
-                    max(1, content_rect.width()),
-                    max(1, content_rect.height()),
-                    font,
-                ),
-            )
-        self._transition_layout_signatures[cache_key] = signature
-        while len(self._transition_layout_signatures) > 2048:
-            self._transition_layout_signatures.popitem(last=False)
-        return signature
+        return self._transition_renderer.layout_signature(index, cell_size)
 
     def _paint_preview_content(
         self,
@@ -444,133 +231,25 @@ class AssetGridDelegate(QStyledItemDelegate):
                     font,
                 )
 
-    @staticmethod
-    def _transition_record_signature(record) -> tuple[object, ...]:
-        try:
-            content_hash = record["content_hash"]
-        except (KeyError, IndexError):
-            content_hash = None
-        return (
-            int(record["id"]),
-            str(record["kind"]),
-            hash(str(record["title"])),
-            hash(str(record["content"] or "")),
-            str(record["path"] or ""),
-            content_hash,
-        )
-
     def render_transition_preview(
         self,
         index: QModelIndex,
         cell_size: QSize,
         layout_signature: tuple[object, ...] | None = None,
     ) -> QPixmap | None:
-        record = index.data(AssetItemModel.ItemRole)
-        if record is None or cell_size.isEmpty():
-            return None
-        cell = QRect(0, 0, cell_size.width(), cell_size.height())
-        preview = self.preview_rect(cell)
-        if preview.isEmpty():
-            return None
-        device_pixel_ratio = max(1.0, float(self.view.devicePixelRatioF()))
-        dark = dark_theme_active()
-        font = self.view.font()
-        if layout_signature is None:
-            layout_signature = self.transition_layout_signature(index, cell_size)
-        if record["kind"] == "image":
-            cache_key = (
-                "transition-image",
-                self._transition_record_signature(record),
-                layout_signature,
-                round(device_pixel_ratio, 3),
-            )
-            cached = self._transition_preview_caches.pop(cache_key, None)
-            if cached is not None:
-                self._transition_preview_caches[cache_key] = cached
-                return cached
-            path = record["path"]
-            if not path:
-                return None
-            try:
-                content_hash = record["content_hash"]
-            except (KeyError, IndexError):
-                content_hash = None
-            source = self.view.thumbnail_for_index(index, path, content_hash)
-            if source is None or source.isNull():
-                return None
-            logical_size = preview.size() - QSize(12, 12)
-            physical_size = QSize(
-                max(1, round(logical_size.width() * device_pixel_ratio)),
-                max(1, round(logical_size.height() * device_pixel_ratio)),
-            )
-            pixmap = source.scaled(
-                physical_size,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            pixmap.setDevicePixelRatio(device_pixel_ratio)
-            self._transition_preview_caches[cache_key] = pixmap
-            while len(self._transition_preview_caches) > 192:
-                self._transition_preview_caches.popitem(last=False)
-            return pixmap
-        cache_key = (
-            self._transition_record_signature(record),
-            layout_signature,
-            dark,
-            font.toString(),
-            round(device_pixel_ratio, 3),
-        )
-        cached = self._transition_preview_caches.pop(cache_key, None)
-        if cached is not None:
-            self._transition_preview_caches[cache_key] = cached
-            return cached
-        pixmap = QPixmap(
-            max(1, round(preview.width() * device_pixel_ratio)),
-            max(1, round(preview.height() * device_pixel_ratio)),
-        )
-        pixmap.setDevicePixelRatio(device_pixel_ratio)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._paint_preview_content(
-            painter,
-            QRect(0, 0, preview.width(), preview.height()),
+        return self._transition_renderer.render_preview(
             index,
-            record,
-            dark,
-            font,
+            cell_size,
+            layout_signature,
         )
-        painter.end()
-        self._transition_preview_caches[cache_key] = pixmap
-        while len(self._transition_preview_caches) > 192:
-            self._transition_preview_caches.popitem(last=False)
-        return pixmap
 
     @staticmethod
     def transition_image_target(preview: QRect, pixmap: QPixmap) -> QRectF:
-        available = QSizeF(
-            max(1, preview.width() - 12),
-            max(1, preview.height() - 12),
-        )
-        source_size = pixmap.deviceIndependentSize()
-        if source_size.isEmpty():
-            return QRectF()
-        target_size = source_size.scaled(
-            available,
-            Qt.AspectRatioMode.KeepAspectRatio,
-        )
-        return QRectF(
-            preview.center().x() - target_size.width() / 2.0,
-            preview.center().y() - target_size.height() / 2.0,
-            target_size.width(),
-            target_size.height(),
-        )
+        return AssetGridTransitionRenderer.image_target(preview, pixmap)
 
     @staticmethod
     def transition_preview_clip(preview: QRect, kind: str) -> QRect:
-        if kind == "image":
-            return preview
-        return preview.adjusted(10, 9, -10, -9)
+        return AssetGridTransitionRenderer.preview_clip(preview, kind)
 
     def paint_transition_card(
         self,

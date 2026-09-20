@@ -116,10 +116,8 @@ class AppTests(unittest.TestCase):
             setattr(owner, attribute, None)
 
     def test_smoke_mode_has_bounded_ready_and_quit_attempts(self):
-        source = Path(app.__file__).read_text(encoding="utf-8")
-        self.assertIn("if smoke_attempts < 80:", source)
-        self.assertIn("if smoke_quit_attempts < 80:", source)
-        self.assertIn('handle.write("smoke_quit_timeout=True\\n")', source)
+        self.assertEqual(app.SmokeLifecycle.MAX_ATTEMPTS, 80)
+        self.assertEqual(app.SmokeLifecycle.RETRY_MS, 250)
 
     @unittest.skipUnless(os.name == "nt", "Windows DPI awareness is Windows-only")
     def test_dpi_awareness_prefers_per_monitor_v2(self):

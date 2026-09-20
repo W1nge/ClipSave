@@ -7,7 +7,6 @@ from PySide6.QtCore import (
     QModelIndex,
     QPoint,
     QRect,
-    QRectF,
     QSize,
     Qt,
     QTimer,
@@ -29,9 +28,8 @@ from PySide6.QtWidgets import (
 from .asset_grid_delegate import AssetGridDelegate
 from .asset_grid_transition import (
     AssetGridTransitionOverlay,
-    GridTransitionCard,
-    grid_transition_card_elevated,
 )
+from .asset_grid_transition_controller import AssetGridTransitionController
 from .item_gestures import ItemRightClickGesture, ItemTripleClickGesture
 from .item_models import AssetItemModel
 from .sidebar import Sidebar
@@ -41,6 +39,7 @@ from .thumbnail_service import (
     cache_decoded_thumbnail,
     cached_thumbnail,
 )
+from .thumbnail_session import ThumbnailSession
 from .ui_primitives import (
     AutoHideScrollBar,
     WheelRemainder,
@@ -65,6 +64,18 @@ class AssetGrid(QListView):
     open_requested = Signal(int)
     favorite_requested = Signal(int, bool)
 
+    @property
+    def _thumbnail_generation(self) -> int:
+        return self._thumbnail_session.generation
+
+    @property
+    def _sidebar_transition_active(self) -> bool:
+        return self._transition_controller.active
+
+    @property
+    def _sidebar_transition_overlay(self) -> AssetGridTransitionOverlay | None:
+        return self._transition_controller.overlay
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -83,8 +94,7 @@ class AssetGrid(QListView):
         self.setViewportMargins(14, 48, 14, 18)
         self.setSpacing(0)
         self.setObjectName("AssetGrid")
-        self._sidebar_transition_active = False
-        self._sidebar_transition_overlay: AssetGridTransitionOverlay | None = None
+        self._transition_controller = AssetGridTransitionController(self)
         self._pending_items_update: tuple[list, int | None] | None = None
         self._asset_model = AssetItemModel(self)
         self.setModel(self._asset_model)
@@ -98,8 +108,8 @@ class AssetGrid(QListView):
         self._layout_updates_suspended = False
         self._layout_update_pending = False
         self._layout_resize_mode = None
-        self._thumbnail_generation = 0
         self._thumbnail_loader = self._make_thumbnail_queue(self)
+        self._thumbnail_session = ThumbnailSession(self._thumbnail_loader)
         self._thumbnail_loader.decoded.connect(self._thumbnail_decoded)
         self._thumbnail_loader.capacity_available.connect(
             self._thumbnail_capacity_available
@@ -130,8 +140,7 @@ class AssetGrid(QListView):
         self._right_click.cancel()
         self._left_click.cancel()
         self._thumbnail_refresh_timer.stop()
-        self._thumbnail_generation += 1
-        self._thumbnail_loader.cancel_queued()
+        self._thumbnail_session.invalidate()
         self.selected_id = selected_id
         self._asset_model.set_items(items)
         self.items = self._asset_model.items
@@ -161,14 +170,12 @@ class AssetGrid(QListView):
             self._layout_update_pending = False
             self._layout_resize_mode = self.resizeMode()
             self._thumbnail_refresh_timer.stop()
-            self._thumbnail_generation += 1
-            self._thumbnail_loader.cancel_queued()
+            self._thumbnail_session.invalidate()
             self.setResizeMode(QListView.ResizeMode.Fixed)
             return
 
         self._thumbnail_refresh_timer.stop()
-        self._thumbnail_generation += 1
-        self._thumbnail_loader.cancel_queued()
+        self._thumbnail_session.invalidate()
         resize_mode = (
             self._layout_resize_mode
             if self._layout_resize_mode is not None
@@ -183,54 +190,13 @@ class AssetGrid(QListView):
 
     @staticmethod
     def _layout_for_viewport_width(width: int) -> tuple[int, QSize]:
-        available = max(210, int(width))
-        columns = max(1, available // 245)
-        gap = 12
-        layout_width = max(210, available - 1)
-        card_width = max(210, (layout_width - columns * gap) // columns)
-        return columns, QSize(
-            card_width + gap,
-            AssetGridDelegate.card_height + gap,
-        )
+        return AssetGridTransitionController.layout_for_viewport_width(width)
 
     def _update_grid_size(self) -> None:
         available = max(210, self.viewport().width())
         columns, grid_size = self._layout_for_viewport_width(available)
         self.columns = columns
         self.setGridSize(grid_size)
-
-    @staticmethod
-    def _transition_cell_rect(
-        row: int,
-        columns: int,
-        grid_size: QSize,
-        scroll_offset: int,
-    ) -> QRectF:
-        layout_row, column = divmod(row, columns)
-        return QRectF(
-            column * grid_size.width(),
-            layout_row * grid_size.height() - scroll_offset,
-            grid_size.width(),
-            grid_size.height(),
-        )
-
-    def _transition_rows(
-        self,
-        columns: int,
-        grid_size: QSize,
-        scroll_offset: int,
-    ) -> range:
-        count = self._asset_model.rowCount()
-        if count <= 0:
-            return range(0)
-        first_layout_row = max(0, scroll_offset // grid_size.height() - 1)
-        last_layout_row = (
-            scroll_offset + self.viewport().height()
-        ) // grid_size.height() + 1
-        return range(
-            min(count, first_layout_row * columns),
-            min(count, (last_layout_row + 1) * columns),
-        )
 
     def begin_sidebar_transition(
         self,
@@ -239,34 +205,11 @@ class AssetGrid(QListView):
         expanded_sidebar_width: int = Sidebar.EXPANDED_WIDTH,
         collapsed_sidebar_width: int = Sidebar.COLLAPSED_WIDTH,
     ) -> bool:
-        self._clear_sidebar_transition(repaint=False)
-        if (
-            not self.isVisible()
-            or self._asset_model.rowCount() <= 0
-            or self.viewport().width() <= 0
-            or self.viewport().height() <= 0
-        ):
-            return False
-
-        current_sidebar_width = max(
-            collapsed_sidebar_width,
-            min(expanded_sidebar_width, int(current_sidebar_width)),
-        )
-        current_width = self.viewport().width()
-        expanded_width = max(
-            1,
-            current_width
-            - (expanded_sidebar_width - current_sidebar_width),
-        )
-        collapsed_width = max(
-            1,
-            current_width
-            + (current_sidebar_width - collapsed_sidebar_width),
-        )
-        return self.begin_viewport_width_transition(
-            expanded_width,
-            collapsed_width,
+        return self._transition_controller.begin_sidebar(
+            current_sidebar_width,
             progress,
+            expanded_sidebar_width,
+            collapsed_sidebar_width,
         )
 
     def begin_viewport_width_transition(
@@ -275,81 +218,14 @@ class AssetGrid(QListView):
         end_viewport_width: int,
         progress: float = 0.0,
     ) -> bool:
-        self._clear_sidebar_transition(repaint=False)
-        if (
-            not self.isVisible()
-            or self._asset_model.rowCount() <= 0
-            or self.viewport().width() <= 0
-            or self.viewport().height() <= 0
-        ):
-            return False
-        start_columns, start_size = self._layout_for_viewport_width(
-            max(1, int(start_viewport_width))
-        )
-        end_columns, end_size = self._layout_for_viewport_width(
-            max(1, int(end_viewport_width))
-        )
-        scroll_offset = self.verticalScrollBar().value()
-        rows = sorted(
-            set(
-                self._transition_rows(
-                    start_columns,
-                    start_size,
-                    scroll_offset,
-                )
-            )
-            | set(
-                self._transition_rows(
-                    end_columns,
-                    end_size,
-                    scroll_offset,
-                )
-            )
-        )
-        if not rows:
-            return False
-
-        cards = [
-            GridTransitionCard(
-                row=row,
-                expanded_rect=self._transition_cell_rect(
-                    row,
-                    start_columns,
-                    start_size,
-                    scroll_offset,
-                ),
-                collapsed_rect=self._transition_cell_rect(
-                    row,
-                    end_columns,
-                    end_size,
-                    scroll_offset,
-                ),
-                elevated=grid_transition_card_elevated(
-                    row,
-                    start_columns,
-                    end_columns,
-                ),
-            )
-            for row in rows
-        ]
-        overlay = AssetGridTransitionOverlay(
-            self,
-            cards,
-            start_columns,
-            end_columns,
+        return self._transition_controller.begin_viewport(
+            start_viewport_width,
+            end_viewport_width,
             progress,
         )
-        self._sidebar_transition_overlay = overlay
-        self._sidebar_transition_active = True
-        return True
 
     def set_sidebar_transition_progress(self, progress: float) -> None:
-        overlay = self._sidebar_transition_overlay
-        if not self._sidebar_transition_active or overlay is None:
-            return
-        dirty = overlay.set_progress(progress)
-        if not dirty.isEmpty():
-            self.viewport().update(dirty)
+        self._transition_controller.set_progress(progress)
 
     def finish_sidebar_transition(self) -> None:
         self._clear_sidebar_transition(repaint=True)
@@ -362,19 +238,12 @@ class AssetGrid(QListView):
             self._apply_items_now(*pending)
 
     def _clear_sidebar_transition(self, repaint: bool) -> None:
-        overlay = self._sidebar_transition_overlay
-        if overlay is None and not self._sidebar_transition_active:
-            return
-        self._sidebar_transition_active = False
-        self._sidebar_transition_overlay = None
-        if repaint and self.viewport().isVisible():
-            self.viewport().repaint()
+        self._transition_controller.clear(repaint)
 
     def set_preview_loading_enabled(self, enabled: bool) -> None:
         if enabled == self.preview_loading_enabled:
             return
-        self._thumbnail_generation += 1
-        self._thumbnail_loader.cancel_queued()
+        self._thumbnail_session.invalidate()
         self.preview_loading_enabled = enabled
         if enabled and self.isVisible() and not self._layout_updates_suspended:
             self.viewport().update()
@@ -386,8 +255,7 @@ class AssetGrid(QListView):
         self._right_click.cancel()
         self._left_click.cancel()
         self._thumbnail_refresh_timer.stop()
-        self._thumbnail_generation += 1
-        self._thumbnail_loader.cancel_queued()
+        self._thumbnail_session.invalidate()
         super().hideEvent(event)
 
     def showEvent(self, event) -> None:
@@ -407,21 +275,18 @@ class AssetGrid(QListView):
         self._right_click.cancel()
         self._left_click.cancel()
         self._thumbnail_refresh_timer.stop()
-        self._thumbnail_generation += 1
-        self._thumbnail_loader.close()
+        self._thumbnail_session.close()
         super().closeEvent(event)
 
     def shutdown_thumbnail_loader(self, timeout_ms: int = 2000) -> bool:
-        self._thumbnail_generation += 1
-        return self._thumbnail_loader.close(timeout_ms)
+        return self._thumbnail_session.close(timeout_ms)
 
     def wait_for_thumbnail_idle(self) -> bool:
         self._thumbnail_refresh_timer.stop()
-        self._thumbnail_generation += 1
-        return self._thumbnail_loader.pause_and_wait()
+        return self._thumbnail_session.pause_and_wait()
 
     def resume_thumbnail_loader(self) -> None:
-        self._thumbnail_loader.resume()
+        self._thumbnail_session.resume()
         if (
             self.preview_loading_enabled
             and self.isVisible()
@@ -444,12 +309,12 @@ class AssetGrid(QListView):
             or not self.visualRect(index).intersects(self.viewport().rect())
         ):
             return None
-        self._thumbnail_loader.request(key, self._thumbnail_generation)
+        self._thumbnail_session.request(key)
         return None
 
     @Slot(object, object, int)
     def _thumbnail_decoded(self, key: ThumbnailCacheKey, image: QImage, generation: int) -> None:
-        if generation != self._thumbnail_generation:
+        if not self._thumbnail_session.is_current(generation):
             return
         model_generation = self._asset_model.generation
         if not self._asset_model.has_thumbnail_path(key.path, model_generation):
@@ -466,8 +331,7 @@ class AssetGrid(QListView):
     def _refresh_thumbnail_generation(self) -> None:
         if self._layout_updates_suspended:
             return
-        self._thumbnail_generation += 1
-        self._thumbnail_loader.cancel_queued()
+        self._thumbnail_session.invalidate()
         self.viewport().update()
 
     def _thumbnail_capacity_available(self) -> None:

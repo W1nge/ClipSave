@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from clipsave_app.bulk_checkpoint import (
     clear_checkpoint,
@@ -47,6 +48,14 @@ class BulkImageCheckpointTests(unittest.TestCase):
         clear_checkpoint(self.path)
         clear_checkpoint(self.path)
         self.assertIsNone(load_checkpoint(self.path))
+
+    def test_save_syncs_parent_directory_after_publish(self):
+        checkpoint = new_checkpoint([11])
+
+        with patch("clipsave_app.bulk_checkpoint.sync_directory") as sync:
+            save_checkpoint(self.path, checkpoint)
+
+        sync.assert_called_once_with(self.path.parent)
 
 
 if __name__ == "__main__":

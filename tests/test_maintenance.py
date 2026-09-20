@@ -28,6 +28,15 @@ class MaintenanceTests(unittest.TestCase):
         self.database.close()
         self.temp.cleanup()
 
+    def clean(self, manifest, confirmation, *, permanent: bool = False):
+        return clean_indexed_duplicates(
+            self.database,
+            manifest,
+            confirmation,
+            permanent=permanent,
+            library_dir=self.library,
+        )
+
     def test_scan_classifies_indexed_duplicate_orphan_duplicate_and_unique(self):
         indexed = self.library / "indexed.png"
         Image.new("RGB", (8, 8), "red").save(indexed)
@@ -76,19 +85,15 @@ class MaintenanceTests(unittest.TestCase):
         manifest, _report = scan_orphans(self.database, self.library, self.root / "reports")
 
         with self.assertRaises(ValueError):
-            clean_indexed_duplicates(self.database, manifest, "wrong")
+            self.clean(manifest, "wrong")
 
         recycled = []
         def recycle(path):
             recycled.append(path)
             Path(path).unlink()
 
-        with (
-            patch("clipsave_app.maintenance.LIBRARY_DIR", self.library),
-            patch("clipsave_app.storage.LIBRARY_DIR", self.library),
-            patch("clipsave_app.maintenance.send2trash", side_effect=recycle),
-        ):
-            result = clean_indexed_duplicates(self.database, manifest, CONFIRMATION_PHRASE)
+        with patch("clipsave_app.maintenance.send2trash", side_effect=recycle):
+            result = self.clean(manifest, CONFIRMATION_PHRASE)
         self.assertEqual(result["deleted"], 1)
         self.assertEqual(len(recycled), 1)
         recycled_path = Path(recycled[0])
@@ -104,12 +109,8 @@ class MaintenanceTests(unittest.TestCase):
         data = json.loads(manifest.read_text(encoding="utf-8"))
         data["orphans"][0]["size"] += 1
         manifest.write_text(json.dumps(data), encoding="utf-8")
-        with (
-            patch("clipsave_app.maintenance.LIBRARY_DIR", self.library),
-            patch("clipsave_app.storage.LIBRARY_DIR", self.library),
-            patch("clipsave_app.maintenance.send2trash") as send,
-        ):
-            result = clean_indexed_duplicates(self.database, manifest, CONFIRMATION_PHRASE)
+        with patch("clipsave_app.maintenance.send2trash") as send:
+            result = self.clean(manifest, CONFIRMATION_PHRASE)
         self.assertEqual(result["skipped"], 1)
         send.assert_not_called()
 
@@ -119,9 +120,8 @@ class MaintenanceTests(unittest.TestCase):
         data["library_dir"] = str(self.root / "another-library")
         manifest.write_text(json.dumps(data), encoding="utf-8")
 
-        with patch("clipsave_app.maintenance.LIBRARY_DIR", self.library):
-            with self.assertRaisesRegex(ValueError, "different library"):
-                clean_indexed_duplicates(self.database, manifest, CONFIRMATION_PHRASE)
+        with self.assertRaisesRegex(ValueError, "different library"):
+            self.clean(manifest, CONFIRMATION_PHRASE)
 
     def test_permanent_cleanup_uses_distinct_confirmation_and_unlinks(self):
         indexed = self.library / "indexed.png"
@@ -132,19 +132,12 @@ class MaintenanceTests(unittest.TestCase):
         manifest, _report = scan_orphans(self.database, self.library, self.root / "reports")
 
         with self.assertRaises(ValueError):
-            clean_indexed_duplicates(
-                self.database, manifest, CONFIRMATION_PHRASE, permanent=True
-            )
-        with (
-            patch("clipsave_app.maintenance.LIBRARY_DIR", self.library),
-            patch("clipsave_app.storage.LIBRARY_DIR", self.library),
-        ):
-            result = clean_indexed_duplicates(
-                self.database,
+            self.clean(manifest, CONFIRMATION_PHRASE, permanent=True)
+        result = self.clean(
                 manifest,
                 PERMANENT_CONFIRMATION_PHRASE,
                 permanent=True,
-            )
+        )
         self.assertEqual(result["deleted"], 1)
         self.assertFalse(duplicate.exists())
 
@@ -162,8 +155,7 @@ class MaintenanceTests(unittest.TestCase):
         manifest.write_text(json.dumps(data), encoding="utf-8")
 
         with self.assertRaisesRegex(ValueError, "invalid deletion record"):
-            clean_indexed_duplicates(
-                self.database,
+            self.clean(
                 manifest,
                 PERMANENT_CONFIRMATION_PHRASE,
                 permanent=True,
@@ -183,16 +175,11 @@ class MaintenanceTests(unittest.TestCase):
         self.database.remove_item(original_id)
         self.assertTrue(self.database.import_file(duplicate, "image"))
 
-        with (
-            patch("clipsave_app.maintenance.LIBRARY_DIR", self.library),
-            patch("clipsave_app.storage.LIBRARY_DIR", self.library),
-        ):
-            result = clean_indexed_duplicates(
-                self.database,
+        result = self.clean(
                 manifest,
                 PERMANENT_CONFIRMATION_PHRASE,
                 permanent=True,
-            )
+        )
 
         self.assertEqual(result["deleted"], 0)
         self.assertEqual(result["skipped"], 1)
@@ -206,16 +193,11 @@ class MaintenanceTests(unittest.TestCase):
         duplicate.write_bytes(external.read_bytes())
         manifest, _report = scan_orphans(self.database, self.library, self.root / "reports")
 
-        with (
-            patch("clipsave_app.maintenance.LIBRARY_DIR", self.library),
-            patch("clipsave_app.storage.LIBRARY_DIR", self.library),
-        ):
-            result = clean_indexed_duplicates(
-                self.database,
+        result = self.clean(
                 manifest,
                 PERMANENT_CONFIRMATION_PHRASE,
                 permanent=True,
-            )
+        )
 
         self.assertEqual(result["deleted"], 0)
         self.assertEqual(result["skipped"], 1)
@@ -240,16 +222,11 @@ class MaintenanceTests(unittest.TestCase):
             mutation_blocked.append(True)
             return real_delete(*args, **kwargs)
 
-        with (
-            patch("clipsave_app.maintenance.LIBRARY_DIR", self.library),
-            patch("clipsave_app.storage.LIBRARY_DIR", self.library),
-            patch(
-                "clipsave_app.maintenance.delete_managed_file",
-                side_effect=delete_while_keeper_is_locked,
-            ),
+        with patch(
+            "clipsave_app.maintenance.delete_managed_file",
+            side_effect=delete_while_keeper_is_locked,
         ):
-            result = clean_indexed_duplicates(
-                self.database,
+            result = self.clean(
                 manifest,
                 PERMANENT_CONFIRMATION_PHRASE,
                 permanent=True,

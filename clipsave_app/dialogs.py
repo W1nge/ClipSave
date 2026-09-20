@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .constants import DATA_DIR, LIBRARY_DIR
 from .markdown_view import SafeMarkdownBrowser, set_markdown_content
 from .ui_primitives import (
     AutoHideScrollBar,
@@ -199,9 +201,20 @@ class SettingsDialog(QDialog):
     import_requested = Signal()
     bulk_processing_requested = Signal()
 
-    def __init__(self, settings, parent=None):
+    def __init__(
+        self,
+        settings,
+        parent=None,
+        *,
+        global_hotkey_registered: bool | None = None,
+        bulk_progress_provider: Callable[[], dict[str, object]] | None = None,
+        data_dir: Path | None = None,
+        library_dir: Path | None = None,
+    ):
         super().__init__(parent)
         self.settings = settings
+        data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
+        library_dir = Path(library_dir) if library_dir is not None else LIBRARY_DIR
         self.bulk_processing_confirmed = False
         self.setWindowTitle("ClipSave 设置")
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
@@ -250,7 +263,7 @@ class SettingsDialog(QDialog):
             lambda checked: self.dark_theme_switch.setEnabled(not checked)
         )
         left_layout.addWidget(self.dark_theme_switch)
-        hotkey_state = getattr(parent, "global_hotkey_registered", None)
+        hotkey_state = global_hotkey_registered
         if hotkey_state is False:
             hotkey_text = "全局唤醒快捷键：Ctrl + Alt + V（注册失败，可能已被占用）"
         elif hotkey_state is True:
@@ -262,12 +275,10 @@ class SettingsDialog(QDialog):
         self.hotkey_status.setWordWrap(True)
         left_layout.addWidget(self.hotkey_status)
         left_layout.addSpacing(8)
-        from .constants import DATA_DIR, LIBRARY_DIR
-
         left_layout.addWidget(_settings_section_header("本地存储", "hard-drive"))
         for caption_text, path, attribute_name in (
-            ("剪贴板文件", LIBRARY_DIR, "library_path_label"),
-            ("数据库和设置", DATA_DIR, "data_path_label"),
+            ("剪贴板文件", library_dir, "library_path_label"),
+            ("数据库和设置", data_dir, "data_path_label"),
         ):
             caption = QLabel(caption_text)
             caption.setObjectName("SettingsCaption")
@@ -297,7 +308,9 @@ class SettingsDialog(QDialog):
         open_storage = QPushButton("打开本地资料库")
         open_storage.setObjectName("SettingsAction")
         open_storage.setIcon(lucide_icon("folder"))
-        open_storage.clicked.connect(lambda: _startfile_or_warn(self, LIBRARY_DIR))
+        open_storage.clicked.connect(
+            lambda: _startfile_or_warn(self, library_dir)
+        )
         self.open_storage_button = open_storage
         storage_actions.addWidget(open_storage, 1)
         left_layout.addLayout(storage_actions)
@@ -346,7 +359,7 @@ class SettingsDialog(QDialog):
         self.bulk_progress.setObjectName("BulkImageProgress")
         self.bulk_progress.setTextVisible(False)
         right_layout.addWidget(self.bulk_progress)
-        self._bulk_progress_provider = parent
+        self._bulk_progress_provider = bulk_progress_provider
         self._bulk_progress_timer = QTimer(self)
         self._bulk_progress_timer.setInterval(250)
         self._bulk_progress_timer.timeout.connect(self._refresh_bulk_progress)
@@ -395,7 +408,7 @@ class SettingsDialog(QDialog):
         root.addWidget(footer)
 
     def _refresh_bulk_progress(self) -> None:
-        provider = getattr(self._bulk_progress_provider, "bulk_image_progress_snapshot", None)
+        provider = self._bulk_progress_provider
         if callable(provider):
             state = provider()
         else:
