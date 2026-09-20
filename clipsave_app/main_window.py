@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import ctypes
 import os
 import threading
 import time
-from ctypes import wintypes
 from pathlib import Path
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QObject, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QIcon, QImage, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,11 +34,14 @@ from .bulk_image_controller import BulkImageCompletion, BulkImageController
 from .app_paths import AppPaths
 from .constants import APP_NAME, LIBRARY_DIR
 from .database import LibraryDatabase
+from .detail_animation_controller import DetailAnimationController
 from .library_controller import LibraryController
 from .library_models import LibraryQuery, LibraryViewState
 from .maintenance_controller import LibraryMaintenanceController
 from .image_task_controller import ImageTaskController
+from .monitoring_controller import MonitoringController
 from .mutation_controller import LibraryMutationController
+from .native_window_controller import NativeWindowController, windows_resize_hit_test
 from .shutdown_coordinator import ShutdownCoordinator, ShutdownFailure
 from .services import (
     AIService,
@@ -55,18 +56,13 @@ from .services import (
     unregister_windows_power_saving_notification,
 )
 from .settings import Settings
+from .sidebar_interaction_controller import SidebarInteractionController
 from .startup import set_start_with_windows
 from .storage import is_under_local_store, recycle_managed_file
 from .styles import stylesheet_for_theme
 from .task_supervisor import TaskSupervisor
 from .window_effects_controller import WindowEffectsController
 from .windows_frame import (
-    WM_DPICHANGED,
-    WM_GETMINMAXINFO,
-    WM_NCACTIVATE,
-    WM_NCCALCSIZE,
-    WM_WINDOWPOSCHANGING,
-    WM_WINDOWPOSCHANGED,
     enable_native_resize_frame,
     handle_getminmaxinfo,
     handle_nccalcsize,
@@ -273,6 +269,114 @@ class MainWindow(QMainWindow):
         self.window_effects_controller.power_notification_handle = value
 
     @property
+    def _material_refresh_pending(self) -> bool:
+        return self.window_effects_controller.material_refresh_pending
+
+    @_material_refresh_pending.setter
+    def _material_refresh_pending(self, value: bool) -> None:
+        self.window_effects_controller.material_refresh_pending = bool(value)
+
+    @property
+    def _interactive_resize_active(self) -> bool:
+        return self.native_window_controller.interactive_resize_active
+
+    @_interactive_resize_active.setter
+    def _interactive_resize_active(self, value: bool) -> None:
+        self.native_window_controller.interactive_resize_active = bool(value)
+
+    @property
+    def _maximized_bounds_sync_pending(self) -> bool:
+        return self.native_window_controller.maximized_bounds_sync_pending
+
+    @_maximized_bounds_sync_pending.setter
+    def _maximized_bounds_sync_pending(self, value: bool) -> None:
+        self.native_window_controller.maximized_bounds_sync_pending = bool(value)
+
+    @property
+    def _detail_animation_active(self) -> bool:
+        return self.detail_animation_controller.active
+
+    @_detail_animation_active.setter
+    def _detail_animation_active(self, value: bool) -> None:
+        self.detail_animation_controller.active = bool(value)
+
+    @property
+    def _detail_animation_target_visible(self) -> bool:
+        return self.detail_animation_controller.target_visible
+
+    @_detail_animation_target_visible.setter
+    def _detail_animation_target_visible(self, value: bool) -> None:
+        self.detail_animation_controller.target_visible = bool(value)
+
+    @property
+    def _detail_animation_progress(self) -> float:
+        return self.detail_animation_controller.progress
+
+    @_detail_animation_progress.setter
+    def _detail_animation_progress(self, value: float) -> None:
+        self.detail_animation_controller.progress = float(value)
+
+    @property
+    def _detail_animation_start_progress(self) -> float:
+        return self.detail_animation_controller.start_progress
+
+    @_detail_animation_start_progress.setter
+    def _detail_animation_start_progress(self, value: float) -> None:
+        self.detail_animation_controller.start_progress = float(value)
+
+    @property
+    def _detail_animation_end_progress(self) -> float:
+        return self.detail_animation_controller.end_progress
+
+    @_detail_animation_end_progress.setter
+    def _detail_animation_end_progress(self, value: float) -> None:
+        self.detail_animation_controller.end_progress = float(value)
+
+    @property
+    def _detail_animation_target_width(self) -> int:
+        return self.detail_animation_controller.target_width
+
+    @_detail_animation_target_width.setter
+    def _detail_animation_target_width(self, value: int) -> None:
+        self.detail_animation_controller.target_width = int(value)
+
+    @property
+    def _detail_animation_timer(self):
+        return self.detail_animation_controller.timer
+
+    @property
+    def _detail_animation_elapsed(self):
+        return self.detail_animation_controller.elapsed
+
+    @property
+    def _detail_width(self) -> int:
+        return self.detail_animation_controller.saved_width
+
+    @_detail_width.setter
+    def _detail_width(self, value: int) -> None:
+        self.detail_animation_controller.saved_width = int(value)
+
+    @property
+    def _sidebar_animation_active(self) -> bool:
+        return self.sidebar_interaction_controller.animation_active
+
+    @_sidebar_animation_active.setter
+    def _sidebar_animation_active(self, value: bool) -> None:
+        self.sidebar_interaction_controller.animation_active = bool(value)
+
+    @property
+    def _pending_sidebar_collapsed(self) -> bool | None:
+        return self.sidebar_interaction_controller.pending_collapsed
+
+    @_pending_sidebar_collapsed.setter
+    def _pending_sidebar_collapsed(self, value: bool | None) -> None:
+        self.sidebar_interaction_controller.pending_collapsed = value
+
+    @property
+    def _sidebar_setting_timer(self):
+        return self.sidebar_interaction_controller.setting_timer
+
+    @property
     def current_items(self):
         return self.library_state.items
 
@@ -462,29 +566,6 @@ class MainWindow(QMainWindow):
         self.bulk_image_controller.finished.connect(self._bulk_image_finished)
         self._closing = False
         self._quit_in_progress = False
-        self._interactive_resize_active = False
-        self._sidebar_animation_active = False
-        self._detail_animation_active = False
-        self._detail_animation_target_visible = False
-        self._detail_animation_progress = 0.0
-        self._detail_animation_start_progress = 0.0
-        self._detail_animation_end_progress = 0.0
-        self._detail_animation_target_width = 340
-        self._detail_animation_timer = QTimer(self)
-        self._detail_animation_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._detail_animation_timer.timeout.connect(
-            self._advance_detail_animation
-        )
-        self._detail_animation_elapsed = QElapsedTimer()
-        self._pending_sidebar_collapsed: bool | None = None
-        self._sidebar_setting_timer = QTimer(self)
-        self._sidebar_setting_timer.setSingleShot(True)
-        self._sidebar_setting_timer.setInterval(250)
-        self._sidebar_setting_timer.timeout.connect(
-            self._flush_pending_sidebar_collapsed_setting
-        )
-        self._native_resize_frame_enabled = False
-        self._native_resize_frame_hwnd: int | None = None
         self.window_effects_controller = WindowEffectsController(
             self,
             platform_check=lambda: is_windows_qt_platform(),
@@ -493,8 +574,43 @@ class MainWindow(QMainWindow):
             unregister_power=lambda handle: unregister_windows_power_saving_notification(handle),
             sync_surface_style=lambda **kwargs: self._sync_surface_style(**kwargs),
         )
-        self._material_refresh_pending = False
-        self._maximized_bounds_sync_pending = False
+        self.native_window_controller = NativeWindowController(
+            self,
+            native_events_enabled=lambda: os.name == "nt",
+            platform_check=lambda: is_windows_qt_platform(),
+            window_rect=lambda hwnd: window_rect(hwnd),
+            dpi_scale=lambda hwnd: window_dpi_scale(hwnd),
+            handle_getminmaxinfo=lambda *args: handle_getminmaxinfo(*args),
+            handle_ncactivate=lambda *args: handle_ncactivate(*args),
+            handle_nccalcsize=lambda *args: handle_nccalcsize(*args),
+            schedule_material_refresh=lambda: self._schedule_material_refresh(),
+            schedule_maximized_bounds_sync=lambda: self._schedule_maximized_bounds_sync(),
+            sync_backdrop_from_windowpos=lambda lparam: self._sync_windows_backdrop_from_windowpos(
+                lparam
+            ),
+            sync_backdrop_geometry_now=lambda: self._sync_windows_backdrop_geometry_now(),
+            sync_backdrop_window=lambda: self._sync_windows_backdrop_window(),
+            schedule_soon=lambda callback: QTimer.singleShot(0, callback),
+            set_layout_updates_suspended=lambda value: self.grid.set_layout_updates_suspended(
+                value
+            ),
+            sidebar_animation_active=lambda: self._sidebar_animation_active,
+            detail_animation_active=lambda: self._detail_animation_active,
+            resize_hit_test=lambda *args: self._windows_resize_hit_test(*args),
+            enable_resize_frame=lambda hwnd: enable_native_resize_frame(hwnd),
+            clear_resize_handles=lambda: self._clear_resize_handles(),
+            install_resize_handles=lambda: (
+                self._install_resize_handles(self.centralWidget())
+                if not self.resize_handles
+                else None
+            ),
+            native_window_is_maximized=lambda hwnd: native_window_is_maximized(hwnd),
+            restore_native_window=lambda hwnd: restore_native_window(hwnd),
+            maximize_native_window=lambda hwnd: maximize_native_window(hwnd),
+            synchronize_maximized_work_area=lambda hwnd: synchronize_maximized_work_area(
+                hwnd
+            ),
+        )
         self._initial_position_constrained = False
         self.global_hotkey_registered: bool | None = None
         self.dark_theme = self._desired_dark_theme()
@@ -510,6 +626,30 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 440)
         self.setStyleSheet(stylesheet_for_theme(self.dark_theme))
         self.build_ui()
+        self.sidebar_interaction_controller = SidebarInteractionController(
+            sidebar=self.sidebar,
+            grid=self.grid,
+            body_layout=self._body_layout,
+            settings_get=lambda key, default=None: self.settings.get(key, default),
+            save_setting=lambda key, value: self._save_setting(key, value),
+            detail_animation_active=lambda: self._detail_animation_active,
+            finish_detail_animation=lambda: self._finish_detail_animation(),
+            interactive_resize_active=lambda: self._interactive_resize_active,
+            parent=self,
+        )
+        self.sidebar_interaction_controller.connect_signals()
+        self.detail_animation_controller = DetailAnimationController(
+            self,
+            detail=self.detail,
+            grid=self.grid,
+            content_splitter=self.content_splitter,
+            body_layout=self._body_layout,
+            detail_button=self.detail_button,
+            sidebar=self.sidebar,
+            sidebar_animation_active=lambda: self._sidebar_animation_active,
+            interactive_resize_active=lambda: self._interactive_resize_active,
+            parent=self,
+        )
         self.build_tray()
         self.build_shortcuts()
         self._ensure_native_resize_frame()
@@ -526,6 +666,10 @@ class MainWindow(QMainWindow):
             self.clipboard_service = ClipboardService(database, self, paths=paths)
         else:
             self.clipboard_service = clipboard_service
+        self.monitoring_controller = MonitoringController(
+            self.settings,
+            self.clipboard_service,
+        )
         self.clipboard_service.captured.connect(self.on_captured)
         self.clipboard_service.failed.connect(self.show_error_status)
         self.clipboard_service.state_changed.connect(self.update_monitor_button)
@@ -619,10 +763,6 @@ class MainWindow(QMainWindow):
         self.sidebar.delete_collection_requested.connect(self.delete_collection)
         self.sidebar.delete_tag_requested.connect(self.delete_tag)
         self.sidebar.settings_requested.connect(self.open_settings)
-        self.sidebar.collapsed_changed.connect(self._queue_sidebar_collapsed_setting)
-        self.sidebar.width_animation_started.connect(self._begin_sidebar_animation)
-        self.sidebar.width_animation_progress.connect(self._update_sidebar_animation)
-        self.sidebar.width_animation_finished.connect(self._end_sidebar_animation)
         body_layout.addWidget(self.sidebar)
 
         middle = QWidget()
@@ -788,23 +928,15 @@ class MainWindow(QMainWindow):
         }
         self._update_resize_handles()
 
-    def _ensure_native_resize_frame(self) -> None:
-        if not is_windows_qt_platform():
-            return
-        hwnd = int(self.winId())
-        if self._native_resize_frame_enabled and self._native_resize_frame_hwnd == hwnd:
-            return
-        enabled = enable_native_resize_frame(hwnd)
-        self._native_resize_frame_enabled = enabled
-        self._native_resize_frame_hwnd = hwnd if enabled else None
-        if enabled:
-            if self.resize_handles:
-                for handle in self.resize_handles.values():
-                    handle.deleteLater()
-                self.resize_handles = {}
-            return
+    def _clear_resize_handles(self) -> None:
         if not self.resize_handles:
-            self._install_resize_handles(self.centralWidget())
+            return
+        for handle in self.resize_handles.values():
+            handle.deleteLater()
+        self.resize_handles = {}
+
+    def _ensure_native_resize_frame(self) -> None:
+        self.native_window_controller.ensure_native_resize_frame()
 
     def _ensure_windows_backdrop_window(self) -> int | None:
         return self.window_effects_controller.ensure_backdrop_window()
@@ -922,14 +1054,7 @@ class MainWindow(QMainWindow):
             self._sync_windows_backdrop_geometry_now()
 
     def toggle_maximized(self) -> None:
-        if self._window_is_maximized():
-            hwnd = int(self.winId()) if is_windows_qt_platform() else 0
-            if not restore_native_window(hwnd):
-                self.showNormal()
-        else:
-            hwnd = int(self.winId()) if is_windows_qt_platform() else 0
-            if not maximize_native_window(hwnd):
-                self.showMaximized()
+        self.native_window_controller.toggle_maximized()
         self.window_title_bar.update_maximize_state(self._window_is_maximized())
         QTimer.singleShot(
             0,
@@ -939,11 +1064,7 @@ class MainWindow(QMainWindow):
         )
 
     def _window_is_maximized(self) -> bool:
-        if is_windows_qt_platform():
-            native_state = native_window_is_maximized(int(self.winId()))
-            if native_state is not None:
-                return native_state
-        return self.isMaximized()
+        return self.native_window_controller.window_is_maximized()
 
     def changeEvent(self, event) -> None:
         if event.type() == QEvent.Type.WindowStateChange and hasattr(self, "window_title_bar"):
@@ -957,70 +1078,9 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
 
     def nativeEvent(self, event_type, message):
-        if os.name == "nt" and event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
-            msg = wintypes.MSG.from_address(int(message))
-            if msg.message in (0x001A, 0x031A, 0x031E):
-                # WM_SETTINGCHANGE / WM_THEMECHANGED / WM_DWMCOMPOSITIONCHANGED
-                self._schedule_material_refresh()
-            if msg.message == 0x0218:  # WM_POWERBROADCAST
-                # Includes PBT_APMPOWERSTATUSCHANGE and the registered
-                # GUID_POWER_SAVING_STATUS PBT_POWERSETTINGCHANGE notification.
-                self._schedule_material_refresh()
-            if msg.message == WM_GETMINMAXINFO:
-                hwnd = int(msg.hWnd) or int(self.winId())
-                scale = window_dpi_scale(hwnd)
-                handled, result = handle_getminmaxinfo(
-                    hwnd,
-                    int(msg.wParam),
-                    int(msg.lParam),
-                    (
-                        max(1, round(self.minimumWidth() * scale)),
-                        max(1, round(self.minimumHeight() * scale)),
-                    ),
-                )
-                if handled:
-                    return True, result
-            if msg.message == WM_NCACTIVATE:
-                handled, result = handle_ncactivate(int(msg.hWnd), int(msg.wParam))
-                if handled:
-                    return True, result
-            if msg.message == WM_NCCALCSIZE:
-                handled, result = handle_nccalcsize(int(msg.hWnd), int(msg.wParam), int(msg.lParam))
-                if handled:
-                    return True, result
-            if msg.message == WM_WINDOWPOSCHANGING and self._interactive_resize_active:
-                self._sync_windows_backdrop_from_windowpos(int(msg.lParam))
-            if msg.message in (WM_WINDOWPOSCHANGED, WM_DPICHANGED):
-                self._schedule_maximized_bounds_sync()
-                if self._interactive_resize_active:
-                    # WM_WINDOWPOSCHANGING follows the proposed rectangle so
-                    # the Acrylic host moves in the same transaction.  Windows
-                    # can still commit a final size that differs by one device
-                    # pixel after NCCALCSIZE/Qt rounding, so snap the native
-                    # helper to the committed GetWindowRect here.  Geometry
-                    # only: never touch z-order from inside the host callback.
-                    self._sync_windows_backdrop_geometry_now()
-                else:
-                    QTimer.singleShot(0, self._sync_windows_backdrop_window)
-            if msg.message == 0x0231:  # WM_ENTERSIZEMOVE
-                self._begin_interactive_resize()
-            elif msg.message == 0x0232:  # WM_EXITSIZEMOVE
-                self._end_interactive_resize()
-            if msg.message == 0x0084 and not (self.isMaximized() or self.isFullScreen()):  # WM_NCHITTEST
-                hwnd = int(msg.hWnd) or int(self.winId())
-                rect = window_rect(hwnd)
-                if rect is None:
-                    return super().nativeEvent(event_type, message)
-                x = ctypes.c_short(msg.lParam & 0xFFFF).value
-                y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
-                hit = self._windows_resize_hit_test(
-                    x,
-                    y,
-                    *rect,
-                    window_dpi_scale(hwnd),
-                )
-                if hit is not None:
-                    return True, hit
+        handled = self.native_window_controller.handle_native_event(event_type, message)
+        if handled is not None:
+            return handled
         return super().nativeEvent(event_type, message)
 
     def _schedule_maximized_bounds_sync(self) -> None:
@@ -1033,7 +1093,7 @@ class MainWindow(QMainWindow):
         self._maximized_bounds_sync_pending = False
         if self._closing or self._quit_in_progress or not is_windows_qt_platform():
             return
-        synchronize_maximized_work_area(int(self.winId()))
+        self.native_window_controller.sync_maximized_work_area()
 
     @classmethod
     def _windows_resize_hit_test(
@@ -1046,80 +1106,32 @@ class MainWindow(QMainWindow):
         bottom: int,
         device_pixel_ratio: float,
     ) -> int | None:
-        if x < left or x >= right or y < top or y >= bottom:
-            return None
-        edge = max(1, round(cls.RESIZE_EDGE_WIDTH * device_pixel_ratio))
-        corner = max(edge, round(cls.RESIZE_CORNER_SIZE * device_pixel_ratio))
-        on_left = x < left + edge
-        on_right = x >= right - edge
-        on_top = y < top + edge
-        on_bottom = y >= bottom - edge
-        near_left = x < left + corner
-        near_right = x >= right - corner
-        near_top = y < top + corner
-        near_bottom = y >= bottom - corner
-        if (on_top and near_left) or (on_left and near_top):
-            return 13  # HTTOPLEFT
-        if (on_top and near_right) or (on_right and near_top):
-            return 14  # HTTOPRIGHT
-        if (on_bottom and near_left) or (on_left and near_bottom):
-            return 16  # HTBOTTOMLEFT
-        if (on_bottom and near_right) or (on_right and near_bottom):
-            return 17  # HTBOTTOMRIGHT
-        if on_left:
-            return 10  # HTLEFT
-        if on_right:
-            return 11  # HTRIGHT
-        if on_top:
-            return 12  # HTTOP
-        if on_bottom:
-            return 15  # HTBOTTOM
-        return None
+        return windows_resize_hit_test(
+            x,
+            y,
+            left,
+            top,
+            right,
+            bottom,
+            device_pixel_ratio,
+            edge_width=cls.RESIZE_EDGE_WIDTH,
+            corner_size=cls.RESIZE_CORNER_SIZE,
+        )
 
     def _begin_interactive_resize(self) -> None:
-        if self._interactive_resize_active:
-            return
-        self._interactive_resize_active = True
-        self.grid.set_layout_updates_suspended(True)
+        self.native_window_controller.begin_interactive_resize()
 
     def _end_interactive_resize(self) -> None:
-        if not self._interactive_resize_active:
-            return
-        self._interactive_resize_active = False
-        if is_windows_qt_platform():
-            # The live loop used geometry-only native sync to avoid callback
-            # reentrancy. Re-establish exact z-order once the Win32 sizing loop
-            # has returned to Qt's event queue.
-            QTimer.singleShot(0, self._sync_windows_backdrop_window)
-        self.grid.set_layout_updates_suspended(
-            self._sidebar_animation_active or self._detail_animation_active
-        )
+        self.native_window_controller.end_interactive_resize()
 
     def _begin_sidebar_animation(self) -> None:
-        if self._sidebar_animation_active:
-            return
-        if self._detail_animation_active:
-            self._finish_detail_animation()
-        self._sidebar_animation_active = True
-        self.grid.set_layout_updates_suspended(True)
-        self.grid.begin_sidebar_transition(
-            self.sidebar.width(),
-            self.sidebar.collapse_progress,
-        )
+        self.sidebar_interaction_controller.begin_animation()
 
     def _update_sidebar_animation(self, progress: float) -> None:
-        if not self._sidebar_animation_active:
-            return
-        self._body_layout.activate()
-        self.grid.set_sidebar_transition_progress(progress)
+        self.sidebar_interaction_controller.update_animation(progress)
 
     def _end_sidebar_animation(self) -> None:
-        if not self._sidebar_animation_active:
-            return
-        self._sidebar_animation_active = False
-        self._body_layout.activate()
-        self.grid.set_layout_updates_suspended(self._interactive_resize_active)
-        self.grid.finish_sidebar_transition()
+        self.sidebar_interaction_controller.end_animation()
 
     def build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.app_icon, self)
@@ -1552,177 +1564,28 @@ class MainWindow(QMainWindow):
         self._start_detail_animation(False)
 
     def _desired_detail_width(self) -> int:
-        total = max(
-            1,
-            self.content_splitter.width()
-            - self.content_splitter.handleWidth(),
-        )
-        desired = min(520, max(280, getattr(self, "_detail_width", 340)))
-        if total > 0:
-            desired = min(desired, max(280, total - 240))
-        return max(1, desired)
+        return self.detail_animation_controller.desired_width()
 
     def _start_detail_animation(self, visible: bool) -> None:
-        visible = bool(visible)
-        end_progress = 1.0 if visible else 0.0
-        if (
-            not self._detail_animation_active
-            and abs(self._detail_animation_progress - end_progress) < 1e-6
-        ):
-            self._detail_animation_target_visible = visible
-            self.detail.setVisible(visible)
-            self.detail_button.setToolTip(
-                "收起详情" if visible else "显示详情"
-            )
-            return
-        if self._sidebar_animation_active:
-            self.sidebar.set_collapsed(self.sidebar.collapsed, animate=False)
-
-        self._detail_animation_target_visible = visible
-        self._detail_animation_timer.stop()
-        target_width = self._desired_detail_width()
-        self._detail_animation_target_width = target_width
-        self.detail.setMinimumWidth(0)
-        self.detail.setMaximumWidth(target_width)
-        self.content_splitter.setCollapsible(1, True)
-        self.detail.setVisible(True)
-        self._body_layout.activate()
-        pane_total = max(
-            1,
-            self.content_splitter.width()
-            - self.content_splitter.handleWidth(),
-        )
-        if pane_total > 0:
-            target_width = min(
-                target_width,
-                max(1, pane_total - 240),
-            )
-            self._detail_animation_target_width = target_width
-            self.detail.setMaximumWidth(target_width)
-        starting_transaction = not self._detail_animation_active
-        if not self._detail_animation_active:
-            self._detail_animation_active = True
-            self.grid.set_layout_updates_suspended(True)
-
-        self._apply_detail_panel_width(0)
-        hidden_viewport_width = self.grid.viewport().width()
-        self._apply_detail_panel_width(target_width)
-        shown_viewport_width = self.grid.viewport().width()
-        if starting_transaction:
-            self.detail.begin_width_transition(
-                target_width,
-                self.detail.viewport().width(),
-            )
-            self._body_layout.activate()
-            QApplication.sendPostedEvents(
-                None,
-                QEvent.Type.LayoutRequest,
-            )
-            self.detail.synchronize_width_transition_content()
-        self._apply_detail_panel_width(
-            round(target_width * self._detail_animation_progress)
-        )
-        self.grid.begin_viewport_width_transition(
-            hidden_viewport_width,
-            shown_viewport_width,
-            self._detail_animation_progress,
-        )
-        self._detail_animation_start_progress = self._detail_animation_progress
-        self._detail_animation_end_progress = end_progress
-        screen = self.screen()
-        refresh_rate = float(screen.refreshRate()) if screen is not None else 60.0
-        if refresh_rate < 30.0:
-            refresh_rate = 60.0
-        refresh_rate = min(
-            Sidebar.MAX_ANIMATION_REFRESH_RATE,
-            refresh_rate,
-        )
-        self._detail_animation_timer.setInterval(
-            max(1, round(1000.0 / refresh_rate))
-        )
-        self._detail_animation_elapsed.start()
-        self._detail_animation_timer.start()
-        self.detail_button.setToolTip(
-            "收起详情" if visible else "显示详情"
-        )
+        self.detail_animation_controller.start(visible)
 
     def _advance_detail_animation(self) -> None:
-        if not self._detail_animation_active:
-            self._detail_animation_timer.stop()
-            return
-        elapsed_ms = (
-            self._detail_animation_elapsed.nsecsElapsed() / 1_000_000.0
-        )
-        fraction = min(1.0, elapsed_ms / Sidebar.ANIMATION_DURATION_MS)
-        progress = self._detail_animation_start_progress + (
-            self._detail_animation_end_progress
-            - self._detail_animation_start_progress
-        ) * fraction
-        self._set_detail_animation_progress(progress)
-        if fraction >= 1.0:
-            self._finish_detail_animation()
+        self.detail_animation_controller.advance()
 
     def _set_detail_animation_progress(self, progress: float) -> None:
-        progress = max(0.0, min(1.0, float(progress)))
-        self._detail_animation_progress = progress
-        width = round(self._detail_animation_target_width * progress)
-        self._apply_detail_panel_width(width)
-        self.grid.set_sidebar_transition_progress(progress)
+        self.detail_animation_controller.set_progress(progress)
 
     def _apply_detail_panel_width(self, width: int) -> None:
-        total = max(
-            1,
-            self.content_splitter.width()
-            - self.content_splitter.handleWidth(),
-        )
-        self.content_splitter.setSizes(
-            [max(0, total - width), max(0, width)]
-        )
-        self._body_layout.activate()
+        self.detail_animation_controller.apply_panel_width(width)
 
     def _finish_detail_animation(self) -> None:
-        self._detail_animation_timer.stop()
-        endpoint = 1.0 if self._detail_animation_target_visible else 0.0
-        self._set_detail_animation_progress(endpoint)
-        self._detail_animation_active = False
-        self.grid.set_layout_updates_suspended(
-            self._interactive_resize_active
-        )
-        self.grid.finish_sidebar_transition()
-        self.detail.finish_width_transition()
-        self.detail.setMinimumWidth(280)
-        self.detail.setMaximumWidth(520)
-        if self._detail_animation_target_visible:
-            self._restore_detail_splitter_size()
-        else:
-            self.detail.setVisible(False)
-        self.content_splitter.setCollapsible(1, False)
-        self._body_layout.activate()
+        self.detail_animation_controller.finish()
 
     def _detail_splitter_moved(self, _position: int, _index: int) -> None:
-        if self.detail.isVisible() and not self._detail_animation_active:
-            self._detail_width = max(self.detail.minimumWidth(), self.detail.width())
+        self.detail_animation_controller.splitter_moved(_position, _index)
 
     def _restore_detail_splitter_size(self) -> None:
-        if (
-            not hasattr(self, "content_splitter")
-            or self._detail_animation_active
-        ):
-            return
-        total = max(
-            1,
-            self.content_splitter.width()
-            - self.content_splitter.handleWidth(),
-        )
-        if total <= 0:
-            QTimer.singleShot(0, self._restore_detail_splitter_size)
-            return
-        desired = min(
-            self.detail.maximumWidth(),
-            max(self.detail.minimumWidth(), getattr(self, "_detail_width", 340)),
-        )
-        desired = min(desired, max(self.detail.minimumWidth(), total - 240))
-        self.content_splitter.setSizes([max(1, total - desired), desired])
+        self.detail_animation_controller.restore_splitter_size()
 
     def set_view_mode(self, mode: str) -> None:
         mode = "list" if mode == "list" else "grid"
@@ -1768,51 +1631,11 @@ class MainWindow(QMainWindow):
         self._refresh_search_items_async()
 
     def toggle_monitor(self) -> None:
-        previous = self.clipboard_service.timer.isActive()
-        desired = not previous
-        save_warning: Exception | None = None
-        try:
-            self.settings.set("monitoring", desired)
-        except Exception as exc:
-            if bool(self.settings.get("monitoring", previous)) != desired:
-                self.show_error_status(f"设置无法保存：{exc}")
-                return
-            save_warning = exc
-
-        try:
-            if desired:
-                self.clipboard_service.start()
-            else:
-                self.clipboard_service.stop()
-        except Exception as exc:
-            rollback_errors = []
-            try:
-                self.settings.set("monitoring", previous)
-            except Exception as rollback_exc:
-                rollback_errors.append(str(rollback_exc))
-            try:
-                if previous:
-                    self.clipboard_service.start()
-                else:
-                    self.clipboard_service.stop()
-            except Exception as rollback_exc:
-                rollback_errors.append(str(rollback_exc))
-            suffix = f"；回滚失败：{'；'.join(rollback_errors)}" if rollback_errors else ""
-            self.show_error_status(f"本地自动捕获无法切换：{exc}{suffix}")
+        result = self.monitoring_controller.toggle()
+        if not result.succeeded:
+            self.show_error_status(result.message)
             return
-
-        if self.clipboard_service.timer.isActive() != desired:
-            try:
-                self.settings.set("monitoring", previous)
-            except Exception as exc:
-                self.show_error_status(f"本地自动捕获状态异常，且设置无法回滚：{exc}")
-                return
-            self.show_error_status("本地自动捕获未能切换到请求的状态")
-            return
-        if save_warning is not None:
-            self.show_error_status(f"设置已写入，但持久化确认失败：{save_warning}")
-            return
-        self._show_monitor_notification(desired)
+        self._show_monitor_notification(result.active)
 
     def _show_monitor_notification(self, active: bool) -> None:
         message = "本地自动捕获已开启" if active else "本地自动捕获已暂停"
@@ -1833,32 +1656,10 @@ class MainWindow(QMainWindow):
             self.show_error_status(f"设置无法保存：{exc}")
 
     def _queue_sidebar_collapsed_setting(self, value: bool) -> None:
-        value = bool(value)
-        if self._pending_sidebar_collapsed is None and bool(
-            self.settings.get("sidebar_collapsed", False)
-        ) == value:
-            return
-        if (
-            self._pending_sidebar_collapsed == value
-            and self._sidebar_setting_timer.isActive()
-        ):
-            return
-        self._pending_sidebar_collapsed = value
-        self._sidebar_setting_timer.start()
+        self.sidebar_interaction_controller.queue_collapsed_setting(value)
 
     def _flush_pending_sidebar_collapsed_setting(self, force: bool = False) -> None:
-        self._sidebar_setting_timer.stop()
-        if not force and self._sidebar_animation_active:
-            self._sidebar_setting_timer.start()
-            return
-        value = self._pending_sidebar_collapsed
-        self._pending_sidebar_collapsed = None
-        if (
-            value is None
-            or bool(self.settings.get("sidebar_collapsed", False)) == value
-        ):
-            return
-        self._save_setting("sidebar_collapsed", value)
+        self.sidebar_interaction_controller.flush_collapsed_setting(force=force)
 
     def update_monitor_button(self, active: bool) -> None:
         self.capture_status.set_active(active)
@@ -3127,66 +2928,17 @@ class MainWindow(QMainWindow):
         self._cancel_item_search_request()
         monitoring_was_active = self.shutdown_coordinator.prepare_session_end()
 
-        note_updates = self.detail.pending_note_updates()
-        if self.detail.current_item is not None:
-            item_id = self.detail.current_item["id"]
-            notes = self.detail.notes.toPlainText()
-            if notes != self.detail.loaded_notes:
-                note_updates[item_id] = (self.detail.loaded_notes, notes)
-        if note_updates:
-            note_result: list[Exception | None] = []
-            note_saved_ids: list[int] = []
-            reconciled_note_ids: set[int] = set()
-            note_state_lock = threading.Lock()
-            note_done = threading.Event()
-            note_token = object()
-
-            def persist_notes(cancel_event: threading.Event) -> None:
-                error = None
-                try:
-                    for item_id, (expected_notes, notes) in note_updates.items():
-                        if cancel_event.is_set():
-                            return
-                        if not self.database.set_notes_if_unchanged(
-                            item_id, expected_notes, notes
-                        ):
-                            raise RuntimeError("notes changed during session shutdown")
-                        with note_state_lock:
-                            note_saved_ids.append(item_id)
-                except Exception as exc:
-                    error = exc
-                finally:
-                    note_result.append(error)
-                    note_done.set()
-
-            def reconcile_saved_notes() -> None:
-                with note_state_lock:
-                    pending_ids = [
-                        item_id
-                        for item_id in note_saved_ids
-                        if item_id not in reconciled_note_ids
-                    ]
-                    reconciled_note_ids.update(pending_ids)
-                for item_id in pending_ids:
-                    _expected_notes, notes = note_updates[item_id]
-                    self.detail.mark_notes_saved(item_id, notes)
-
-            def reconcile_late_note_saves() -> None:
-                if self._closing:
-                    return
-                if not note_done.is_set():
-                    QTimer.singleShot(25, reconcile_late_note_saves)
-                    return
-                reconcile_saved_notes()
-
-            self._start_async_task(note_token, persist_notes)
-            notes_finished = note_done.wait(remaining())
-            reconcile_saved_notes()
-            if not notes_finished:
-                self._cancel_async_token(note_token)
-                QTimer.singleShot(0, reconcile_late_note_saves)
-            if not notes_finished or note_result != [None]:
-                return abort(monitoring_was_active)
+        if not self.shutdown_coordinator.persist_session_notes(
+            remaining(),
+            start_task=lambda token, target: self._start_async_task(token, target),
+            cancel_task=lambda token: self._cancel_async_token(token),
+            schedule_later=lambda delay_ms, callback: QTimer.singleShot(
+                delay_ms,
+                callback,
+            ),
+            is_closing=lambda: self._closing,
+        ):
+            return abort(monitoring_was_active)
 
         for attribute in ("_startup_scan_request", "_import_request", "_backup_request"):
             request = getattr(self, attribute)

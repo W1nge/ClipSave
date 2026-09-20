@@ -39,6 +39,7 @@ class WindowEffectsController:
         self.backdrop_window_hwnd: int | None = None
         self.power_notification_hwnd: int | None = None
         self.power_notification_handle: int | None = None
+        self.material_refresh_pending = False
 
     def ensure_backdrop_window(self) -> int | None:
         if not self.platform_check():
