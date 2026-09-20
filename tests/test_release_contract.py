@@ -113,6 +113,15 @@ class ReleaseContractTests(unittest.TestCase):
         )
         self.assertIn("$($match.Groups[1].Value.Trim())", workflow)
 
+    def test_release_validates_pyinstaller_warnings_before_publish(self):
+        workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+        warning_gate = (
+            ".\\.venv\\Scripts\\python.exe check_pyinstaller_warnings.py "
+            "build\\work\\ClipSave\\warn-ClipSave.txt"
+        )
+        self.assertIn(warning_gate, workflow)
+        self.assertLess(workflow.index(warning_gate), workflow.index("Publish GitHub Release"))
+
     def test_release_checklist_owns_windows_visual_and_interactive_gates(self):
         checklist = Path("RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
         self.assertIn("verify_windows_visual_smoke.py", checklist)

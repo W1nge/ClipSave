@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
-from sqlite3 import Connection
 
 from .library_models import CollectionSummary, LibraryItem, TagSummary
 
@@ -14,7 +14,7 @@ class DatabaseQueryStore:
     def __init__(
         self,
         *,
-        connection: Callable[[], Connection],
+        connection: Callable[[], sqlite3.Connection],
         lock: AbstractContextManager,
         utc_timestamp: Callable[[dt.datetime | str | None], str],
         summary_content_limit: int,

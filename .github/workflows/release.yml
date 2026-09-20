@@ -117,6 +117,11 @@ jobs:
           RestoreLockedMode: "true"
         run: set CLIPSAVE_OFFICIAL_BUILD=1&& echo.|build.bat
 
+      - name: Validate PyInstaller warnings
+        if: steps.meta.outputs.should_release == 'true'
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe check_pyinstaller_warnings.py build\work\ClipSave\warn-ClipSave.txt
+
       - name: Run regression suite
         if: steps.meta.outputs.should_release == 'true'
         shell: pwsh
