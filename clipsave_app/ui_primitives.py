@@ -713,6 +713,9 @@ def _fit_dialog_size(widget: QWidget, preferred: QSize, margin: int = 32) -> QSi
     return QSize(min(preferred.width(), available.width()), min(preferred.height(), available.height()))
 
 
+fit_dialog_size = _fit_dialog_size
+
+
 class DialogTitleBar(DraggableBar):
     def __init__(self, title: str, parent=None):
         super().__init__(parent)

@@ -240,3 +240,8 @@ class _AssetGridTransitionOverlay:
         )
         painter.restore()
 
+
+GridTransitionCard = _GridTransitionCard
+AssetGridTransitionOverlay = _AssetGridTransitionOverlay
+grid_transition_card_elevated = _grid_transition_card_elevated
+

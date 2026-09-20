@@ -28,18 +28,18 @@ from PySide6.QtWidgets import (
 
 from .asset_grid_delegate import AssetGridDelegate
 from .asset_grid_transition import (
-    _AssetGridTransitionOverlay,
-    _GridTransitionCard,
-    _grid_transition_card_elevated,
+    AssetGridTransitionOverlay,
+    GridTransitionCard,
+    grid_transition_card_elevated,
 )
 from .item_gestures import ItemRightClickGesture, ItemTripleClickGesture
 from .item_models import AssetItemModel
 from .sidebar import Sidebar
 from .thumbnail_service import (
     ThumbnailDecodeQueue,
-    _ThumbnailCacheKey,
-    _cache_decoded_thumbnail,
-    _cached_thumbnail,
+    ThumbnailCacheKey,
+    cache_decoded_thumbnail,
+    cached_thumbnail,
 )
 from .ui_primitives import (
     AutoHideScrollBar,
@@ -58,10 +58,10 @@ class AssetGrid(QListView):
         return ThumbnailDecodeQueue(parent)
 
     def _thumbnail_lookup(self, path, content_hash=None):
-        return _cached_thumbnail(path, content_hash)
+        return cached_thumbnail(path, content_hash)
 
     def _store_decoded_thumbnail(self, key, image):
-        return _cache_decoded_thumbnail(key, image)
+        return cache_decoded_thumbnail(key, image)
     open_requested = Signal(int)
     favorite_requested = Signal(int, bool)
 
@@ -84,7 +84,7 @@ class AssetGrid(QListView):
         self.setSpacing(0)
         self.setObjectName("AssetGrid")
         self._sidebar_transition_active = False
-        self._sidebar_transition_overlay: _AssetGridTransitionOverlay | None = None
+        self._sidebar_transition_overlay: AssetGridTransitionOverlay | None = None
         self._pending_items_update: tuple[list, int | None] | None = None
         self._asset_model = AssetItemModel(self)
         self.setModel(self._asset_model)
@@ -310,7 +310,7 @@ class AssetGrid(QListView):
             return False
 
         cards = [
-            _GridTransitionCard(
+            GridTransitionCard(
                 row=row,
                 expanded_rect=self._transition_cell_rect(
                     row,
@@ -324,7 +324,7 @@ class AssetGrid(QListView):
                     end_size,
                     scroll_offset,
                 ),
-                elevated=_grid_transition_card_elevated(
+                elevated=grid_transition_card_elevated(
                     row,
                     start_columns,
                     end_columns,
@@ -332,7 +332,7 @@ class AssetGrid(QListView):
             )
             for row in rows
         ]
-        overlay = _AssetGridTransitionOverlay(
+        overlay = AssetGridTransitionOverlay(
             self,
             cards,
             start_columns,
@@ -448,7 +448,7 @@ class AssetGrid(QListView):
         return None
 
     @Slot(object, object, int)
-    def _thumbnail_decoded(self, key: _ThumbnailCacheKey, image: QImage, generation: int) -> None:
+    def _thumbnail_decoded(self, key: ThumbnailCacheKey, image: QImage, generation: int) -> None:
         if generation != self._thumbnail_generation:
             return
         model_generation = self._asset_model.generation

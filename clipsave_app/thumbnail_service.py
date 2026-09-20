@@ -333,3 +333,8 @@ class ThumbnailDecodeQueue(QObject):
         self._pump()
         if not self._paused and not active[0].cancelled:
             self.capacity_available.emit()
+
+
+ThumbnailCacheKey = _ThumbnailCacheKey
+cached_thumbnail = _cached_thumbnail
+cache_decoded_thumbnail = _cache_decoded_thumbnail

@@ -29,7 +29,7 @@ from .ui_primitives import (
     ThemedLineEdit,
     ThemedSelectableLabel,
     ToggleSwitch,
-    _fit_dialog_size,
+    fit_dialog_size,
     friendly_day,
     lucide_icon,
 )
@@ -50,7 +50,7 @@ class MarkdownDialog(QDialog):
         self.setObjectName("FluentDialog")
         self.setProperty("markdownDialog", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.resize(_fit_dialog_size(self, QSize(920, 700)))
+        self.resize(fit_dialog_size(self, QSize(920, 700)))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(1, 1, 1, 1)
@@ -93,7 +93,7 @@ class TextDialog(QDialog):
         self.setObjectName("FluentDialog")
         self.setProperty("textDialog", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.resize(_fit_dialog_size(self, QSize(920, 700)))
+        self.resize(fit_dialog_size(self, QSize(920, 700)))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(1, 1, 1, 1)
@@ -125,7 +125,7 @@ class DateDialog(QDialog):
         self.setObjectName("FluentDialog")
         self.setProperty("dateDialog", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setFixedSize(_fit_dialog_size(self, QSize(420, 560)))
+        self.setFixedSize(fit_dialog_size(self, QSize(420, 560)))
         root = QVBoxLayout(self)
         root.setContentsMargins(1, 1, 1, 1)
         root.setSpacing(0)
@@ -209,7 +209,7 @@ class SettingsDialog(QDialog):
         self.setProperty("settingsDialog", True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         preferred_size = QSize(720, 600)
-        dialog_size = _fit_dialog_size(self, preferred_size)
+        dialog_size = fit_dialog_size(self, preferred_size)
         self.setFixedSize(dialog_size)
         root = QVBoxLayout(self)
         root.setContentsMargins(1, 1, 1, 1)

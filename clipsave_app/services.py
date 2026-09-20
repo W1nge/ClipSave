@@ -56,7 +56,7 @@ from PySide6.QtWidgets import QApplication
 
 from .ai_service import (
     AIService as _BaseAIService,
-    _AIServiceRequestError as _AIServiceRequestError,
+    AIServiceRequestError,
 )
 from .clipboard_service import ClipboardService as _BaseClipboardService
 from .native_clipboard_reader import ClipboardBusy as _ClipboardBusy
@@ -87,6 +87,9 @@ class AIService(_BaseAIService):
 
     def _preflight_image(self, path: Path) -> ImageFileSnapshot:
         return preflight_image_file(path)
+
+
+_AIServiceRequestError = AIServiceRequestError
 
 
 class ClipboardService(_BaseClipboardService):

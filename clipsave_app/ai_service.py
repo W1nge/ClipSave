@@ -32,6 +32,9 @@ class _AIServiceRequestError(RuntimeError):
         super().__init__(f"AI 服务返回 {status_code}: {detail[:300]}")
 
 
+AIServiceRequestError = _AIServiceRequestError
+
+
 _raise_if_cancelled = raise_if_cancelled
 
 

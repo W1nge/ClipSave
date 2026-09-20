@@ -21,9 +21,9 @@ from .item_models import TYPE_LABELS, format_local_timestamp, human_size, normal
 from .markdown_view import SafeMarkdownBrowser, set_markdown_content
 from .thumbnail_service import (
     ThumbnailDecodeQueue,
-    _ThumbnailCacheKey,
-    _cache_decoded_thumbnail,
-    _cached_thumbnail,
+    ThumbnailCacheKey,
+    cache_decoded_thumbnail,
+    cached_thumbnail,
 )
 from .ui_primitives import (
     AutoHideScrollBar,
@@ -111,10 +111,10 @@ class DetailPanel(QScrollArea):
         return ThumbnailDecodeQueue(parent)
 
     def _thumbnail_lookup(self, path, content_hash=None):
-        return _cached_thumbnail(path, content_hash)
+        return cached_thumbnail(path, content_hash)
 
     def _store_decoded_thumbnail(self, key, image):
-        return _cache_decoded_thumbnail(key, image)
+        return cache_decoded_thumbnail(key, image)
 
     def _icon(self, name: str) -> QIcon:
         return lucide_icon(name)
@@ -483,7 +483,7 @@ class DetailPanel(QScrollArea):
             self.set_item(self.current_item)
 
     @Slot(object, object, int)
-    def _thumbnail_decoded(self, key: _ThumbnailCacheKey, image: QImage, generation: int) -> None:
+    def _thumbnail_decoded(self, key: ThumbnailCacheKey, image: QImage, generation: int) -> None:
         if generation != self._thumbnail_generation or self.current_item is None:
             return
         if normalized_thumbnail_path(self.current_item["path"]) != key.path:
