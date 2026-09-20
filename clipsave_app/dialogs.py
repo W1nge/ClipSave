@@ -399,13 +399,12 @@ class SettingsDialog(QDialog):
         if callable(provider):
             state = provider()
         else:
-            active = getattr(self._bulk_progress_provider, "_bulk_image_request", None) is not None
             state = {
-                "active": active,
+                "active": False,
                 "resumable": False,
                 "processed": 0,
                 "total": 0,
-                "phase": "正在处理" if active else "",
+                "phase": "",
                 "error": "",
             }
         active = bool(state.get("active"))

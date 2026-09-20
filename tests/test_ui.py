@@ -74,11 +74,11 @@ class MainWindowTests(unittest.TestCase):
 
     def wait_for_delete(self, item_id: int, timeout: float = 2.0) -> None:
         deadline = time.monotonic() + timeout
-        while item_id in self.window._delete_requests and time.monotonic() < deadline:
+        while item_id in self.window.mutation_controller.delete_requests and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.01)
         self.app.processEvents()
-        self.assertNotIn(item_id, self.window._delete_requests)
+        self.assertNotIn(item_id, self.window.mutation_controller.delete_requests)
 
     def test_panels_and_navigation(self):
         self.assertEqual(self.window.windowTitle(), "ClipSave")
@@ -144,7 +144,7 @@ class MainWindowTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNone(self.window.sort_menu)
         self.window.open_day(self.database.days()[0][0])
-        self.assertTrue(wait_for(lambda: self.window._item_search_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
         self.assertEqual(len(self.window.current_items), 1)
         self.window.select_item(self.window.current_items[0]["id"])
         self.window.toggle_detail()
@@ -286,7 +286,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertEqual(ocr.call_count, 2)
         self.assertEqual(describe.call_count, 2)
-        self.assertIsNone(self.window._bulk_image_request)
+        self.assertIsNone(self.window.bulk_image_controller.request)
         for item_id, expected_ocr, expected_description in zip(
             image_ids,
             ("first OCR", "second OCR"),
@@ -324,7 +324,7 @@ class MainWindowTests(unittest.TestCase):
             start_task.call_args.args[1](threading.Event())
             self.app.processEvents()
 
-        checkpoint = load_checkpoint(self.window._bulk_image_checkpoint_path)
+        checkpoint = load_checkpoint(self.window.bulk_image_controller.checkpoint_path)
         self.assertEqual(checkpoint.stage, "description")
         self.assertEqual(checkpoint.next_index, 0)
         first_ocr.assert_called_once()
@@ -344,7 +344,7 @@ class MainWindowTests(unittest.TestCase):
 
         resumed_ocr.assert_called_once()
         self.assertEqual(resumed_describe.call_count, 2)
-        self.assertIsNone(load_checkpoint(self.window._bulk_image_checkpoint_path))
+        self.assertIsNone(load_checkpoint(self.window.bulk_image_controller.checkpoint_path))
         self.assertEqual(self.database.get_item(image_ids[0])["ocr_text"], "first OCR")
         self.assertEqual(
             self.database.get_item(image_ids[0])["ai_description"],
@@ -353,7 +353,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.database.get_item(image_ids[1])["ocr_text"], "second OCR")
 
     def test_settings_shows_resumable_bulk_image_progress(self):
-        self.window._bulk_image_progress_state = {
+        self.window.bulk_image_controller.progress_state = {
             "active": False,
             "resumable": True,
             "processed": 7,
@@ -420,7 +420,7 @@ class MainWindowTests(unittest.TestCase):
         item = self.database.get_item(item_id)
         self.assertEqual(item["ai_description"], "saved description")
         self.assertIsNone(item["embedding"])
-        self.assertNotIn(item_id, self.window._ai_requests)
+        self.assertNotIn(item_id, self.window.image_task_controller.ai_requests)
         describe.assert_called_once()
         status.assert_called_once()
         self.assertEqual(status.call_args.args[0], "AI 描述已生成")
@@ -483,7 +483,7 @@ class MainWindowTests(unittest.TestCase):
             )
             self.window.import_files()
             deadline = time.monotonic() + 2
-            while self.window._import_request is not None and time.monotonic() < deadline:
+            while self.window.mutation_controller.import_request is not None and time.monotonic() < deadline:
                 self.app.processEvents()
                 time.sleep(0.01)
 
@@ -492,16 +492,16 @@ class MainWindowTests(unittest.TestCase):
     def test_automatic_ai_failure_cleans_request_without_modal(self):
         item_id = self.window.current_items[0]["id"]
         token, signals = object(), AsyncSignals()
-        self.window._ai_requests[item_id] = (token, signals)
-        self.window._automatic_ai_items.add(item_id)
+        self.window.image_task_controller.ai_requests[item_id] = (token, signals)
+        self.window.image_task_controller.automatic_ai_items.add(item_id)
 
         with patch.object(self.window, "show_error_status") as status, patch(
             "clipsave_app.main_window.QMessageBox.warning"
         ) as warning:
             self.window._ai_failed(token, signals, item_id, "provider failed")
 
-        self.assertNotIn(item_id, self.window._ai_requests)
-        self.assertNotIn(item_id, self.window._automatic_ai_items)
+        self.assertNotIn(item_id, self.window.image_task_controller.ai_requests)
+        self.assertNotIn(item_id, self.window.image_task_controller.automatic_ai_items)
         status.assert_called_once_with("自动生成描述失败：provider failed")
         warning.assert_not_called()
 
@@ -511,10 +511,10 @@ class MainWindowTests(unittest.TestCase):
         new_ai = (object(), AsyncSignals())
         old_ocr = (object(), AsyncSignals())
         new_ocr = (object(), AsyncSignals())
-        self.window._ai_requests[item_id] = new_ai
-        self.window._ocr_requests[item_id] = new_ocr
-        self.window._automatic_ai_items.add(item_id)
-        self.window._automatic_ocr_items.add(item_id)
+        self.window.image_task_controller.ai_requests[item_id] = new_ai
+        self.window.image_task_controller.ocr_requests[item_id] = new_ocr
+        self.window.image_task_controller.automatic_ai_items.add(item_id)
+        self.window.image_task_controller.automatic_ocr_items.add(item_id)
 
         with patch.object(self.window, "show_error_status") as status, patch(
             "clipsave_app.main_window.QMessageBox.warning"
@@ -522,10 +522,10 @@ class MainWindowTests(unittest.TestCase):
             self.window._ai_failed(old_ai[0], old_ai[1], item_id, "old ai failure")
             self.window._ocr_failed(old_ocr[0], old_ocr[1], item_id, "old ocr failure")
 
-        self.assertIs(self.window._ai_requests[item_id], new_ai)
-        self.assertIs(self.window._ocr_requests[item_id], new_ocr)
-        self.assertIn(item_id, self.window._automatic_ai_items)
-        self.assertIn(item_id, self.window._automatic_ocr_items)
+        self.assertIs(self.window.image_task_controller.ai_requests[item_id], new_ai)
+        self.assertIs(self.window.image_task_controller.ocr_requests[item_id], new_ocr)
+        self.assertIn(item_id, self.window.image_task_controller.automatic_ai_items)
+        self.assertIn(item_id, self.window.image_task_controller.automatic_ocr_items)
         status.assert_not_called()
         warning.assert_not_called()
 
@@ -1296,7 +1296,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertTrue(started.wait(0.5))
             release.set()
             self.assertTrue(
-                wait_for(lambda: self.window._item_search_request is None)
+                wait_for(lambda: self.window.library_controller.search_request is None)
             )
 
         self.assertEqual(
@@ -1328,7 +1328,7 @@ class MainWindowTests(unittest.TestCase):
             self.window._refresh_search_items_async()
             self.assertTrue(
                 wait_for(
-                    lambda: self.window._item_search_request is None
+                    lambda: self.window.library_controller.search_request is None
                     and [item["id"] for item in self.window.current_items] == [second_id]
                 )
             )
@@ -1493,14 +1493,14 @@ class MainWindowTests(unittest.TestCase):
         self.window.select_item(selected_id)
 
         self.window.load_more_items()
-        self.assertTrue(wait_for(lambda: self.window._item_page_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.page_request is None))
         self.assertEqual(len(self.window.current_items), 4)
         self.assertEqual(self.window.current_item_id, selected_id)
         self.assertEqual(self.window._items_offset, 4)
         self.assertTrue(self.window._items_has_more)
 
         self.window.load_more_items()
-        self.assertTrue(wait_for(lambda: self.window._item_page_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.page_request is None))
         self.assertEqual(len(self.window.current_items), 5)
         self.assertEqual(self.window.current_item_id, selected_id)
         self.assertEqual(self.window._items_offset, 5)
@@ -1544,7 +1544,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertLess(elapsed, 0.1)
             self.assertTrue(started.wait(0.5))
             release.set()
-            self.assertTrue(wait_for(lambda: self.window._item_page_request is None))
+            self.assertTrue(wait_for(lambda: self.window.library_controller.page_request is None))
 
         self.assertEqual(len(self.window.current_items), 4)
 
@@ -1554,7 +1554,7 @@ class MainWindowTests(unittest.TestCase):
         self.window.ITEM_PAGE_SIZE = 2
         self.window.refresh_items()
         self.window.load_more_items()
-        self.assertTrue(wait_for(lambda: self.window._item_page_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.page_request is None))
         self.assertEqual(self.window._items_offset, 4)
 
         self.window.search.setText("needle")
@@ -1570,7 +1570,7 @@ class MainWindowTests(unittest.TestCase):
         token = object()
         signals = AsyncSignals()
         image_id = 999
-        self.window._copy_request = (token, signals, image_id)
+        self.window.mutation_controller.copy_request = (token, signals, image_id)
         image = QImage(8, 8, QImage.Format.Format_RGB32)
         image.fill(QColor("#21a8fb"))
 
@@ -1586,7 +1586,7 @@ class MainWindowTests(unittest.TestCase):
         set_text.assert_called_once_with("first clipboard item")
         set_image.assert_not_called()
         show_confirmation.assert_called_once_with()
-        self.assertIsNone(self.window._copy_request)
+        self.assertIsNone(self.window.mutation_controller.copy_request)
 
     def test_capture_refresh_preserves_expanded_search_and_error_tooltip(self):
         self.window.search.setText("missing phrase")
@@ -1690,7 +1690,7 @@ class MainWindowTests(unittest.TestCase):
             worker = start_task.call_args.args[1]
             worker(threading.Event())
             self.assertTrue(
-                wait_for(lambda: self.window._item_search_request is None)
+                wait_for(lambda: self.window.library_controller.search_request is None)
             )
 
         self.assertTrue(self.window._expanded_search_active())
@@ -1762,7 +1762,7 @@ class MainWindowTests(unittest.TestCase):
 
         stale_token, stale_signals = object(), AsyncSignals()
         active_token, active_signals = object(), AsyncSignals()
-        self.window._ai_requests[first_id] = (active_token, active_signals)
+        self.window.image_task_controller.ai_requests[first_id] = (active_token, active_signals)
         first_hash = self.database.get_item(first_id)["content_hash"]
         self.window._ai_succeeded(
             stale_token,
@@ -1775,7 +1775,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.detail.current_item["id"], second_id)
 
         token, signals = object(), AsyncSignals()
-        self.window._ai_requests[first_id] = (token, signals)
+        self.window.image_task_controller.ai_requests[first_id] = (token, signals)
         expanded_ids = [item["id"] for item in self.window.current_items]
         self.window.search.setText("nonmatching expanded query")
         self.window.search_timer.stop()
@@ -1796,7 +1796,7 @@ class MainWindowTests(unittest.TestCase):
         previous_ids = [item["id"] for item in self.window.current_items]
         old_token, old_signals = object(), AsyncSignals()
         new_token, new_signals = object(), AsyncSignals()
-        self.window._expanded_search_request = (new_token, new_signals)
+        self.window.image_task_controller.expanded_search_request = (new_token, new_signals)
         self.window._expanded_search_succeeded(old_token, old_signals, "", ["stale"])
         self.assertEqual([item["id"] for item in self.window.current_items], previous_ids)
 
@@ -1808,7 +1808,7 @@ class MainWindowTests(unittest.TestCase):
         item_id = self.database.add_image(image_path)
         expected_hash = self.database.get_item(item_id)["content_hash"]
         token, signals = object(), AsyncSignals()
-        self.window._ai_requests[item_id] = (token, signals)
+        self.window.image_task_controller.ai_requests[item_id] = (token, signals)
         with self.database._transaction():
             self.database.connection.execute(
                 "UPDATE items SET content_hash=? WHERE id=?",
@@ -1824,7 +1824,7 @@ class MainWindowTests(unittest.TestCase):
         )
 
         self.assertEqual(self.database.get_item(item_id)["ai_description"], "")
-        self.assertNotIn(item_id, self.window._ai_requests)
+        self.assertNotIn(item_id, self.window.image_task_controller.ai_requests)
 
     def test_async_task_cancellation_is_tracked_and_waited_for(self):
         token = object()
@@ -1882,10 +1882,10 @@ class MainWindowTests(unittest.TestCase):
             self.assertIsNot(worker_threads[0], threading.current_thread())
             release.set()
             deadline = time.monotonic() + 2
-            while self.window._startup_scan_request is not None and time.monotonic() < deadline:
+            while self.window.maintenance_controller.startup_request is not None and time.monotonic() < deadline:
                 self.app.processEvents()
                 time.sleep(0.01)
-        self.assertIsNone(self.window._startup_scan_request)
+        self.assertIsNone(self.window.maintenance_controller.startup_request)
 
     def test_quit_refuses_to_exit_while_clipboard_write_is_pending(self):
         with patch.object(self.window.clipboard_service.timer, "isActive", return_value=True), patch.object(
@@ -1998,14 +1998,14 @@ class MainWindowTests(unittest.TestCase):
         tag_id = self.database.add_tag(item_id, "temporary filter")
         self.window._refresh_navigation_metadata()
         self.window.navigate("tag", tag_id)
-        self.assertTrue(wait_for(lambda: self.window._item_search_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
         self.window.select_item(item_id)
         self.window.toggle_detail()
         self.assertEqual(self.window.detail.current_item["id"], item_id)
 
         self.window.remove_tag_from_item(item_id, "temporary filter")
         self.assertTrue(
-            wait_for(lambda: self.window._library_refresh_request is None)
+            wait_for(lambda: self.window.library_controller.refresh_request is None)
         )
 
         self.assertEqual(self.window.current_items, [])
@@ -2014,7 +2014,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_navigation_active_state_survives_metadata_refresh(self):
         self.window.navigate("favorite", None)
-        self.assertTrue(wait_for(lambda: self.window._item_search_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
         self.assertTrue(bool(self.window.sidebar.nav_buttons["favorite"].property("active")))
         self.window._refresh_navigation_metadata()
         self.assertTrue(bool(self.window.sidebar.nav_buttons["favorite"].property("active")))
@@ -2024,7 +2024,7 @@ class MainWindowTests(unittest.TestCase):
         tag_id = self.database.add_tag(item_id, "Active tag")
         self.window._refresh_navigation_metadata()
         self.window.navigate("collection", collection_id)
-        self.assertTrue(wait_for(lambda: self.window._item_search_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
         collection_button = next(
             button
             for button in self.window.sidebar.collection_buttons
@@ -2032,7 +2032,7 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertTrue(bool(collection_button.property("active")))
         self.window.navigate("tag", tag_id)
-        self.assertTrue(wait_for(lambda: self.window._item_search_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
         tag_button = next(
             button
             for button in self.window.sidebar.tag_buttons
@@ -2052,8 +2052,8 @@ class MainWindowTests(unittest.TestCase):
             return_value=QMessageBox.StandardButton.No,
         ) as question:
             delete_button.click()
-            self.assertTrue(wait_for(lambda: self.window._item_search_request is None))
-            self.assertTrue(wait_for(lambda: self.window._item_search_request is None))
+            self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
+            self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
 
         self.assertEqual(question.call_args.args[4], QMessageBox.StandardButton.No)
         self.assertIn(collection_id, {row["id"] for row in self.database.collections()})
@@ -2065,7 +2065,7 @@ class MainWindowTests(unittest.TestCase):
         self.database.set_collection(item_id, collection_id)
         self.window._refresh_navigation_metadata()
         self.window.navigate("collection", collection_id)
-        self.assertTrue(wait_for(lambda: self.window._item_search_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
         self.window.select_item(item_id)
         self.window.toggle_detail()
         delete_button = self.window.sidebar.collection_delete_buttons[collection_id]
@@ -2090,7 +2090,7 @@ class MainWindowTests(unittest.TestCase):
         tag_id = self.database.add_tag(item_id, "Delete tag")
         self.window._refresh_navigation_metadata()
         self.window.navigate("tag", tag_id)
-        self.assertTrue(wait_for(lambda: self.window._item_search_request is None))
+        self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
         self.window.select_item(item_id)
         self.window.toggle_detail()
         delete_button = self.window.sidebar.tag_delete_buttons[tag_id]
@@ -2211,7 +2211,7 @@ class MainWindowTests(unittest.TestCase):
             self.window.delete_item(image_id)
             self.wait_for_delete(image_id)
             self.assertTrue(
-                wait_for(lambda: self.window._library_refresh_request is None)
+                wait_for(lambda: self.window.library_controller.refresh_request is None)
             )
         self.assertIsNotNone(self.database.get_item(image_id))
         warning.assert_called_once()
@@ -2248,7 +2248,7 @@ class MainWindowTests(unittest.TestCase):
                 elapsed = time.monotonic() - started_at
                 self.assertLess(elapsed, 0.2)
                 self.assertTrue(started.wait(1))
-                self.assertIn(image_id, self.window._delete_requests)
+                self.assertIn(image_id, self.window.mutation_controller.delete_requests)
                 self.assertNotIn(image_id, {item["id"] for item in self.window.current_items})
                 release.set()
                 self.wait_for_delete(image_id)
@@ -2288,8 +2288,8 @@ class MainWindowTests(unittest.TestCase):
         image_id = self.database.add_image(image_path)
         ai_request = (object(), AsyncSignals())
         ocr_request = (object(), AsyncSignals())
-        self.window._ai_requests[image_id] = ai_request
-        self.window._ocr_requests[image_id] = ocr_request
+        self.window.image_task_controller.ai_requests[image_id] = ai_request
+        self.window.image_task_controller.ocr_requests[image_id] = ocr_request
 
         with patch("clipsave_app.main_window.is_under_local_store", return_value=True), patch(
             "clipsave_app.main_window.QMessageBox.question",
@@ -2306,8 +2306,8 @@ class MainWindowTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["missing"], 1)
         self.assertNotIn(image_id, {item["id"] for item in self.database.query_items()})
-        self.assertNotIn(image_id, self.window._ai_requests)
-        self.assertNotIn(image_id, self.window._ocr_requests)
+        self.assertNotIn(image_id, self.window.image_task_controller.ai_requests)
+        self.assertNotIn(image_id, self.window.image_task_controller.ocr_requests)
 
     def test_delete_hides_item_in_session_when_both_index_updates_fail(self):
         image_path = Path(self.temp.name) / "managed-double-failure.png"
@@ -2339,8 +2339,8 @@ class MainWindowTests(unittest.TestCase):
         item_id = self.window.current_items[0]["id"]
         ai_request = (object(), AsyncSignals())
         ocr_request = (object(), AsyncSignals())
-        self.window._ai_requests[item_id] = ai_request
-        self.window._ocr_requests[item_id] = ocr_request
+        self.window.image_task_controller.ai_requests[item_id] = ai_request
+        self.window.image_task_controller.ocr_requests[item_id] = ocr_request
         with patch.object(self.window, "_cancel_and_wait_for_async_tasks", return_value=False), patch.object(
             self.window.clipboard_service, "shutdown"
         ) as shutdown, patch("clipsave_app.main_window.QMessageBox.warning") as warning:
@@ -2350,13 +2350,13 @@ class MainWindowTests(unittest.TestCase):
         warning.assert_called_once()
         self.assertFalse(self.window._quit_in_progress)
         self.assertFalse(self.window.force_quit)
-        self.assertIs(self.window._ai_requests[item_id], ai_request)
-        self.assertIs(self.window._ocr_requests[item_id], ocr_request)
+        self.assertIs(self.window.image_task_controller.ai_requests[item_id], ai_request)
+        self.assertIs(self.window.image_task_controller.ocr_requests[item_id], ocr_request)
 
     def test_quit_late_failure_restores_completed_expanded_search_button(self):
         token = object()
         signals = AsyncSignals()
-        self.window._expanded_search_request = (token, signals)
+        self.window.image_task_controller.expanded_search_request = (token, signals)
         self.window.expanded_search_button.setEnabled(False)
         self.window.expanded_search_button.setText("扩展中…")
 
@@ -2367,7 +2367,7 @@ class MainWindowTests(unittest.TestCase):
         ), patch("clipsave_app.main_window.QMessageBox.warning"):
             self.assertFalse(self.window.quit_application())
 
-        self.assertIsNone(self.window._expanded_search_request)
+        self.assertIsNone(self.window.image_task_controller.expanded_search_request)
         self.assertTrue(self.window.expanded_search_button.isEnabled())
         self.assertEqual(self.window.expanded_search_button.text(), "扩大搜索")
 
@@ -2468,7 +2468,7 @@ class MainWindowTests(unittest.TestCase):
         with patch.object(self.window.clipboard_service, "suppress_image") as suppress:
             self.window.copy_item(image_id)
             deadline = time.monotonic() + 2
-            while self.window._copy_request is not None and time.monotonic() < deadline:
+            while self.window.mutation_controller.copy_request is not None and time.monotonic() < deadline:
                 self.app.processEvents()
                 time.sleep(0.01)
         suppress.assert_called_once()
@@ -2498,7 +2498,7 @@ class MainWindowTests(unittest.TestCase):
         ) as show_status, patch("clipsave_app.main_window.QMessageBox.warning") as warning:
             self.window.import_files()
             deadline = time.monotonic() + 2
-            while self.window._import_request is not None and time.monotonic() < deadline:
+            while self.window.mutation_controller.import_request is not None and time.monotonic() < deadline:
                 self.app.processEvents()
                 time.sleep(0.01)
 
@@ -2520,7 +2520,7 @@ class MainWindowTests(unittest.TestCase):
         ) as warning:
             self.window.import_files()
             deadline = time.monotonic() + 2
-            while self.window._import_request is not None and time.monotonic() < deadline:
+            while self.window.mutation_controller.import_request is not None and time.monotonic() < deadline:
                 self.app.processEvents()
                 time.sleep(0.01)
 
@@ -2547,7 +2547,7 @@ class MainWindowTests(unittest.TestCase):
         ), patch.object(self.window, "show_status") as show_status:
             self.window.import_files()
             deadline = time.monotonic() + 2
-            while self.window._import_request is not None and time.monotonic() < deadline:
+            while self.window.mutation_controller.import_request is not None and time.monotonic() < deadline:
                 self.app.processEvents()
                 time.sleep(0.01)
 
@@ -2585,7 +2585,7 @@ class MainWindowTests(unittest.TestCase):
         ) as schedule:
             self.window.import_files()
             self.assertTrue(
-                wait_for(lambda: self.window._import_request is None)
+                wait_for(lambda: self.window.mutation_controller.import_request is None)
             )
 
         import_file.assert_called_once_with(
@@ -2614,7 +2614,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertTrue(started.wait(0.5))
             release.set()
             self.assertTrue(
-                wait_for(lambda: self.window._library_refresh_request is None)
+                wait_for(lambda: self.window.library_controller.refresh_request is None)
             )
 
     def test_database_delete_failure_keeps_index_and_reports_error(self):
@@ -2658,7 +2658,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertTrue(self.window.save_notes(text_id, "replacement"))
         self.assertTrue(
-            wait_for(lambda: self.window._library_refresh_request is None)
+            wait_for(lambda: self.window.library_controller.refresh_request is None)
         )
         self.assertNotIn(text_id, {item["id"] for item in self.window.current_items})
 
@@ -2673,7 +2673,7 @@ class MainWindowTests(unittest.TestCase):
 
         token = object()
         signals = AsyncSignals()
-        self.window._ocr_requests[image_id] = (token, signals)
+        self.window.image_task_controller.ocr_requests[image_id] = (token, signals)
         expected_hash = self.database.get_item(image_id)["content_hash"]
         self.window._ocr_succeeded(
             token,
@@ -2683,7 +2683,7 @@ class MainWindowTests(unittest.TestCase):
             expected_hash,
         )
         self.assertTrue(
-            wait_for(lambda: self.window._library_refresh_request is None)
+            wait_for(lambda: self.window.library_controller.refresh_request is None)
         )
         self.assertNotIn(image_id, {item["id"] for item in self.window.current_items})
 
@@ -2692,8 +2692,8 @@ class MainWindowTests(unittest.TestCase):
         expected_hash = self.database.get_item(item_id)["content_hash"]
         ai_request = (object(), AsyncSignals())
         ocr_request = (object(), AsyncSignals())
-        self.window._ai_requests[item_id] = ai_request
-        self.window._ocr_requests[item_id] = ocr_request
+        self.window.image_task_controller.ai_requests[item_id] = ai_request
+        self.window.image_task_controller.ocr_requests[item_id] = ocr_request
 
         with patch(
             "clipsave_app.main_window.QMessageBox.question",
@@ -2701,8 +2701,8 @@ class MainWindowTests(unittest.TestCase):
         ):
             self.window.delete_item(item_id)
 
-        self.assertNotIn(item_id, self.window._ai_requests)
-        self.assertNotIn(item_id, self.window._ocr_requests)
+        self.assertNotIn(item_id, self.window.image_task_controller.ai_requests)
+        self.assertNotIn(item_id, self.window.image_task_controller.ocr_requests)
         with patch.object(
             self.database, "update_ocr_if_current"
         ) as update_ocr, patch.object(
@@ -2757,11 +2757,11 @@ class MainWindowTests(unittest.TestCase):
     def test_startup_scan_failure_is_preserved_for_smoke_readiness(self):
         token = object()
         signals = AsyncSignals()
-        self.window._startup_scan_request = (token, signals)
+        self.window.maintenance_controller.startup_request = (token, signals)
 
         self.window._startup_scan_failed(token, signals, "scan failed")
 
-        self.assertIsNone(self.window._startup_scan_request)
+        self.assertIsNone(self.window.maintenance_controller.startup_request)
         self.assertEqual(self.window.startup_scan_error, "scan failed")
 
     def test_session_shutdown_note_write_respects_deadline(self):
@@ -2882,7 +2882,7 @@ class MainWindowTests(unittest.TestCase):
         self.window.detail.notes.setPlainText("replacement")
         token = object()
         signals = AsyncSignals()
-        self.window._ai_requests[item_id] = (token, signals)
+        self.window.image_task_controller.ai_requests[item_id] = (token, signals)
 
         self.window._ai_succeeded(
             token,
@@ -2909,7 +2909,7 @@ class MainWindowTests(unittest.TestCase):
         self.window.detail.notes.setPlainText("new note")
         token = object()
         signals = AsyncSignals()
-        self.window._ai_requests[item_id] = (token, signals)
+        self.window.image_task_controller.ai_requests[item_id] = (token, signals)
 
         self.window._ai_succeeded(
             token,
@@ -2927,8 +2927,8 @@ class MainWindowTests(unittest.TestCase):
         item_id = self.window.current_items[0]["id"]
         ai_request = (object(), AsyncSignals())
         ocr_request = (object(), AsyncSignals())
-        self.window._ai_requests[item_id] = ai_request
-        self.window._ocr_requests[item_id] = ocr_request
+        self.window.image_task_controller.ai_requests[item_id] = ai_request
+        self.window.image_task_controller.ocr_requests[item_id] = ocr_request
         self.window._quit_in_progress = True
 
         with patch("clipsave_app.main_window.QMessageBox.warning") as warning:
@@ -2939,12 +2939,12 @@ class MainWindowTests(unittest.TestCase):
 
     def test_failed_session_shutdown_keeps_live_import_request_tracked(self):
         request = (object(), AsyncSignals())
-        self.window._import_request = request
+        self.window.mutation_controller.import_request = request
         ocr_request = (object(), AsyncSignals())
         current_id = self.window.current_items[0]["id"]
         self.window.select_item(current_id)
         self.window.toggle_detail()
-        self.window._ocr_requests[current_id] = ocr_request
+        self.window.image_task_controller.ocr_requests[current_id] = ocr_request
 
         def wait_request(candidate, _timeout, **_kwargs):
             return candidate is not request
@@ -2954,24 +2954,24 @@ class MainWindowTests(unittest.TestCase):
         ), patch.object(self.window.detail, "set_ocr_busy") as set_ocr_busy:
             self.assertFalse(self.window.quit_application_for_session_end(0.2))
 
-        self.assertIs(self.window._import_request, request)
-        self.assertIs(self.window._ocr_requests[current_id], ocr_request)
+        self.assertIs(self.window.mutation_controller.import_request, request)
+        self.assertIs(self.window.image_task_controller.ocr_requests[current_id], ocr_request)
         set_ocr_busy.assert_called_once_with(True)
 
     def test_async_task_timeout_keeps_ai_ocr_requests_tracked(self):
         item_id = self.window.current_items[0]["id"]
         ai_request = (object(), AsyncSignals())
         ocr_request = (object(), AsyncSignals())
-        self.window._ai_requests[item_id] = ai_request
-        self.window._ocr_requests[item_id] = ocr_request
+        self.window.image_task_controller.ai_requests[item_id] = ai_request
+        self.window.image_task_controller.ocr_requests[item_id] = ocr_request
 
         with patch.object(
             self.window, "_cancel_and_wait_for_async_tasks", return_value=False
         ):
             self.assertFalse(self.window.quit_application_for_session_end(0.2))
 
-        self.assertIs(self.window._ai_requests[item_id], ai_request)
-        self.assertIs(self.window._ocr_requests[item_id], ocr_request)
+        self.assertIs(self.window.image_task_controller.ai_requests[item_id], ai_request)
+        self.assertIs(self.window.image_task_controller.ocr_requests[item_id], ocr_request)
 
     def test_cancelled_bounded_request_is_cleaned_when_worker_finishes_late(self):
         item_id = self.window.current_items[0]["id"]
@@ -2979,34 +2979,34 @@ class MainWindowTests(unittest.TestCase):
         signals = AsyncSignals()
         handle = Mock()
         handle.done_event = threading.Event()
-        self.window._ocr_requests[item_id] = (token, signals)
+        self.window.image_task_controller.ocr_requests[item_id] = (token, signals)
         with self.window._async_tasks_lock:
             self.window._bounded_tasks[token] = handle
 
         self.window._schedule_cancelled_request_cleanup({token})
         self.app.processEvents()
-        self.assertIn(item_id, self.window._ocr_requests)
+        self.assertIn(item_id, self.window.image_task_controller.ocr_requests)
         handle.done_event.set()
         deadline = time.monotonic() + 1
-        while item_id in self.window._ocr_requests and time.monotonic() < deadline:
+        while item_id in self.window.image_task_controller.ocr_requests and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.02)
 
-        self.assertNotIn(item_id, self.window._ocr_requests)
+        self.assertNotIn(item_id, self.window.image_task_controller.ocr_requests)
         with self.window._async_tasks_lock:
             self.assertNotIn(token, self.window._bounded_tasks)
 
     def test_session_abort_restores_expanded_search_button_after_completed_cancel(self):
         token = object()
         signals = AsyncSignals()
-        self.window._expanded_search_request = (token, signals)
+        self.window.image_task_controller.expanded_search_request = (token, signals)
         self.window.expanded_search_button.setEnabled(False)
         self.window.expanded_search_button.setText("扩展中…")
 
         with patch.object(self.window.clipboard_service, "shutdown", return_value=False):
             self.assertFalse(self.window.quit_application_for_session_end(0.2))
 
-        self.assertIsNone(self.window._expanded_search_request)
+        self.assertIsNone(self.window.image_task_controller.expanded_search_request)
         self.assertTrue(self.window.expanded_search_button.isEnabled())
         self.assertEqual(self.window.expanded_search_button.text(), "扩大搜索")
 
@@ -3077,20 +3077,20 @@ class MainWindowTests(unittest.TestCase):
         self.window.select_item(item_id)
         self.window.toggle_detail()
         request = (object(), AsyncSignals())
-        self.window._ocr_requests[item_id] = request
+        self.window.image_task_controller.ocr_requests[item_id] = request
         self.window.detail.set_ocr_busy(True)
 
         with patch.object(self.window.clipboard_service, "shutdown", return_value=False):
             self.assertFalse(self.window.quit_application_for_session_end(0.2))
 
-        self.assertNotIn(item_id, self.window._ocr_requests)
+        self.assertNotIn(item_id, self.window.image_task_controller.ocr_requests)
         self.assertTrue(self.window.detail.ocr_button.isEnabled())
         self.assertNotIn("识别中", self.window.detail.ocr_button.text())
 
     def test_cancelled_import_reports_unprocessed_files_not_duplicates(self):
         token = object()
         signals = AsyncSignals()
-        self.window._import_request = (token, signals)
+        self.window.mutation_controller.import_request = (token, signals)
         with patch.object(self.window, "show_status") as show_status:
             self.window._import_finished(
                 token,
@@ -3113,7 +3113,7 @@ class MainWindowTests(unittest.TestCase):
     def test_import_callbacks_do_not_show_modals_during_session_shutdown(self):
         token = object()
         signals = AsyncSignals()
-        self.window._import_request = (token, signals)
+        self.window.mutation_controller.import_request = (token, signals)
         self.window._quit_in_progress = True
         with patch("clipsave_app.main_window.QMessageBox.warning") as warning:
             self.window._import_failed(token, signals, "late failure")

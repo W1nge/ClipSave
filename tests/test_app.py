@@ -99,21 +99,21 @@ class AppTests(unittest.TestCase):
 
     def test_smoke_background_idle_waits_for_startup_refresh_queries(self):
         window = MagicMock()
-        window._startup_scan_request = None
-        window._library_refresh_request = None
-        window._item_search_request = None
-        window._item_page_request = None
+        window.maintenance_controller.startup_request = None
+        window.library_controller.refresh_request = None
+        window.library_controller.search_request = None
+        window.library_controller.page_request = None
         self.assertTrue(app._smoke_background_idle(window))
 
-        for attribute in (
-            "_startup_scan_request",
-            "_library_refresh_request",
-            "_item_search_request",
-            "_item_page_request",
+        for owner, attribute in (
+            (window.maintenance_controller, "startup_request"),
+            (window.library_controller, "refresh_request"),
+            (window.library_controller, "search_request"),
+            (window.library_controller, "page_request"),
         ):
-            setattr(window, attribute, object())
+            setattr(owner, attribute, object())
             self.assertFalse(app._smoke_background_idle(window), attribute)
-            setattr(window, attribute, None)
+            setattr(owner, attribute, None)
 
     def test_smoke_mode_has_bounded_ready_and_quit_attempts(self):
         source = Path(app.__file__).read_text(encoding="utf-8")

@@ -140,98 +140,6 @@ class MainWindow(QMainWindow):
     ITEM_PAGE_SIZE = 500
 
     @property
-    def _library_refresh_request(self):
-        return self.library_controller.refresh_request
-
-    @property
-    def _item_search_request(self):
-        return self.library_controller.search_request
-
-    @property
-    def _item_page_request(self):
-        return self.library_controller.page_request
-
-    @property
-    def _startup_scan_request(self):
-        return self.maintenance_controller.startup_request
-
-    @_startup_scan_request.setter
-    def _startup_scan_request(self, value) -> None:
-        self.maintenance_controller.startup_request = value
-
-    @property
-    def _backup_request(self):
-        return self.maintenance_controller.backup_request
-
-    @_backup_request.setter
-    def _backup_request(self, value) -> None:
-        self.maintenance_controller.backup_request = value
-
-    @property
-    def _ai_requests(self):
-        return self.image_task_controller.ai_requests
-
-    @property
-    def _ocr_requests(self):
-        return self.image_task_controller.ocr_requests
-
-    @property
-    def _automatic_ai_items(self):
-        return self.image_task_controller.automatic_ai_items
-
-    @property
-    def _automatic_ocr_items(self):
-        return self.image_task_controller.automatic_ocr_items
-
-    @property
-    def _expanded_search_request(self):
-        return self.image_task_controller.expanded_search_request
-
-    @_expanded_search_request.setter
-    def _expanded_search_request(self, value) -> None:
-        self.image_task_controller.expanded_search_request = value
-
-    @property
-    def _import_request(self):
-        return self.mutation_controller.import_request
-
-    @_import_request.setter
-    def _import_request(self, value) -> None:
-        self.mutation_controller.import_request = value
-
-    @property
-    def _copy_request(self):
-        return self.mutation_controller.copy_request
-
-    @_copy_request.setter
-    def _copy_request(self, value) -> None:
-        self.mutation_controller.copy_request = value
-
-    @property
-    def _delete_requests(self):
-        return self.mutation_controller.delete_requests
-
-    @property
-    def _pending_delete_item_ids(self):
-        return self.mutation_controller.pending_delete_item_ids
-
-    @property
-    def _bulk_image_request(self):
-        return self.bulk_image_controller.request
-
-    @property
-    def _bulk_image_checkpoint_path(self):
-        return self.bulk_image_controller.checkpoint_path
-
-    @property
-    def _bulk_image_progress_state(self):
-        return self.bulk_image_controller.progress_state
-
-    @_bulk_image_progress_state.setter
-    def _bulk_image_progress_state(self, value) -> None:
-        self.bulk_image_controller.progress_state = value
-
-    @property
     def _native_backdrop_hwnd(self):
         return self.window_effects_controller.native_backdrop_hwnd
 
@@ -1390,8 +1298,8 @@ class MainWindow(QMainWindow):
     def load_more_items(self) -> None:
         if (
             self._items_loading
-            or self._item_search_request is not None
-            or self._item_page_request is not None
+            or self.library_controller.search_request is not None
+            or self.library_controller.page_request is not None
             or not self._items_has_more
             or self._closing
             or self._quit_in_progress
@@ -1450,7 +1358,7 @@ class MainWindow(QMainWindow):
             item
             for item in items
             if item["id"] not in self._session_hidden_item_ids
-            and item["id"] not in self._pending_delete_item_ids
+            and item["id"] not in self.mutation_controller.pending_delete_item_ids
         ]
         visible_ids = {item["id"] for item in self.current_items}
         if self.current_item_id is not None and self.current_item_id not in visible_ids:
@@ -1538,9 +1446,9 @@ class MainWindow(QMainWindow):
                     if refreshed_item is not None:
                         self.detail.set_item(refreshed_item)
                 return
-            if item_id in self._ai_requests:
+            if item_id in self.image_task_controller.ai_requests:
                 self.detail.set_ai_busy(True)
-            if item_id in self._ocr_requests:
+            if item_id in self.image_task_controller.ocr_requests:
                 self.detail.set_ocr_busy(True)
 
     def toggle_detail(self) -> None:
@@ -1719,9 +1627,9 @@ class MainWindow(QMainWindow):
         item = self.database.get_item(item_id)
         if not item:
             return
-        if self._copy_request is not None:
-            self._cancel_async_token(self._copy_request[0])
-            self._copy_request = None
+        if self.mutation_controller.copy_request is not None:
+            self._cancel_async_token(self.mutation_controller.copy_request[0])
+            self.mutation_controller.copy_request = None
         clipboard = QApplication.clipboard()
         if item["kind"] == "image" and item["path"]:
             path = Path(item["path"])
@@ -1770,7 +1678,7 @@ class MainWindow(QMainWindow):
     def delete_item(self, item_id: int) -> None:
         if self._closing or self._quit_in_progress:
             return
-        if item_id in self._delete_requests:
+        if item_id in self.mutation_controller.delete_requests:
             self.show_status("该内容正在删除")
             return
         item = self.database.get_item(item_id)
@@ -1816,7 +1724,7 @@ class MainWindow(QMainWindow):
             self.detail.clear_item()
         self._apply_items(self.current_items)
         self.show_status("正在删除内容…")
-        if item_id not in self._delete_requests:
+        if item_id not in self.mutation_controller.delete_requests:
             self._delete_failed(request[0], request[1], item_id, "删除任务无法启动")
 
     def _restore_delete_view(self, item_id: int, was_selected: bool, detail_was_visible: bool) -> None:
@@ -2046,7 +1954,7 @@ class MainWindow(QMainWindow):
     def import_files(self, parent=None) -> None:
         if self._closing or self._quit_in_progress:
             return
-        if self._import_request is not None:
+        if self.mutation_controller.import_request is not None:
             QMessageBox.information(self, "正在导入", "上一批文件仍在导入，请稍候。")
             return
         paths, _ = QFileDialog.getOpenFileNames(parent or self, "导入内容", "", "支持的文件 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.md)")
@@ -2157,7 +2065,7 @@ class MainWindow(QMainWindow):
         return self.bulk_image_controller.load_checkpoint()
 
     def _confirm_bulk_image_processing(self, dialog: SettingsDialog) -> None:
-        if self._bulk_image_request is not None:
+        if self.bulk_image_controller.request is not None:
             QMessageBox.information(self, "批量处理进行中", "当前已有批量图片处理任务正在运行。")
             return
         base_url = dialog.base_url.text().strip()
@@ -2210,7 +2118,7 @@ class MainWindow(QMainWindow):
     def start_bulk_image_processing(self) -> None:
         if self._closing or self._quit_in_progress:
             return
-        if self._bulk_image_request is not None:
+        if self.bulk_image_controller.request is not None:
             QMessageBox.information(self, "批量处理进行中", "当前已有批量图片处理任务正在运行。")
             return
         service = self._ai_service()
@@ -2326,13 +2234,13 @@ class MainWindow(QMainWindow):
         if (
             self.settings.get("auto_ocr", False)
             and not str(item["ocr_text"] or "").strip()
-            and item_id not in self._ocr_requests
+            and item_id not in self.image_task_controller.ocr_requests
         ):
             self.generate_ocr(item_id, automatic=True)
         if (
             self.settings.get("auto_description", False)
             and not str(item["ai_description"] or "").strip()
-            and item_id not in self._ai_requests
+            and item_id not in self.image_task_controller.ai_requests
         ):
             self.generate_ai_description(item_id, automatic=True)
 
@@ -2341,7 +2249,11 @@ class MainWindow(QMainWindow):
         self.maintenance_controller.start_scan(full_scan, reconcile_images)
 
     def _start_periodic_backup(self) -> None:
-        if self._closing or self._quit_in_progress or self._backup_request is not None:
+        if (
+            self._closing
+            or self._quit_in_progress
+            or self.maintenance_controller.backup_request is not None
+        ):
             return
         if not self.database.backup_state()["dirty"]:
             return
@@ -2497,7 +2409,11 @@ class MainWindow(QMainWindow):
         operation: str,
     ) -> bool:
         is_ai = operation == "ai"
-        requests = self._ai_requests if is_ai else self._ocr_requests
+        requests = (
+            self.image_task_controller.ai_requests
+            if is_ai
+            else self.image_task_controller.ocr_requests
+        )
         invalid_title = "AI 描述" if is_ai else "OCR"
         invalid_message = (
             "当前只支持为图片生成 AI 描述。"
@@ -2655,7 +2571,7 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "扩大搜索失败", message)
 
     def _cancel_expanded_search_request(self) -> None:
-        if self._expanded_search_request is None:
+        if self.image_task_controller.expanded_search_request is None:
             return
         self.image_task_controller.cancel_expanded_search()
         if hasattr(self, "expanded_search_button"):
@@ -2886,9 +2802,13 @@ class MainWindow(QMainWindow):
             self.force_quit = False
             self._set_interactions_enabled(True)
             current_id = self.current_item_id
-            self.detail.set_ai_busy(bool(current_id and current_id in self._ai_requests))
-            self.detail.set_ocr_busy(bool(current_id and current_id in self._ocr_requests))
-            if self._expanded_search_request is None:
+            self.detail.set_ai_busy(
+                bool(current_id and current_id in self.image_task_controller.ai_requests)
+            )
+            self.detail.set_ocr_busy(
+                bool(current_id and current_id in self.image_task_controller.ocr_requests)
+            )
+            if self.image_task_controller.expanded_search_request is None:
                 self.expanded_search_button.setEnabled(True)
                 self.expanded_search_button.setText("扩大搜索")
             self._schedule_cancelled_request_cleanup(cancelled_request_tokens)
@@ -2913,14 +2833,18 @@ class MainWindow(QMainWindow):
         ):
             return abort(monitoring_was_active)
 
-        for attribute in ("_startup_scan_request", "_import_request", "_backup_request"):
-            request = getattr(self, attribute)
+        for owner, attribute in (
+            (self.maintenance_controller, "startup_request"),
+            (self.mutation_controller, "import_request"),
+            (self.maintenance_controller, "backup_request"),
+        ):
+            request = getattr(owner, attribute)
             self._cancel_request(request)
             if not self._cancel_and_wait_request(
                 request, remaining(), process_events=False
             ):
                 return abort(monitoring_was_active)
-            setattr(self, attribute, None)
+            setattr(owner, attribute, None)
         self.backup_timer.stop()
         cancelled_request_tokens.update(self._cancel_background_requests())
         if not self._cancel_and_wait_for_async_tasks(
@@ -2981,7 +2905,10 @@ class MainWindow(QMainWindow):
                 "仍有备注尚未保存，ClipSave 已取消退出。",
             )
             return False
-        if not self._cancel_and_wait_request(self._startup_scan_request, 10.0):
+        if not self._cancel_and_wait_request(
+            self.maintenance_controller.startup_request,
+            10.0,
+        ):
             self._quit_in_progress = False
             self.force_quit = False
             self._set_interactions_enabled(True)
@@ -2991,9 +2918,12 @@ class MainWindow(QMainWindow):
                 "本地文件扫描仍在结束。为避免数据库操作中断，ClipSave 暂时不会退出。请稍后再次退出。",
             )
             return False
-        self._cancel_request(self._startup_scan_request)
-        self._startup_scan_request = None
-        if not self._cancel_and_wait_request(self._import_request, 10.0):
+        self._cancel_request(self.maintenance_controller.startup_request)
+        self.maintenance_controller.startup_request = None
+        if not self._cancel_and_wait_request(
+            self.mutation_controller.import_request,
+            10.0,
+        ):
             self._quit_in_progress = False
             self.force_quit = False
             self._set_interactions_enabled(True)
@@ -3003,10 +2933,13 @@ class MainWindow(QMainWindow):
                 "当前文件仍在完成本地复制或校验。为避免产生不完整文件，ClipSave 暂时不会退出。请稍后再次退出。",
             )
             return False
-        self._cancel_request(self._import_request)
-        self._import_request = None
+        self._cancel_request(self.mutation_controller.import_request)
+        self.mutation_controller.import_request = None
         self.backup_timer.stop()
-        if not self._cancel_and_wait_request(self._backup_request, 10.0):
+        if not self._cancel_and_wait_request(
+            self.maintenance_controller.backup_request,
+            10.0,
+        ):
             self._quit_in_progress = False
             self.force_quit = False
             self._set_interactions_enabled(True)
@@ -3017,8 +2950,8 @@ class MainWindow(QMainWindow):
                 "数据库备份仍在完成。为避免备份损坏，ClipSave 暂时不会退出。请稍后再次退出。",
             )
             return False
-        self._cancel_request(self._backup_request)
-        self._backup_request = None
+        self._cancel_request(self.maintenance_controller.backup_request)
+        self.maintenance_controller.backup_request = None
         cancelled_request_tokens = self._cancel_background_requests()
         if not self._cancel_and_wait_for_async_tasks(6.0):
             self._quit_in_progress = False

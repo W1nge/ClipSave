@@ -216,14 +216,11 @@ def _smoke_backdrop_status(window) -> str:
 
 
 def _smoke_background_idle(window) -> bool:
-    return all(
-        getattr(window, attribute, None) is None
-        for attribute in (
-            "_startup_scan_request",
-            "_library_refresh_request",
-            "_item_search_request",
-            "_item_page_request",
-        )
+    return (
+        window.maintenance_controller.startup_request is None
+        and window.library_controller.refresh_request is None
+        and window.library_controller.search_request is None
+        and window.library_controller.page_request is None
     )
 
 
