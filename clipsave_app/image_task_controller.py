@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from .ai_service import AIService
+from .database import LibraryDatabase
 from .file_preflight import OperationCancelled, preflight_image_file
 from .task_executor import TaskCapacityExceeded, ai_ocr_task_executor
 from .task_supervisor import TaskSupervisor
@@ -19,6 +20,15 @@ class ImageTaskCleanup:
     ai_item_ids: tuple[int, ...] = ()
     ocr_item_ids: tuple[int, ...] = ()
     expanded_search_finished: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ImageOperationCompletion:
+    matched: bool
+    automatic: bool = False
+    saved: bool = False
+    stale_content: bool = False
+    error: str | None = None
 
 
 class ImageTaskController(QObject):
@@ -34,10 +44,12 @@ class ImageTaskController(QObject):
         supervisor: TaskSupervisor,
         parent: QObject | None = None,
         *,
+        database: LibraryDatabase | None = None,
         start_bounded: Callable[..., object] | None = None,
     ) -> None:
         super().__init__(parent)
         self.supervisor = supervisor
+        self.database = database
         self._start_bounded = start_bounded
         self.ai_requests: dict[int, tuple[object, QObject]] = {}
         self.ocr_requests: dict[int, tuple[object, QObject]] = {}
@@ -169,6 +181,68 @@ class ImageTaskController(QObject):
         automatic = item_id in automatic_items
         automatic_items.discard(item_id)
         return True, automatic
+
+    def commit_operation(
+        self,
+        item_id: int,
+        operation: str,
+        token: object,
+        marker: QObject,
+        expected_content_hash: str,
+        result_text: str,
+    ) -> ImageOperationCompletion:
+        if not self.is_current_operation(item_id, operation, token, marker):
+            self.supervisor.finish_bounded(token)
+            return ImageOperationCompletion(matched=False)
+        if self.database is None:
+            matched, automatic = self.finish_operation(
+                item_id,
+                operation,
+                token,
+                marker,
+            )
+            return ImageOperationCompletion(
+                matched=matched,
+                automatic=automatic,
+                error="Image task database is unavailable",
+            )
+
+        update_result = (
+            self.database.update_ai_if_current
+            if operation == "ai"
+            else self.database.update_ocr_if_current
+        )
+        try:
+            saved = update_result(
+                item_id,
+                expected_content_hash,
+                result_text,
+            )
+        except Exception as exc:
+            matched, automatic = self.finish_operation(
+                item_id,
+                operation,
+                token,
+                marker,
+            )
+            return ImageOperationCompletion(
+                matched=matched,
+                automatic=automatic,
+                error=str(exc),
+            )
+
+        matched, automatic = self.finish_operation(
+            item_id,
+            operation,
+            token,
+            marker,
+        )
+        return ImageOperationCompletion(
+            matched=matched,
+            automatic=automatic,
+            saved=bool(saved),
+            stale_content=not bool(saved),
+        )
 
     def finish_expanded_search(self, token: object, marker: QObject) -> bool:
         self.supervisor.finish_bounded(token)

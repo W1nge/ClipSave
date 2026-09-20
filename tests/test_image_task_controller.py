@@ -29,6 +29,25 @@ class FakeService:
         return [query, f"{query} expanded"]
 
 
+class FakeDatabase:
+    def __init__(self, *, saved=True, error=None):
+        self.saved = saved
+        self.error = error
+        self.calls = []
+
+    def update_ai_if_current(self, item_id, expected_hash, text):
+        self.calls.append(("ai", item_id, expected_hash, text))
+        if self.error is not None:
+            raise self.error
+        return self.saved
+
+    def update_ocr_if_current(self, item_id, expected_hash, text):
+        self.calls.append(("ocr", item_id, expected_hash, text))
+        if self.error is not None:
+            raise self.error
+        return self.saved
+
+
 class ImmediateHandle:
     def __init__(self, target):
         self.cancel_event = threading.Event()
@@ -206,3 +225,70 @@ class ImageTaskControllerTests(unittest.TestCase):
         self.assertIsNotNone(controller.expanded_search_request)
         self.assertTrue(controller.finish_expanded_search(token, marker))
         self.assertIsNone(controller.expanded_search_request)
+
+    def test_commit_operation_owns_cas_persistence_and_request_finish(self):
+        database = FakeDatabase(saved=True)
+        controller = ImageTaskController(TaskSupervisor(), database=database)
+        token = object()
+        marker = QObject(controller)
+        controller.ai_requests[8] = (token, marker)
+        controller.automatic_ai_items.add(8)
+
+        result = controller.commit_operation(
+            8,
+            "ai",
+            token,
+            marker,
+            "a" * 64,
+            "description",
+        )
+
+        self.assertTrue(result.matched)
+        self.assertTrue(result.automatic)
+        self.assertTrue(result.saved)
+        self.assertFalse(result.stale_content)
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            database.calls,
+            [("ai", 8, "a" * 64, "description")],
+        )
+        self.assertNotIn(8, controller.ai_requests)
+
+    def test_commit_operation_reports_stale_content_and_database_errors(self):
+        stale_database = FakeDatabase(saved=False)
+        stale = ImageTaskController(TaskSupervisor(), database=stale_database)
+        stale_token = object()
+        stale_marker = QObject(stale)
+        stale.ocr_requests[3] = (stale_token, stale_marker)
+
+        stale_result = stale.commit_operation(
+            3,
+            "ocr",
+            stale_token,
+            stale_marker,
+            "b" * 64,
+            "text",
+        )
+
+        self.assertTrue(stale_result.matched)
+        self.assertFalse(stale_result.saved)
+        self.assertTrue(stale_result.stale_content)
+
+        failed_database = FakeDatabase(error=OSError("db failed"))
+        failed = ImageTaskController(TaskSupervisor(), database=failed_database)
+        failed_token = object()
+        failed_marker = QObject(failed)
+        failed.ai_requests[4] = (failed_token, failed_marker)
+
+        failed_result = failed.commit_operation(
+            4,
+            "ai",
+            failed_token,
+            failed_marker,
+            "c" * 64,
+            "description",
+        )
+
+        self.assertTrue(failed_result.matched)
+        self.assertEqual(failed_result.error, "db failed")
+        self.assertNotIn(4, failed.ai_requests)

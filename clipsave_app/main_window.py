@@ -531,6 +531,7 @@ class MainWindow(QMainWindow):
         self.image_task_controller = ImageTaskController(
             self._task_supervisor,
             parent=self,
+            database=database,
             start_bounded=lambda token, target, **kwargs: self._start_bounded_task(
                 token,
                 target,
@@ -2577,68 +2578,23 @@ class MainWindow(QMainWindow):
         text: str,
         expected_content_hash: str,
     ) -> None:
-        if not self.image_task_controller.is_current_operation(
-            item_id,
+        self._image_operation_succeeded(
             "ocr",
             token,
             signals,
-        ):
-            self._finish_async_token(token)
-            return
-        if self._closing or self._quit_in_progress:
-            self.image_task_controller.finish_operation(
-                item_id,
-                "ocr",
-                token,
-                signals,
-            )
-            return
-        try:
-            saved = self.database.update_ocr_if_current(
-                item_id, expected_content_hash, text
-            )
-        except Exception as exc:
-            self._ocr_failed(token, signals, item_id, f"OCR 结果无法保存：{exc}")
-            return
-        if not saved:
-            self.image_task_controller.finish_operation(
-                item_id,
-                "ocr",
-                token,
-                signals,
-            )
-            if self.current_item_id == item_id:
-                self.detail.set_ocr_busy(False)
-            self.show_status("图片已变化，已丢弃过期的 OCR 结果")
-            return
-        self.image_task_controller.finish_operation(
             item_id,
-            "ocr",
-            token,
-            signals,
+            text,
+            expected_content_hash,
         )
-        self._refresh_after_mutation()
-        if self.current_item_id == item_id:
-            self.update_detail(item_id)
-        self.show_status("OCR 识别完成" if text else "图片中未识别到文字")
 
     def _ocr_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
-        matched, automatic = self.image_task_controller.finish_operation(
-            item_id,
+        self._image_operation_failed(
             "ocr",
             token,
             signals,
+            item_id,
+            message,
         )
-        if not matched:
-            return
-        if self._closing or self._quit_in_progress:
-            return
-        if self.current_item_id == item_id:
-            self.detail.set_ocr_busy(False, failed=True)
-        if automatic:
-            self.show_error_status(f"自动 OCR 失败：{message}")
-        else:
-            QMessageBox.warning(self, "OCR 识别失败", message)
 
     def expand_search(self) -> None:
         query = self.search.text().strip()
@@ -2714,57 +2670,90 @@ class MainWindow(QMainWindow):
         description: str,
         expected_content_hash: str,
     ) -> None:
-        if not self.image_task_controller.is_current_operation(
-            item_id,
+        self._image_operation_succeeded(
             "ai",
             token,
             signals,
-        ):
-            self._finish_async_token(token)
-            return
+            item_id,
+            description,
+            expected_content_hash,
+        )
+
+    def _image_operation_succeeded(
+        self,
+        operation: str,
+        token: object,
+        signals: AsyncSignals,
+        item_id: int,
+        result_text: str,
+        expected_content_hash: str,
+    ) -> None:
         if self._closing or self._quit_in_progress:
             self.image_task_controller.finish_operation(
                 item_id,
-                "ai",
+                operation,
                 token,
                 signals,
             )
             return
-        try:
-            saved = self.database.update_ai_if_current(
-                item_id,
-                expected_content_hash,
-                description,
-            )
-        except Exception as exc:
-            self._ai_failed(token, signals, item_id, f"AI 结果无法保存：{exc}")
-            return
-        if not saved:
-            self.image_task_controller.finish_operation(
-                item_id,
-                "ai",
-                token,
-                signals,
-            )
-            if self.current_item_id == item_id:
-                self.detail.set_ai_busy(False)
-            self.show_status("图片已变化，已丢弃过期的 AI 结果")
-            return
-        self.image_task_controller.finish_operation(
+
+        is_ai = operation == "ai"
+        completion = self.image_task_controller.commit_operation(
             item_id,
-            "ai",
+            operation,
             token,
             signals,
+            expected_content_hash,
+            result_text,
         )
+        if not completion.matched:
+            return
+        if completion.error is not None:
+            prefix = "AI" if is_ai else "OCR"
+            self._show_image_operation_failure(
+                operation,
+                item_id,
+                f"{prefix} 结果无法保存：{completion.error}",
+                completion.automatic,
+            )
+            return
+        if completion.stale_content:
+            if self.current_item_id == item_id:
+                if is_ai:
+                    self.detail.set_ai_busy(False)
+                else:
+                    self.detail.set_ocr_busy(False)
+            result_name = "AI" if is_ai else "OCR"
+            self.show_status(f"图片已变化，已丢弃过期的 {result_name} 结果")
+            return
         self._refresh_after_mutation()
         if self.current_item_id == item_id:
             self.update_detail(item_id)
-        self.show_status("AI 描述已生成")
+        if is_ai:
+            self.show_status("AI 描述已生成")
+        else:
+            self.show_status("OCR 识别完成" if result_text else "图片中未识别到文字")
 
     def _ai_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
+        self._image_operation_failed(
+            "ai",
+            token,
+            signals,
+            item_id,
+            message,
+        )
+
+    def _image_operation_failed(
+        self,
+        operation: str,
+        token: object,
+        signals: AsyncSignals,
+        item_id: int,
+        message: str,
+    ) -> None:
         matched, automatic = self.image_task_controller.finish_operation(
             item_id,
-            "ai",
+            operation,
             token,
             signals,
         )
@@ -2772,12 +2761,32 @@ class MainWindow(QMainWindow):
             return
         if self._closing or self._quit_in_progress:
             return
+        self._show_image_operation_failure(
+            operation,
+            item_id,
+            message,
+            automatic,
+        )
+
+    def _show_image_operation_failure(
+        self,
+        operation: str,
+        item_id: int,
+        message: str,
+        automatic: bool,
+    ) -> None:
+        is_ai = operation == "ai"
         if self.current_item_id == item_id:
-            self.detail.set_ai_busy(False, failed=True)
+            if is_ai:
+                self.detail.set_ai_busy(False, failed=True)
+            else:
+                self.detail.set_ocr_busy(False, failed=True)
         if automatic:
-            self.show_error_status(f"自动生成描述失败：{message}")
+            prefix = "自动生成描述失败" if is_ai else "自动 OCR 失败"
+            self.show_error_status(f"{prefix}：{message}")
         else:
-            QMessageBox.warning(self, "AI 服务失败", message)
+            title = "AI 服务失败" if is_ai else "OCR 识别失败"
+            QMessageBox.warning(self, title, message)
 
     def focus_search(self) -> None:
         self.bring_to_front()
