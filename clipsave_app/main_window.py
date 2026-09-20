@@ -31,57 +31,50 @@ from PySide6.QtWidgets import (
 )
 from send2trash import send2trash
 
-from .bulk_checkpoint import (
-    BulkImageCheckpoint,
-    checkpoint_path,
-    clear_checkpoint,
-    load_checkpoint,
-    new_checkpoint,
-    save_checkpoint,
-)
+from .bulk_checkpoint import checkpoint_path
+from .bulk_image_controller import BulkImageCompletion, BulkImageController
+from .app_paths import AppPaths
 from .constants import APP_NAME, LIBRARY_DIR
-from .database import ImportFileDetails, LibraryDatabase
+from .database import LibraryDatabase
+from .library_controller import LibraryController
+from .library_models import LibraryQuery, LibraryViewState
+from .maintenance_controller import LibraryMaintenanceController
+from .image_task_controller import ImageTaskController
+from .mutation_controller import LibraryMutationController
+from .shutdown_coordinator import ShutdownCoordinator, ShutdownFailure
 from .services import (
     AIService,
     BackdropResult,
     ClipboardService,
-    OperationCancelled,
     TaskCapacityExceeded,
     ai_ocr_task_executor,
     apply_windows_backdrop,
     preflight_image_file,
     register_windows_power_saving_notification,
     release_windows_backdrop,
-    shutdown_ai_ocr_task_executor,
     unregister_windows_power_saving_notification,
 )
 from .settings import Settings
 from .startup import set_start_with_windows
 from .storage import is_under_local_store, recycle_managed_file
 from .styles import stylesheet_for_theme
+from .task_supervisor import TaskSupervisor
+from .window_effects_controller import WindowEffectsController
 from .windows_frame import (
-    WINDOWPOS,
     WM_DPICHANGED,
     WM_GETMINMAXINFO,
     WM_NCACTIVATE,
     WM_NCCALCSIZE,
     WM_WINDOWPOSCHANGING,
     WM_WINDOWPOSCHANGED,
-    SWP_HIDEWINDOW,
-    SWP_NOMOVE,
-    SWP_NOSIZE,
-    create_backdrop_host_window,
-    destroy_backdrop_host_window,
     enable_native_resize_frame,
     handle_getminmaxinfo,
     handle_nccalcsize,
     handle_ncactivate,
-    hide_backdrop_host_window,
     is_windows_qt_platform,
     maximize_native_window,
     native_window_is_maximized,
     restore_native_window,
-    sync_backdrop_host_window,
     synchronize_maximized_work_area,
     window_dpi_scale,
     window_rect,
@@ -142,15 +135,238 @@ class AsyncSignals(QObject):
     failed = Signal(str)
 
 
-class BulkImageSignals(QObject):
-    progress = Signal(int, int, int, str)
-    finished = Signal(object)
-
-
 class MainWindow(QMainWindow):
     RESIZE_EDGE_WIDTH = 8
     RESIZE_CORNER_SIZE = 14
     ITEM_PAGE_SIZE = 500
+
+    @property
+    def _library_refresh_request(self):
+        return self.library_controller.refresh_request
+
+    @property
+    def _item_search_request(self):
+        return self.library_controller.search_request
+
+    @property
+    def _item_page_request(self):
+        return self.library_controller.page_request
+
+    @property
+    def _startup_scan_request(self):
+        return self.maintenance_controller.startup_request
+
+    @_startup_scan_request.setter
+    def _startup_scan_request(self, value) -> None:
+        self.maintenance_controller.startup_request = value
+
+    @property
+    def _backup_request(self):
+        return self.maintenance_controller.backup_request
+
+    @_backup_request.setter
+    def _backup_request(self, value) -> None:
+        self.maintenance_controller.backup_request = value
+
+    @property
+    def _ai_requests(self):
+        return self.image_task_controller.ai_requests
+
+    @property
+    def _ocr_requests(self):
+        return self.image_task_controller.ocr_requests
+
+    @property
+    def _automatic_ai_items(self):
+        return self.image_task_controller.automatic_ai_items
+
+    @property
+    def _automatic_ocr_items(self):
+        return self.image_task_controller.automatic_ocr_items
+
+    @property
+    def _expanded_search_request(self):
+        return self.image_task_controller.expanded_search_request
+
+    @_expanded_search_request.setter
+    def _expanded_search_request(self, value) -> None:
+        self.image_task_controller.expanded_search_request = value
+
+    @property
+    def _import_request(self):
+        return self.mutation_controller.import_request
+
+    @_import_request.setter
+    def _import_request(self, value) -> None:
+        self.mutation_controller.import_request = value
+
+    @property
+    def _copy_request(self):
+        return self.mutation_controller.copy_request
+
+    @_copy_request.setter
+    def _copy_request(self, value) -> None:
+        self.mutation_controller.copy_request = value
+
+    @property
+    def _delete_requests(self):
+        return self.mutation_controller.delete_requests
+
+    @property
+    def _pending_delete_item_ids(self):
+        return self.mutation_controller.pending_delete_item_ids
+
+    @property
+    def _bulk_image_request(self):
+        return self.bulk_image_controller.request
+
+    @property
+    def _bulk_image_checkpoint_path(self):
+        return self.bulk_image_controller.checkpoint_path
+
+    @property
+    def _bulk_image_progress_state(self):
+        return self.bulk_image_controller.progress_state
+
+    @_bulk_image_progress_state.setter
+    def _bulk_image_progress_state(self, value) -> None:
+        self.bulk_image_controller.progress_state = value
+
+    @property
+    def _native_backdrop_hwnd(self):
+        return self.window_effects_controller.native_backdrop_hwnd
+
+    @_native_backdrop_hwnd.setter
+    def _native_backdrop_hwnd(self, value) -> None:
+        self.window_effects_controller.native_backdrop_hwnd = value
+
+    @property
+    def _native_backdrop_result(self):
+        return self.window_effects_controller.native_backdrop_result
+
+    @_native_backdrop_result.setter
+    def _native_backdrop_result(self, value) -> None:
+        self.window_effects_controller.native_backdrop_result = value
+
+    @property
+    def _windows_backdrop_window_hwnd(self):
+        return self.window_effects_controller.backdrop_window_hwnd
+
+    @_windows_backdrop_window_hwnd.setter
+    def _windows_backdrop_window_hwnd(self, value) -> None:
+        self.window_effects_controller.backdrop_window_hwnd = value
+
+    @property
+    def _power_saving_notification_hwnd(self):
+        return self.window_effects_controller.power_notification_hwnd
+
+    @_power_saving_notification_hwnd.setter
+    def _power_saving_notification_hwnd(self, value) -> None:
+        self.window_effects_controller.power_notification_hwnd = value
+
+    @property
+    def _power_saving_notification_handle(self):
+        return self.window_effects_controller.power_notification_handle
+
+    @_power_saving_notification_handle.setter
+    def _power_saving_notification_handle(self, value) -> None:
+        self.window_effects_controller.power_notification_handle = value
+
+    @property
+    def current_items(self):
+        return self.library_state.items
+
+    @current_items.setter
+    def current_items(self, value) -> None:
+        self.library_state.items = value
+
+    @property
+    def _items_offset(self) -> int:
+        return self.library_state.offset
+
+    @_items_offset.setter
+    def _items_offset(self, value: int) -> None:
+        self.library_state.offset = value
+
+    @property
+    def _items_has_more(self) -> bool:
+        return self.library_state.has_more
+
+    @_items_has_more.setter
+    def _items_has_more(self, value: bool) -> None:
+        self.library_state.has_more = value
+
+    @property
+    def _items_loading(self) -> bool:
+        return self.library_state.loading
+
+    @_items_loading.setter
+    def _items_loading(self, value: bool) -> None:
+        self.library_state.loading = value
+
+    @property
+    def current_item_id(self) -> int | None:
+        return self.library_state.selected_item_id
+
+    @current_item_id.setter
+    def current_item_id(self, value: int | None) -> None:
+        self.library_state.selected_item_id = value
+
+    @property
+    def current_kind(self) -> str | None:
+        return self.library_state.kind
+
+    @current_kind.setter
+    def current_kind(self, value: str | None) -> None:
+        self.library_state.kind = value
+
+    @property
+    def current_favorite(self) -> bool:
+        return self.library_state.favorite
+
+    @current_favorite.setter
+    def current_favorite(self, value: bool) -> None:
+        self.library_state.favorite = value
+
+    @property
+    def current_day(self) -> str | None:
+        return self.library_state.day
+
+    @current_day.setter
+    def current_day(self, value: str | None) -> None:
+        self.library_state.day = value
+
+    @property
+    def current_recent(self) -> bool:
+        return self.library_state.recent
+
+    @current_recent.setter
+    def current_recent(self, value: bool) -> None:
+        self.library_state.recent = value
+
+    @property
+    def current_collection(self) -> int | None:
+        return self.library_state.collection_id
+
+    @current_collection.setter
+    def current_collection(self, value: int | None) -> None:
+        self.library_state.collection_id = value
+
+    @property
+    def current_tag(self) -> int | None:
+        return self.library_state.tag_id
+
+    @current_tag.setter
+    def current_tag(self, value: int | None) -> None:
+        self.library_state.tag_id = value
+
+    @property
+    def current_sort(self) -> str:
+        return self.library_state.sort
+
+    @current_sort.setter
+    def current_sort(self, value: str) -> None:
+        self.library_state.sort = value
 
     def __init__(
         self,
@@ -159,53 +375,91 @@ class MainWindow(QMainWindow):
         app_icon: QIcon,
         scan_on_start: bool = True,
         reconcile_on_start: bool = False,
+        paths: AppPaths | None = None,
+        clipboard_service: ClipboardService | None = None,
+        runtime=None,
     ):
         super().__init__()
         self.database = database
         self.settings = settings
+        self.paths = paths
+        self.runtime = runtime
         self.app_icon = app_icon
-        self.current_items = []
-        self._items_offset = 0
-        self._items_has_more = False
-        self._items_loading = False
-        self.current_item_id: int | None = None
-        self.current_kind: str | None = None
-        self.current_favorite = False
-        self.current_day: str | None = None
-        self.current_recent = False
-        self.current_collection: int | None = None
-        self.current_tag: int | None = None
-        self.current_sort = settings.get("sort", "newest")
+        self.library_state = LibraryViewState(sort=settings.get("sort", "newest"))
         self.sort_menu = None
         self.sort_menu_closed_at = 0.0
         self.force_quit = False
         self._grid_dirty = True
         self._table_dirty = True
         self._async_signals: set[QObject] = set()
-        self._ai_requests: dict[int, tuple[object, AsyncSignals]] = {}
-        self._ocr_requests: dict[int, tuple[object, AsyncSignals]] = {}
-        self._automatic_ai_items: set[int] = set()
-        self._automatic_ocr_items: set[int] = set()
-        self._library_refresh_request: tuple[object, AsyncSignals] | None = None
-        self._item_search_request: tuple[object, AsyncSignals] | None = None
-        self._item_page_request: tuple[object, AsyncSignals] | None = None
-        self._expanded_search_request: tuple[object, AsyncSignals] | None = None
         self._expanded_search_query = ""
         self._expanded_search_terms: tuple[str, ...] = ()
         self._session_hidden_item_ids: set[int] = set()
-        self._pending_delete_item_ids: set[int] = set()
-        self._delete_requests: dict[int, tuple[object, AsyncSignals, bool, bool]] = {}
-        self._startup_scan_request: tuple[object, AsyncSignals] | None = None
         self.startup_scan_error: str | None = None
-        self._import_request: tuple[object, AsyncSignals] | None = None
-        self._copy_request: tuple[object, AsyncSignals, int] | None = None
-        self._backup_request: tuple[object, AsyncSignals] | None = None
-        self._bulk_image_request: tuple[object, BulkImageSignals] | None = None
-        self._bulk_image_checkpoint_path = checkpoint_path(Path(settings.path))
-        self._bulk_image_progress_state = self._initial_bulk_image_progress_state()
-        self._async_tasks: dict[object, tuple[threading.Event, threading.Thread]] = {}
-        self._bounded_tasks: dict[object, object] = {}
-        self._async_tasks_lock = threading.Lock()
+        self._task_supervisor = TaskSupervisor()
+        # Compatibility views while callers/tests migrate to TaskSupervisor.
+        self._async_tasks = self._task_supervisor.regular_tasks
+        self._bounded_tasks = self._task_supervisor.bounded_tasks
+        self._async_tasks_lock = self._task_supervisor.lock
+        self.library_controller = LibraryController(
+            database,
+            self._task_supervisor,
+            parent=self,
+        )
+        self.library_controller.refresh_succeeded.connect(self._library_refresh_succeeded)
+        self.library_controller.refresh_failed.connect(self._library_refresh_failed)
+        self.library_controller.search_succeeded.connect(self._item_search_succeeded)
+        self.library_controller.search_failed.connect(self._item_search_failed)
+        self.library_controller.page_succeeded.connect(self._item_page_succeeded)
+        self.library_controller.page_failed.connect(self._item_page_failed)
+        self.maintenance_controller = LibraryMaintenanceController(
+            database,
+            self._task_supervisor,
+            parent=self,
+        )
+        self.maintenance_controller.scan_succeeded.connect(self._startup_scan_finished)
+        self.maintenance_controller.scan_failed.connect(self._startup_scan_failed)
+        self.maintenance_controller.backup_succeeded.connect(self._periodic_backup_finished)
+        self.maintenance_controller.backup_failed.connect(self._periodic_backup_failed)
+        self.image_task_controller = ImageTaskController(
+            self._task_supervisor,
+            parent=self,
+            start_bounded=lambda token, target, **kwargs: self._start_bounded_task(
+                token,
+                target,
+                **kwargs,
+            ),
+        )
+        self.image_task_controller.ai_succeeded.connect(self._ai_succeeded)
+        self.image_task_controller.ai_failed.connect(self._ai_failed)
+        self.image_task_controller.ocr_succeeded.connect(self._ocr_succeeded)
+        self.image_task_controller.ocr_failed.connect(self._ocr_failed)
+        self.image_task_controller.expanded_search_succeeded.connect(
+            self._expanded_search_succeeded
+        )
+        self.image_task_controller.expanded_search_failed.connect(
+            self._expanded_search_failed
+        )
+        self.mutation_controller = LibraryMutationController(
+            database,
+            self._task_supervisor,
+            parent=self,
+        )
+        self.mutation_controller.import_finished.connect(self._import_finished)
+        self.mutation_controller.import_failed.connect(self._import_failed)
+        self.mutation_controller.copy_succeeded.connect(self._copy_image_succeeded)
+        self.mutation_controller.copy_failed.connect(self._copy_image_failed)
+        self.mutation_controller.delete_finished.connect(self._delete_finished)
+        self.mutation_controller.delete_failed.connect(self._delete_failed)
+        self.bulk_image_controller = BulkImageController(
+            database,
+            checkpoint_path(Path(settings.path)),
+            start_task=lambda token, target: self._start_async_task(token, target),
+            cancel_task=lambda token: self._cancel_async_token(token),
+            parent=self,
+        )
+        self.bulk_image_controller.progress_changed.connect(self._bulk_image_progress)
+        self.bulk_image_controller.finished.connect(self._bulk_image_finished)
         self._closing = False
         self._quit_in_progress = False
         self._interactive_resize_active = False
@@ -231,11 +485,14 @@ class MainWindow(QMainWindow):
         )
         self._native_resize_frame_enabled = False
         self._native_resize_frame_hwnd: int | None = None
-        self._native_backdrop_hwnd: int | None = None
-        self._native_backdrop_result: BackdropResult | None = None
-        self._windows_backdrop_window_hwnd: int | None = None
-        self._power_saving_notification_hwnd: int | None = None
-        self._power_saving_notification_handle: int | None = None
+        self.window_effects_controller = WindowEffectsController(
+            self,
+            platform_check=lambda: is_windows_qt_platform(),
+            apply_backdrop=lambda *args, **kwargs: apply_windows_backdrop(*args, **kwargs),
+            register_power=lambda hwnd: register_windows_power_saving_notification(hwnd),
+            unregister_power=lambda handle: unregister_windows_power_saving_notification(handle),
+            sync_surface_style=lambda **kwargs: self._sync_surface_style(**kwargs),
+        )
         self._material_refresh_pending = False
         self._maximized_bounds_sync_pending = False
         self._initial_position_constrained = False
@@ -265,10 +522,20 @@ class MainWindow(QMainWindow):
             app.aboutToQuit.connect(release_windows_backdrop)
             app.aboutToQuit.connect(self._destroy_windows_backdrop_window)
 
-        self.clipboard_service = ClipboardService(database, self)
+        if clipboard_service is None:
+            self.clipboard_service = ClipboardService(database, self, paths=paths)
+        else:
+            self.clipboard_service = clipboard_service
         self.clipboard_service.captured.connect(self.on_captured)
         self.clipboard_service.failed.connect(self.show_error_status)
         self.clipboard_service.state_changed.connect(self.update_monitor_button)
+        self.shutdown_coordinator = ShutdownCoordinator(
+            database,
+            self.clipboard_service,
+            self.grid,
+            self.detail,
+            runtime=runtime,
+        )
         if settings.get("monitoring", False):
             self.clipboard_service.start()
         else:
@@ -540,26 +807,13 @@ class MainWindow(QMainWindow):
             self._install_resize_handles(self.centralWidget())
 
     def _ensure_windows_backdrop_window(self) -> int | None:
-        if not is_windows_qt_platform():
-            return None
-        if self._windows_backdrop_window_hwnd:
-            return self._windows_backdrop_window_hwnd
-        hwnd = create_backdrop_host_window()
-        if not hwnd:
-            return None
-        self._windows_backdrop_window_hwnd = hwnd
-        return hwnd
+        return self.window_effects_controller.ensure_backdrop_window()
 
     def _destroy_windows_backdrop_window(self) -> None:
-        hwnd = self._windows_backdrop_window_hwnd
-        self._windows_backdrop_window_hwnd = None
-        if hwnd:
-            destroy_backdrop_host_window(hwnd)
+        self.window_effects_controller.destroy_backdrop_window()
 
     def _hide_windows_backdrop_window(self) -> None:
-        hwnd = self._windows_backdrop_window_hwnd
-        if hwnd:
-            hide_backdrop_host_window(hwnd)
+        self.window_effects_controller.hide_backdrop_window()
 
     def _sync_windows_backdrop_window_rect(
         self,
@@ -570,174 +824,36 @@ class MainWindow(QMainWindow):
         *,
         visible: bool | None = None,
     ) -> None:
-        if (
-            self._native_backdrop_result is None
-            or self._native_backdrop_result.backend.value != "win10_effect_acrylic"
-            or not self._native_backdrop_result.success
-        ):
-            self._hide_windows_backdrop_window()
-            return
-        backdrop_hwnd = self._windows_backdrop_window_hwnd
-        if not backdrop_hwnd:
-            return
-        should_show = (
-            self.isVisible() and not self.isMinimized()
-            if visible is None
-            else visible
-        )
-        if not should_show:
-            hide_backdrop_host_window(backdrop_hwnd)
-            return
-        sync_backdrop_host_window(
-            backdrop_hwnd,
-            int(self.winId()),
-            int(x),
-            int(y),
-            max(1, int(width)),
-            max(1, int(height)),
-            visible=True,
-        )
-
-    def _sync_windows_backdrop_window(self) -> None:
-        if not is_windows_qt_platform():
-            return
-        if (
-            self._native_backdrop_result is None
-            or self._native_backdrop_result.backend.value != "win10_effect_acrylic"
-            or not self._native_backdrop_result.success
-        ):
-            return
-        hwnd = int(self.winId())
-        rect = window_rect(hwnd)
-        if rect is None:
-            return
-        left, top, right, bottom = rect
-        self._sync_windows_backdrop_window_rect(
-            left,
-            top,
-            max(1, right - left),
-            max(1, bottom - top),
-        )
-
-    def _sync_windows_backdrop_geometry_now(self) -> None:
-        """Mirror the host's real Win32 bounds and keep the helper just behind it."""
-        if (
-            self._native_backdrop_result is None
-            or self._native_backdrop_result.backend.value != "win10_effect_acrylic"
-            or not self._native_backdrop_result.success
-        ):
-            return
-        backdrop_hwnd = self._windows_backdrop_window_hwnd
-        host_hwnd = int(self.winId())
-        if not backdrop_hwnd or self.isMinimized():
-            return
-        rect = window_rect(host_hwnd)
-        if rect is None:
-            return
-        left, top, right, bottom = rect
-        sync_backdrop_host_window(
-            backdrop_hwnd,
-            host_hwnd,
-            left,
-            top,
-            max(1, right - left),
-            max(1, bottom - top),
-            visible=self.isVisible(),
-            sync_z_order=False,
-        )
-
-    def _sync_windows_backdrop_from_windowpos(self, lparam: int) -> None:
-        """Pre-position the Acrylic HWND during WM_WINDOWPOSCHANGING.
-
-        This runs before the host geometry is committed, removing the one-event
-        lag that is visible when a separate backdrop window follows a live drag
-        only from moveEvent/resizeEvent.
-        """
-        if (
-            not lparam
-            or self._native_backdrop_result is None
-            or self._native_backdrop_result.backend.value != "win10_effect_acrylic"
-            or not self._native_backdrop_result.success
-            or self.isMinimized()
-        ):
-            return
-        backdrop_hwnd = self._windows_backdrop_window_hwnd
-        host_hwnd = int(self.winId())
-        if not backdrop_hwnd or not host_hwnd:
-            return
-        try:
-            position = WINDOWPOS.from_address(int(lparam))
-        except (TypeError, ValueError):
-            return
-        current = window_rect(host_hwnd)
-        if current is None:
-            return
-        left, top, right, bottom = current
-        x = left if position.flags & SWP_NOMOVE else int(position.x)
-        y = top if position.flags & SWP_NOMOVE else int(position.y)
-        width = max(1, right - left) if position.flags & SWP_NOSIZE else max(1, int(position.cx))
-        height = max(1, bottom - top) if position.flags & SWP_NOSIZE else max(1, int(position.cy))
-        if position.flags & SWP_HIDEWINDOW:
-            return
-        sync_backdrop_host_window(
-            backdrop_hwnd,
-            host_hwnd,
+        self.window_effects_controller.sync_window_rect(
             x,
             y,
             width,
             height,
-            visible=True,
-            sync_z_order=False,
+            visible=visible,
         )
+
+    def _sync_windows_backdrop_window(self) -> None:
+        self.window_effects_controller.sync_window()
+
+    def _sync_windows_backdrop_geometry_now(self) -> None:
+        self.window_effects_controller.sync_geometry_now()
+
+    def _sync_windows_backdrop_from_windowpos(self, lparam: int) -> None:
+        self.window_effects_controller.sync_from_windowpos(lparam)
 
     def _apply_native_backdrop(
         self, *, force: bool = False, dark: bool | None = None
     ) -> None:
-        if not is_windows_qt_platform():
-            return
-        hwnd = int(self.winId())
-        if not force and self._native_backdrop_hwnd == hwnd:
-            return
-        composition_window = self._ensure_windows_backdrop_window()
-        result = apply_windows_backdrop(
-            self,
-            self.dark_theme if dark is None else dark,
-            composition_window=composition_window,
+        self.window_effects_controller.apply_native_backdrop(
+            force=force,
+            dark=dark,
         )
-        self._native_backdrop_result = result
-        self._sync_surface_style(result=result, dark=dark)
-        if result.success:
-            self._native_backdrop_hwnd = hwnd
-            if result.backend.value == "win10_effect_acrylic":
-                self._sync_windows_backdrop_window()
-            else:
-                self._hide_windows_backdrop_window()
-        else:
-            self._native_backdrop_hwnd = None
-            self._hide_windows_backdrop_window()
 
     def _ensure_power_saving_notification(self) -> None:
-        if not is_windows_qt_platform():
-            return
-        hwnd = int(self.winId())
-        if (
-            self._power_saving_notification_handle is not None
-            and self._power_saving_notification_hwnd == hwnd
-        ):
-            return
-        self._release_power_saving_notification()
-        handle = register_windows_power_saving_notification(hwnd)
-        if handle is None:
-            return
-        self._power_saving_notification_hwnd = hwnd
-        self._power_saving_notification_handle = handle
+        self.window_effects_controller.ensure_power_notification()
 
     def _release_power_saving_notification(self) -> None:
-        handle = self._power_saving_notification_handle
-        self._power_saving_notification_handle = None
-        self._power_saving_notification_hwnd = None
-        if handle is not None:
-            unregister_windows_power_saving_notification(handle)
+        self.window_effects_controller.release_power_notification()
 
     def _sync_surface_style(
         self,
@@ -1105,61 +1221,19 @@ class MainWindow(QMainWindow):
     def _refresh_library_async(self) -> None:
         if self._closing or self._quit_in_progress:
             return
-        self._cancel_library_refresh_request()
-        self._cancel_item_search_request()
-        self._cancel_item_page_request()
-        spec = self._current_item_query_spec()
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        self._library_refresh_request = (token, signals)
-        signals.succeeded.connect(
-            lambda _item_id, _text, payload, request_token=token, request_signals=signals, request_spec=spec: self._library_refresh_succeeded(
-                request_token,
-                request_signals,
-                request_spec,
-                payload,
-            )
+        self.library_controller.refresh(
+            self._current_item_query_spec(),
+            self.ITEM_PAGE_SIZE,
         )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals: self._library_refresh_failed(
-                request_token,
-                request_signals,
-                message,
-            )
-        )
-
-        def work(cancel_event: threading.Event) -> None:
-            try:
-                payload = {
-                    "counts": self.database.counts(),
-                    "collections": self.database.collections(),
-                    "tags": self.database.tags(),
-                    "items": self._query_items_for_spec(
-                        spec,
-                        self.ITEM_PAGE_SIZE,
-                        0,
-                    ),
-                }
-                if not cancel_event.is_set():
-                    signals.succeeded.emit(-1, "", payload)
-            except Exception as exc:
-                if not cancel_event.is_set():
-                    signals.failed.emit(str(exc))
-
-        self._start_async_task(token, work)
 
     def _library_refresh_succeeded(
         self,
         token: object,
-        signals: AsyncSignals,
-        spec: dict[str, object],
+        spec: LibraryQuery,
         payload: object,
     ) -> None:
-        self._async_signals.discard(signals)
-        if self._library_refresh_request != (token, signals):
+        if not self.library_controller.finish_refresh(token):
             return
-        self._library_refresh_request = None
         if self._closing or self._quit_in_progress or not isinstance(payload, dict):
             return
         self._apply_navigation_metadata(
@@ -1180,22 +1254,15 @@ class MainWindow(QMainWindow):
     def _library_refresh_failed(
         self,
         token: object,
-        signals: AsyncSignals,
         message: str,
     ) -> None:
-        self._async_signals.discard(signals)
-        if self._library_refresh_request != (token, signals):
+        if not self.library_controller.finish_refresh(token):
             return
-        self._library_refresh_request = None
         if not self._closing and not self._quit_in_progress:
             self.show_error_status(f"资料库刷新失败：{message}")
 
     def _cancel_library_refresh_request(self) -> None:
-        request = self._library_refresh_request
-        if request is None:
-            return
-        self._library_refresh_request = None
-        self._cancel_request(request)
+        self.library_controller.cancel_refresh()
 
 
     def refresh_items(self) -> None:
@@ -1224,34 +1291,29 @@ class MainWindow(QMainWindow):
             filters.append(label)
         self.filter_hint.setText("  ·  ".join(filters))
 
-    def _current_item_query_spec(self) -> dict[str, object]:
+    def _current_item_query_spec(self) -> LibraryQuery:
         expanded_terms = (
             self._expanded_search_terms if self._expanded_search_active() else None
         )
-        return {
-            "query": self.search.text().strip(),
-            "query_terms": expanded_terms,
-            "kind": self.current_kind,
-            "favorite": self.current_favorite,
-            "day": self.current_day,
-            "recent_days": 7 if self.current_recent else None,
-            "collection_id": self.current_collection,
-            "tag_id": self.current_tag,
-            "sort": self.current_sort,
-        }
+        return LibraryQuery(
+            query=self.search.text().strip(),
+            query_terms=expanded_terms,
+            kind=self.current_kind,
+            favorite=self.current_favorite,
+            day=self.current_day,
+            recent_days=7 if self.current_recent else None,
+            collection_id=self.current_collection,
+            tag_id=self.current_tag,
+            sort=self.current_sort,
+        )
 
     def _query_items_for_spec(
         self,
-        spec: dict[str, object],
+        spec: LibraryQuery,
         limit: int,
         offset: int,
     ):
-        return self.database.query_items(
-            **spec,
-            summary_only=True,
-            limit=limit,
-            offset=offset,
-        )
+        return self.library_controller.query_items(spec, limit, offset)
 
     def _query_current_items(self, limit: int, offset: int):
         return self._query_items_for_spec(
@@ -1263,51 +1325,19 @@ class MainWindow(QMainWindow):
     def _refresh_search_items_async(self) -> None:
         if self._closing or self._quit_in_progress:
             return
-        self._cancel_item_search_request()
-        self._cancel_item_page_request()
-        spec = self._current_item_query_spec()
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        self._item_search_request = (token, signals)
-        signals.succeeded.connect(
-            lambda _item_id, _text, items, request_token=token, request_signals=signals, request_spec=spec: self._item_search_succeeded(
-                request_token,
-                request_signals,
-                request_spec,
-                items,
-            )
+        self.library_controller.search(
+            self._current_item_query_spec(),
+            self.ITEM_PAGE_SIZE,
         )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals: self._item_search_failed(
-                request_token,
-                request_signals,
-                message,
-            )
-        )
-
-        def work(cancel_event: threading.Event) -> None:
-            try:
-                items = self._query_items_for_spec(spec, self.ITEM_PAGE_SIZE, 0)
-                if not cancel_event.is_set():
-                    signals.succeeded.emit(-1, "", items)
-            except Exception as exc:
-                if not cancel_event.is_set():
-                    signals.failed.emit(str(exc))
-
-        self._start_async_task(token, work)
 
     def _item_search_succeeded(
         self,
         token: object,
-        signals: AsyncSignals,
-        spec: dict[str, object],
+        spec: LibraryQuery,
         items: object,
     ) -> None:
-        self._async_signals.discard(signals)
-        if self._item_search_request != (token, signals):
+        if not self.library_controller.finish_search(token):
             return
-        self._item_search_request = None
         if self._closing or self._quit_in_progress:
             return
         if spec != self._current_item_query_spec():
@@ -1322,30 +1352,19 @@ class MainWindow(QMainWindow):
     def _item_search_failed(
         self,
         token: object,
-        signals: AsyncSignals,
         message: str,
     ) -> None:
-        self._async_signals.discard(signals)
-        if self._item_search_request != (token, signals):
+        if not self.library_controller.finish_search(token):
             return
-        self._item_search_request = None
         if not self._closing and not self._quit_in_progress:
             self.show_error_status(f"搜索失败：{message}")
 
     def _cancel_item_search_request(self) -> None:
-        request = self._item_search_request
-        if request is None:
-            return
-        self._item_search_request = None
-        self._cancel_request(request)
+        self.library_controller.cancel_search()
 
     def _cancel_item_page_request(self) -> None:
-        request = self._item_page_request
-        if request is None:
-            return
-        self._item_page_request = None
+        self.library_controller.cancel_page()
         self._items_loading = False
-        self._cancel_request(request)
 
     def _load_more_items_if_needed(self, view, value: int) -> None:
         if value < view.verticalScrollBar().maximum() - 120:
@@ -1365,54 +1384,17 @@ class MainWindow(QMainWindow):
         self._items_loading = True
         spec = self._current_item_query_spec()
         offset = self._items_offset
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        self._item_page_request = (token, signals)
-        signals.succeeded.connect(
-            lambda _item_id, _text, items, request_token=token, request_signals=signals, request_spec=spec, request_offset=offset: self._item_page_succeeded(
-                request_token,
-                request_signals,
-                request_spec,
-                request_offset,
-                items,
-            )
-        )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals: self._item_page_failed(
-                request_token,
-                request_signals,
-                message,
-            )
-        )
-
-        def work(cancel_event: threading.Event) -> None:
-            try:
-                items = self._query_items_for_spec(
-                    spec,
-                    self.ITEM_PAGE_SIZE,
-                    offset,
-                )
-                if not cancel_event.is_set():
-                    signals.succeeded.emit(-1, "", items)
-            except Exception as exc:
-                if not cancel_event.is_set():
-                    signals.failed.emit(str(exc))
-
-        self._start_async_task(token, work)
+        self.library_controller.load_page(spec, offset, self.ITEM_PAGE_SIZE)
 
     def _item_page_succeeded(
         self,
         token: object,
-        signals: AsyncSignals,
-        spec: dict[str, object],
+        spec: LibraryQuery,
         offset: int,
         items: object,
     ) -> None:
-        self._async_signals.discard(signals)
-        if self._item_page_request != (token, signals):
+        if not self.library_controller.finish_page(token):
             return
-        self._item_page_request = None
         self._items_loading = False
         if self._closing or self._quit_in_progress:
             return
@@ -1438,13 +1420,10 @@ class MainWindow(QMainWindow):
     def _item_page_failed(
         self,
         token: object,
-        signals: AsyncSignals,
         message: str,
     ) -> None:
-        self._async_signals.discard(signals)
-        if self._item_page_request != (token, signals):
+        if not self.library_controller.finish_page(token):
             return
-        self._item_page_request = None
         self._items_loading = False
         if not self._closing and not self._quit_in_progress:
             self.show_error_status(f"加载更多失败：{message}")
@@ -1937,7 +1916,6 @@ class MainWindow(QMainWindow):
             return
         if self._copy_request is not None:
             self._cancel_async_token(self._copy_request[0])
-            self._async_signals.discard(self._copy_request[1])
             self._copy_request = None
         clipboard = QApplication.clipboard()
         if item["kind"] == "image" and item["path"]:
@@ -1952,39 +1930,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "复制失败", str(exc))
                 self.show_status("复制失败：图片文件无法读取")
                 return
-            token = object()
-            signals = AsyncSignals()
-            self._async_signals.add(signals)
-            self._copy_request = (token, signals, item_id)
-            signals.succeeded.connect(
-                lambda result_item_id, _text, image, request_token=token, request_signals=signals: self._copy_image_succeeded(
-                    request_token, request_signals, result_item_id, image
-                )
-            )
-            signals.failed.connect(
-                lambda message, request_token=token, request_signals=signals: self._copy_image_failed(
-                    request_token, request_signals, message
-                )
-            )
-
-            def work(cancel_event: threading.Event) -> None:
-                try:
-                    snapshot.require_current()
-                    image = QImage(str(snapshot.path))
-                    snapshot.require_current()
-                    if image.isNull():
-                        raise ValueError("图片文件无法读取，可能已损坏或无权访问。")
-                    if not cancel_event.is_set():
-                        signals.succeeded.emit(item_id, "", image)
-                except Exception as exc:
-                    if not cancel_event.is_set():
-                        signals.failed.emit(str(exc))
-
             try:
-                self._start_bounded_task(token, work, estimated_bytes=snapshot.decoded_bytes)
+                self.mutation_controller.start_copy_image(item_id, snapshot)
             except TaskCapacityExceeded as exc:
-                self._copy_request = None
-                self._async_signals.discard(signals)
                 QMessageBox.warning(self, "复制任务繁忙", str(exc))
             return
         else:
@@ -2043,11 +1991,20 @@ class MainWindow(QMainWindow):
         item_snapshot = dict(item)
         was_selected = self.current_item_id == item_id
         detail_was_visible = self.detail.isVisible()
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        self._delete_requests[item_id] = (token, signals, was_selected, detail_was_visible)
-        self._pending_delete_item_ids.add(item_id)
+        library_root = self.paths.library_dir if self.paths is not None else LIBRARY_DIR
+        request = self.mutation_controller.start_delete(
+            item_snapshot,
+            was_selected=was_selected,
+            detail_was_visible=detail_was_visible,
+            is_managed=lambda path: is_under_local_store(path),
+            recycle=lambda path, root, **kwargs: recycle_managed_file(
+                path,
+                root,
+                send2trash,
+                **kwargs,
+            ),
+            library_root=library_root,
+        )
         self._cancel_item_requests(item_id)
         if was_selected:
             self.current_item_id = None
@@ -2056,90 +2013,8 @@ class MainWindow(QMainWindow):
             self.detail.clear_item()
         self._apply_items(self.current_items)
         self.show_status("正在删除内容…")
-        signals.succeeded.connect(
-            lambda result_item_id, _text, result, request_token=token, request_signals=signals:
-            self._delete_finished(request_token, request_signals, result_item_id, result)
-        )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals:
-            self._delete_failed(request_token, request_signals, item_id, message)
-        )
-
-        def work(cancel_event: threading.Event) -> None:
-            recycled = False
-            stage = "preflight"
-            try:
-                managed_file = bool(
-                    item_snapshot["path"]
-                    and is_under_local_store(Path(item_snapshot["path"]))
-                )
-                file_exists = bool(item_snapshot["path"] and Path(item_snapshot["path"]).exists())
-                if cancel_event.is_set():
-                    signals.succeeded.emit(item_id, "", {"outcome": "cancelled"})
-                    return
-                if managed_file and file_exists:
-                    stage = "recycle"
-                    if not is_under_local_store(Path(item_snapshot["path"])):
-                        raise RuntimeError("文件路径在确认期间发生变化，已取消删除。")
-                    recycle_managed_file(
-                        Path(item_snapshot["path"]),
-                        LIBRARY_DIR,
-                        send2trash,
-                        expected_sha256=item_snapshot["content_hash"],
-                        expected_size=item_snapshot["file_size"],
-                    )
-                    recycled = True
-                if cancel_event.is_set() and not recycled:
-                    signals.succeeded.emit(item_id, "", {"outcome": "cancelled"})
-                    return
-                stage = "index"
-                try:
-                    self.database.remove_item(item_id)
-                except Exception as exc:
-                    if not recycled:
-                        signals.succeeded.emit(
-                            item_id,
-                            "",
-                            {"outcome": "failed", "stage": "index", "error": str(exc)},
-                        )
-                        return
-                    mark_error = None
-                    try:
-                        self.database.mark_item_missing(item_id)
-                    except Exception as mark_exc:
-                        mark_error = str(mark_exc)
-                    signals.succeeded.emit(
-                        item_id,
-                        "",
-                        {
-                            "outcome": "reconciled",
-                            "error": str(exc),
-                            "mark_error": mark_error,
-                            "managed_file": managed_file,
-                            "file_exists": file_exists,
-                        },
-                    )
-                    return
-                signals.succeeded.emit(
-                    item_id,
-                    "",
-                    {
-                        "outcome": "deleted",
-                        "managed_file": managed_file,
-                        "file_exists": file_exists,
-                    },
-                )
-            except Exception as exc:
-                signals.succeeded.emit(
-                    item_id,
-                    "",
-                    {"outcome": "failed", "stage": stage, "error": str(exc)},
-                )
-
-        try:
-            self._start_async_task(token, work)
-        except Exception as exc:
-            self._delete_failed(token, signals, item_id, str(exc))
+        if item_id not in self._delete_requests:
+            self._delete_failed(request[0], request[1], item_id, "删除任务无法启动")
 
     def _restore_delete_view(self, item_id: int, was_selected: bool, detail_was_visible: bool) -> None:
         # Failure/cancellation recovery is rare and must restore selection against
@@ -2363,74 +2238,11 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(parent or self, "导入内容", "", "支持的文件 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.md)")
         if not paths:
             return
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        self._import_request = (token, signals)
-        signals.succeeded.connect(
-            lambda _item_id, _text, result, request_token=token, request_signals=signals: self._import_finished(
-                request_token, request_signals, result
-            )
-        )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals: self._import_failed(
-                request_token, request_signals, message
-            )
-        )
         self.show_status(f"正在导入 {len(paths)} 个文件")
-
-        def work(cancel_event: threading.Event) -> None:
-            added = 0
-            localized = 0
-            duplicates = 0
-            processed = 0
-            failed = []
-            image_ids: list[int] = []
-            for filename in paths:
-                if cancel_event.is_set():
-                    break
-                try:
-                    candidate = Path(filename)
-                    import_result = self.database.import_file(
-                        candidate,
-                        copy_to_library=True,
-                        strict=True,
-                        detailed=True,
-                    )
-                    if not isinstance(import_result, ImportFileDetails):
-                        raise RuntimeError("导入未返回详细结果")
-                    if import_result.localized:
-                        localized += 1
-                    elif import_result.added:
-                        added += 1
-                    else:
-                        duplicates += 1
-                    if (
-                        candidate.suffix.lower() != ".md"
-                        and import_result.item_id is not None
-                        and (import_result.added or import_result.localized)
-                    ):
-                        image_ids.append(import_result.item_id)
-                except Exception as exc:
-                    failed.append((Path(filename).name, str(exc)))
-                finally:
-                    processed += 1
-            signals.succeeded.emit(
-                -1,
-                "",
-                {
-                    "total": len(paths),
-                    "added": added,
-                    "localized": localized,
-                    "duplicates": duplicates,
-                    "processed": processed,
-                    "failed": failed,
-                    "image_ids": list(dict.fromkeys(image_ids)),
-                    "cancelled": cancel_event.is_set(),
-                },
-            )
-
-        self._start_async_task(token, work)
+        try:
+            self.mutation_controller.start_import(paths)
+        except Exception as exc:
+            QMessageBox.warning(self, "文件导入失败", str(exc))
 
     def _import_finished(self, token: object, signals: AsyncSignals, result: dict) -> None:
         self._async_signals.discard(signals)
@@ -2514,59 +2326,27 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _bulk_progress_state(
-        checkpoint: BulkImageCheckpoint | None,
+        checkpoint,
         *,
         active: bool = False,
         phase: str = "",
         error: str = "",
     ) -> dict[str, object]:
-        if checkpoint is None:
-            return {
-                "active": False,
-                "resumable": False,
-                "processed": 0,
-                "total": 0,
-                "phase": phase,
-                "error": error,
-            }
-        return {
-            "active": active,
-            "resumable": checkpoint.processed < checkpoint.total,
-            "processed": checkpoint.processed,
-            "total": checkpoint.total,
-            "phase": phase,
-            "error": error,
-        }
+        return BulkImageController.progress_state_for(
+            checkpoint,
+            active=active,
+            phase=phase,
+            error=error,
+        )
 
     def _initial_bulk_image_progress_state(self) -> dict[str, object]:
-        try:
-            checkpoint = load_checkpoint(self._bulk_image_checkpoint_path)
-            if checkpoint is not None and checkpoint.processed >= checkpoint.total:
-                clear_checkpoint(self._bulk_image_checkpoint_path)
-                checkpoint = None
-        except (OSError, ValueError) as exc:
-            return self._bulk_progress_state(
-                None,
-                phase="断点不可用",
-                error=str(exc),
-            )
-        phase = "已暂停，可继续处理" if checkpoint is not None else ""
-        return self._bulk_progress_state(checkpoint, phase=phase)
+        return self.bulk_image_controller.snapshot()
 
     def bulk_image_progress_snapshot(self) -> dict[str, object]:
-        return dict(self._bulk_image_progress_state)
+        return self.bulk_image_controller.snapshot()
 
-    def _load_bulk_image_checkpoint(self) -> BulkImageCheckpoint | None:
-        try:
-            checkpoint = load_checkpoint(self._bulk_image_checkpoint_path)
-        except (OSError, ValueError) as exc:
-            self._bulk_image_progress_state = self._bulk_progress_state(
-                None,
-                phase="断点不可用",
-                error=str(exc),
-            )
-            return None
-        return checkpoint
+    def _load_bulk_image_checkpoint(self):
+        return self.bulk_image_controller.load_checkpoint()
 
     def _confirm_bulk_image_processing(self, dialog: SettingsDialog) -> None:
         if self._bulk_image_request is not None:
@@ -2633,167 +2413,14 @@ class MainWindow(QMainWindow):
                 "请先在设置中填写 Base URL 和视觉模型名称。",
             )
             return
-        checkpoint = self._load_bulk_image_checkpoint()
-        if checkpoint is not None and checkpoint.processed >= checkpoint.total:
-            try:
-                clear_checkpoint(self._bulk_image_checkpoint_path)
-            except OSError as exc:
-                QMessageBox.warning(self, "批量处理无法启动", f"无法清理旧断点：{exc}")
-                return
-            checkpoint = None
-        if checkpoint is None:
-            image_ids = self.database.item_ids(kind="image", sort="oldest")
-            if not image_ids:
+        try:
+            checkpoint = self.bulk_image_controller.start(service)
+        except LookupError as exc:
+            if str(exc) == "NO_IMAGES":
                 QMessageBox.information(self, "没有图片", "本地资料库中没有可处理的图片。")
                 return
-            checkpoint = new_checkpoint(image_ids)
-            try:
-                clear_checkpoint(self._bulk_image_checkpoint_path)
-                save_checkpoint(self._bulk_image_checkpoint_path, checkpoint)
-            except OSError as exc:
-                QMessageBox.warning(self, "批量处理无法启动", f"无法保存批处理断点：{exc}")
-                return
-
-        token = object()
-        signals = BulkImageSignals()
-        self._async_signals.add(signals)
-        self._bulk_image_request = (token, signals)
-        signals.progress.connect(
-            lambda processed, total, item_id, phase, request_token=token, request_signals=signals: self._bulk_image_progress(
-                request_token,
-                request_signals,
-                processed,
-                total,
-                item_id,
-                phase,
-            )
-        )
-        signals.finished.connect(
-            lambda result, request_token=token, request_signals=signals: self._bulk_image_finished(
-                request_token,
-                request_signals,
-                result,
-            )
-        )
-        self._bulk_image_progress_state = self._bulk_progress_state(
-            checkpoint,
-            active=True,
-            phase="正在继续处理" if checkpoint.processed else "正在准备",
-        )
-
-        def work(cancel_event: threading.Event) -> None:
-            current = checkpoint
-            total = current.total
-            result = {
-                "total": total,
-                "processed": current.processed,
-                "completed": current.completed,
-                "skipped": current.skipped,
-                "failed": current.failed,
-                "cancelled": False,
-                "error": "",
-            }
-            while current.processed < total:
-                if cancel_event.is_set():
-                    result["cancelled"] = True
-                    break
-                item_id = current.current_item_id
-                if item_id is None:
-                    break
-                try:
-                    item = self.database.get_item(item_id)
-                except Exception as exc:
-                    result["error"] = f"读取图片索引失败：{exc}"
-                    break
-                if not item or item["kind"] != "image" or not item["path"] or not item["content_hash"]:
-                    current = current.advance("skipped")
-                    try:
-                        save_checkpoint(self._bulk_image_checkpoint_path, current)
-                    except OSError as exc:
-                        result["error"] = f"无法保存批处理断点：{exc}"
-                        break
-                    signals.progress.emit(current.processed, total, item_id, "已跳过")
-                    continue
-                try:
-                    image_snapshot = preflight_image_file(Path(item["path"]))
-                except Exception:
-                    current = current.advance("failed")
-                    try:
-                        save_checkpoint(self._bulk_image_checkpoint_path, current)
-                    except OSError as exc:
-                        result["error"] = f"无法保存批处理断点：{exc}"
-                        break
-                    signals.progress.emit(current.processed, total, item_id, "本地文件不可用")
-                    continue
-                try:
-                    if current.stage == "ocr":
-                        signals.progress.emit(current.processed, total, item_id, "正在 OCR")
-                        ocr_text = service.ocr_image(
-                            image_snapshot,
-                            cancel_event,
-                            expected_sha256=item["content_hash"],
-                        )
-                        image_snapshot.require_current()
-                        if not self.database.update_ocr_if_current(
-                            item_id,
-                            item["content_hash"],
-                            ocr_text,
-                        ):
-                            current = current.advance("skipped")
-                            save_checkpoint(self._bulk_image_checkpoint_path, current)
-                            signals.progress.emit(current.processed, total, item_id, "图片已变化")
-                            continue
-                        current = current.at_stage("description")
-                        save_checkpoint(self._bulk_image_checkpoint_path, current)
-                    signals.progress.emit(current.processed, total, item_id, "正在生成描述")
-                    description = service.describe_image(
-                        image_snapshot,
-                        cancel_event,
-                        expected_sha256=item["content_hash"],
-                    )
-                    image_snapshot.require_current()
-                    if not self.database.update_ai_if_current(
-                        item_id,
-                        item["content_hash"],
-                        description,
-                    ):
-                        current = current.advance("skipped")
-                        save_checkpoint(self._bulk_image_checkpoint_path, current)
-                        signals.progress.emit(current.processed, total, item_id, "图片已变化")
-                        continue
-                except OperationCancelled:
-                    result["cancelled"] = True
-                    break
-                except Exception as exc:
-                    result["error"] = str(exc)
-                    break
-                current = current.advance("completed")
-                try:
-                    save_checkpoint(self._bulk_image_checkpoint_path, current)
-                except OSError as exc:
-                    result["error"] = f"无法保存批处理断点：{exc}"
-                    break
-                signals.progress.emit(current.processed, total, item_id, "已完成")
-            result.update(
-                {
-                    "processed": current.processed,
-                    "completed": current.completed,
-                    "skipped": current.skipped,
-                    "failed": current.failed,
-                }
-            )
-            signals.finished.emit(result)
-
-        try:
-            self._start_async_task(token, work)
+            raise
         except Exception as exc:
-            self._bulk_image_request = None
-            self._async_signals.discard(signals)
-            self._bulk_image_progress_state = self._bulk_progress_state(
-                checkpoint,
-                phase="已暂停，可继续处理",
-                error=str(exc),
-            )
             QMessageBox.warning(self, "批量处理无法启动", str(exc))
             return
         self.show_status(
@@ -2802,63 +2429,25 @@ class MainWindow(QMainWindow):
 
     def _bulk_image_progress(
         self,
-        token: object,
-        signals: BulkImageSignals,
         processed: int,
         total: int,
         item_id: int,
         phase: str,
     ) -> None:
-        if self._bulk_image_request != (token, signals) or self._closing:
+        if self._closing:
             return
         if self.current_item_id == item_id:
             self.update_detail(item_id)
-        self._bulk_image_progress_state.update(
-            {
-                "active": True,
-                "resumable": True,
-                "processed": processed,
-                "total": total,
-                "phase": phase,
-                "error": "",
-            }
-        )
         self.show_status(f"批量处理图片 {processed:,}/{total:,}：{phase}")
 
     def _bulk_image_finished(
         self,
-        token: object,
-        signals: BulkImageSignals,
-        result: object,
+        completion: object,
     ) -> None:
-        self._async_signals.discard(signals)
-        if self._bulk_image_request != (token, signals):
+        if not isinstance(completion, BulkImageCompletion):
             return
-        self._bulk_image_request = None
-        details = result if isinstance(result, dict) else {}
-        checkpoint = self._load_bulk_image_checkpoint()
-        error = str(details.get("error") or "")
-        completed_all = (
-            checkpoint is not None and checkpoint.processed >= checkpoint.total
-        )
-        if completed_all:
-            try:
-                clear_checkpoint(self._bulk_image_checkpoint_path)
-            except OSError as exc:
-                error = error or f"无法清理已完成的批处理断点：{exc}"
-            checkpoint = None
-        if checkpoint is not None:
-            self._bulk_image_progress_state = self._bulk_progress_state(
-                checkpoint,
-                phase="已暂停，可继续处理",
-                error=error,
-            )
-        else:
-            self._bulk_image_progress_state = self._bulk_progress_state(
-                None,
-                phase="已完成" if completed_all else "",
-                error=error,
-            )
+        details = completion.details
+        error = completion.error
         if self._closing or self._quit_in_progress:
             return
         self._refresh_library_async()
@@ -2885,31 +2474,11 @@ class MainWindow(QMainWindow):
         )
 
     def _start_async_task(self, token: object, target) -> threading.Event:
-        cancel_event = threading.Event()
-
-        def run() -> None:
-            try:
-                target(cancel_event)
-            finally:
-                with self._async_tasks_lock:
-                    current = self._async_tasks.get(token)
-                    if current is not None and current[1] is threading.current_thread():
-                        self._async_tasks.pop(token, None)
-
-        thread = threading.Thread(target=run, name="ClipSaveAsync", daemon=True)
-        with self._async_tasks_lock:
-            self._async_tasks[token] = (cancel_event, thread)
-        thread.start()
-        return cancel_event
+        return self._task_supervisor.start_thread(token, target)
 
     def _start_bounded_task(self, token: object, target, *, estimated_bytes: int = 0):
-        with self._async_tasks_lock:
-            self._bounded_tasks = {
-                key: handle for key, handle in self._bounded_tasks.items() if not handle.done_event.is_set()
-            }
         handle = ai_ocr_task_executor().submit(target, estimated_bytes=estimated_bytes)
-        with self._async_tasks_lock:
-            self._bounded_tasks[token] = handle
+        self._task_supervisor.track_bounded(token, handle)
         return handle
 
     def _ai_service(self) -> AIService:
@@ -2963,75 +2532,21 @@ class MainWindow(QMainWindow):
 
     def _start_startup_scan(self, full_scan: bool, reconcile_images: bool) -> None:
         self.startup_scan_error = None
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        self._startup_scan_request = (token, signals)
-        signals.succeeded.connect(
-            lambda _item_id, _text, imported, request_token=token, request_signals=signals: self._startup_scan_finished(
-                request_token, request_signals, int(imported)
-            )
-        )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals: self._startup_scan_failed(
-                request_token, request_signals, message
-            )
-        )
-
-        def work(cancel_event: threading.Event) -> None:
-            try:
-                self.database.mark_missing_files(cancel_event)
-                imported = 0
-                if not cancel_event.is_set() and full_scan:
-                    imported = self.database.scan_legacy_files(cancel_event)
-                elif not cancel_event.is_set() and reconcile_images:
-                    imported = self.database.scan_unindexed_files(cancel_event)
-                signals.succeeded.emit(-1, "", imported)
-            except Exception as exc:
-                if not cancel_event.is_set():
-                    signals.failed.emit(str(exc))
-
-        self._start_async_task(token, work)
+        self.maintenance_controller.start_scan(full_scan, reconcile_images)
 
     def _start_periodic_backup(self) -> None:
         if self._closing or self._quit_in_progress or self._backup_request is not None:
             return
         if not self.database.backup_state()["dirty"]:
             return
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        self._backup_request = (token, signals)
-        signals.succeeded.connect(
-            lambda _item_id, _text, path, request_token=token, request_signals=signals: self._periodic_backup_finished(
-                request_token, request_signals, path
-            )
-        )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals: self._periodic_backup_failed(
-                request_token, request_signals, message
-            )
-        )
+        self.maintenance_controller.start_backup()
 
-        def work(_cancel_event: threading.Event) -> None:
-            try:
-                path = self.database.create_backup_if_changed()
-                signals.succeeded.emit(-1, "", str(path) if path else "")
-            except Exception as exc:
-                signals.failed.emit(str(exc))
+    def _periodic_backup_finished(self, token: object, signals: QObject, _path: str) -> None:
+        self.maintenance_controller.finish_backup(token, signals)
 
-        self._start_async_task(token, work)
-
-    def _periodic_backup_finished(self, token: object, signals: AsyncSignals, _path: str) -> None:
-        self._async_signals.discard(signals)
-        if self._backup_request == (token, signals):
-            self._backup_request = None
-
-    def _periodic_backup_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
-        self._async_signals.discard(signals)
-        if self._closing or self._backup_request != (token, signals):
+    def _periodic_backup_failed(self, token: object, signals: QObject, message: str) -> None:
+        if not self.maintenance_controller.finish_backup(token, signals) or self._closing:
             return
-        self._backup_request = None
         self.show_error_status(f"数据库备份失败：{message}")
 
     def _show_database_recovery_state(self) -> None:
@@ -3050,11 +2565,9 @@ class MainWindow(QMainWindow):
             details.append(f"最近一次备份失败：{backup['last_error']}")
         QMessageBox.warning(self, "ClipSave 数据库恢复", "\n\n".join(details))
 
-    def _startup_scan_finished(self, token: object, signals: AsyncSignals, imported: int) -> None:
-        self._async_signals.discard(signals)
-        if self._closing or self._startup_scan_request != (token, signals):
+    def _startup_scan_finished(self, token: object, signals: QObject, imported: int) -> None:
+        if not self.maintenance_controller.finish_scan(token, signals) or self._closing:
             return
-        self._startup_scan_request = None
         self.startup_scan_error = None
         self._refresh_library_async()
         if imported:
@@ -3065,39 +2578,25 @@ class MainWindow(QMainWindow):
                 f"启动扫描跳过了 {report['failed']} 个文件；已处理 {report.get('scanned', 0)} 个"
             )
 
-    def _startup_scan_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
+    def _startup_scan_failed(self, token: object, signals: QObject, message: str) -> None:
         self._async_signals.discard(signals)
-        if self._closing or self._startup_scan_request != (token, signals):
+        if not self.maintenance_controller.finish_scan(token, signals) or self._closing:
             return
-        self._startup_scan_request = None
         self.startup_scan_error = message
         self.show_error_status(f"启动扫描失败：{message}")
 
     def _cancel_async_token(self, token: object) -> None:
-        with self._async_tasks_lock:
-            task = self._async_tasks.get(token)
-            bounded = self._bounded_tasks.get(token)
-        if task is not None:
-            task[0].set()
-        if bounded is not None:
-            bounded.cancel()
+        self._task_supervisor.cancel(token)
 
     def _finish_async_token(self, token: object) -> None:
-        with self._async_tasks_lock:
-            self._bounded_tasks.pop(token, None)
+        self._task_supervisor.finish_bounded(token)
 
     def _schedule_cancelled_request_cleanup(self, cancelled_tokens: set[object]) -> None:
         if not cancelled_tokens:
             return
 
         def token_done(token: object) -> bool:
-            with self._async_tasks_lock:
-                regular = self._async_tasks.get(token)
-                bounded = self._bounded_tasks.get(token)
-            return (
-                (regular is None or not regular[1].is_alive())
-                and (bounded is None or bounded.done_event.is_set())
-            )
+            return self._task_supervisor.token_done(token)
 
         def poll() -> None:
             if self._closing:
@@ -3198,6 +2697,9 @@ class MainWindow(QMainWindow):
         for token, _signals, _was_selected, _detail_was_visible in self._delete_requests.values():
             self._cancel_async_token(token)
             cancelled_tokens.add(token)
+        bulk_token = self.bulk_image_controller.cancel()
+        if bulk_token is not None:
+            cancelled_tokens.add(bulk_token)
         return cancelled_tokens
 
     def _clear_background_request_state(self) -> None:
@@ -3220,21 +2722,13 @@ class MainWindow(QMainWindow):
         if request is None:
             return True
         token, _signals = request
-        self._cancel_async_token(token)
-        with self._async_tasks_lock:
-            task = self._async_tasks.get(token)
-        if task is None:
-            return True
-        deadline = time.monotonic() + max(timeout, 0.0)
         app = QApplication.instance()
-        while task[1].is_alive() and time.monotonic() < deadline:
-            if process_events and app is not None:
-                app.processEvents()
-            wait_time = min(0.01, max(0.0, deadline - time.monotonic()))
-            if wait_time <= 0:
-                break
-            task[1].join(wait_time)
-        return not task[1].is_alive()
+        pump_events = app.processEvents if process_events and app is not None else None
+        return self._task_supervisor.wait_for_token(
+            token,
+            timeout,
+            pump_events=pump_events,
+        )
 
     def _cancel_and_wait_for_async_tasks(
         self,
@@ -3243,40 +2737,13 @@ class MainWindow(QMainWindow):
         require_bounded: bool = True,
         process_events: bool = True,
     ) -> bool:
-        deadline = time.monotonic() + max(timeout, 0.0)
         app = QApplication.instance()
-        while time.monotonic() < deadline:
-            with self._async_tasks_lock:
-                tasks = list(self._async_tasks.values())
-                bounded_tasks = list(self._bounded_tasks.values())
-            for cancel_event, _thread in tasks:
-                cancel_event.set()
-            for handle in bounded_tasks:
-                handle.cancel()
-            regular_done = all(not thread.is_alive() for _cancel_event, thread in tasks)
-            bounded_done = all(handle.done_event.is_set() for handle in bounded_tasks)
-            if regular_done and (bounded_done or not require_bounded):
-                return True
-            if process_events and app is not None:
-                app.processEvents()
-            for _cancel_event, thread in tasks:
-                if thread.is_alive():
-                    wait_time = min(0.005, max(0.0, deadline - time.monotonic()))
-                    if wait_time <= 0:
-                        break
-                    thread.join(wait_time)
-            for handle in bounded_tasks:
-                if not handle.done_event.is_set():
-                    wait_time = min(0.005, max(0.0, deadline - time.monotonic()))
-                    if wait_time <= 0:
-                        break
-                    handle.wait(wait_time)
-        with self._async_tasks_lock:
-            tasks = list(self._async_tasks.values())
-            bounded_tasks = list(self._bounded_tasks.values())
-        regular_done = all(not thread.is_alive() for _cancel_event, thread in tasks)
-        bounded_done = all(handle.done_event.is_set() for handle in bounded_tasks)
-        return regular_done and (bounded_done or not require_bounded)
+        pump_events = app.processEvents if process_events and app is not None else None
+        return self._task_supervisor.cancel_all_and_wait(
+            timeout,
+            require_bounded=require_bounded,
+            pump_events=pump_events,
+        )
 
     def generate_ai_description(self, item_id: int, *, automatic: bool = False) -> bool:
         return self._start_image_ai_operation(item_id, automatic, operation="ai")
@@ -3294,8 +2761,6 @@ class MainWindow(QMainWindow):
         is_ai = operation == "ai"
         requests = self._ai_requests if is_ai else self._ocr_requests
         automatic_items = self._automatic_ai_items if is_ai else self._automatic_ocr_items
-        result_handler = self._ai_succeeded if is_ai else self._ocr_succeeded
-        failure_handler = self._ai_failed if is_ai else self._ocr_failed
         invalid_title = "AI 描述" if is_ai else "OCR"
         invalid_message = (
             "当前只支持为图片生成 AI 描述。"
@@ -3348,51 +2813,15 @@ class MainWindow(QMainWindow):
                 self.detail.set_ai_busy(True)
             else:
                 self.detail.set_ocr_busy(True)
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        requests[item_id] = (token, signals)
-        if automatic:
-            automatic_items.add(item_id)
-        signals.succeeded.connect(
-            lambda result_item_id, result_text, _unused, request_token=token, request_signals=signals, request_hash=expected_content_hash: result_handler(
-                request_token,
-                request_signals,
-                result_item_id,
-                result_text,
-                request_hash,
-            )
-        )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals, request_item_id=item_id: failure_handler(
-                request_token, request_signals, request_item_id, message
-            )
-        )
-
-        def work(cancel_event: threading.Event) -> None:
-            try:
-                image_snapshot = preflight_image_file(Path(item["path"]))
-                processor = service.describe_image if is_ai else service.ocr_image
-                result_text = processor(
-                    image_snapshot,
-                    cancel_event,
-                    expected_sha256=expected_content_hash,
-                )
-                image_snapshot.require_current()
-                if not cancel_event.is_set():
-                    signals.succeeded.emit(item_id, result_text, None)
-            except OperationCancelled:
-                return
-            except Exception as exc:
-                if not cancel_event.is_set():
-                    signals.failed.emit(str(exc))
-
         try:
-            self._start_bounded_task(token, work, estimated_bytes=self._image_task_estimate(item))
+            self.image_task_controller.start_image_operation(
+                item,
+                service,
+                operation=operation,
+                automatic=automatic,
+                estimated_bytes=self._image_task_estimate(item),
+            )
         except (TaskCapacityExceeded, RuntimeError) as exc:
-            requests.pop(item_id, None)
-            automatic_items.discard(item_id)
-            self._async_signals.discard(signals)
             if self.current_item_id == item_id:
                 if is_ai:
                     self.detail.set_ai_busy(False, failed=True)
@@ -3477,40 +2906,9 @@ class MainWindow(QMainWindow):
         self._cancel_expanded_search_request()
         self.expanded_search_button.setEnabled(False)
         self.expanded_search_button.setText("扩展中…")
-        token = object()
-        signals = AsyncSignals()
-        self._async_signals.add(signals)
-        self._expanded_search_request = (token, signals)
-        signals.succeeded.connect(
-            lambda _item_id, _text, terms, request_token=token, request_signals=signals, request_query=query: self._expanded_search_succeeded(
-                request_token, request_signals, request_query, terms
-            )
-        )
-        signals.failed.connect(
-            lambda message, request_token=token, request_signals=signals: self._expanded_search_failed(
-                request_token, request_signals, message
-            )
-        )
-
-        def work(cancel_event: threading.Event) -> None:
-            try:
-                terms = service.expand_search_query(query, cancel_event)
-                if not cancel_event.is_set():
-                    signals.succeeded.emit(-1, "", terms)
-            except OperationCancelled:
-                return
-            except Exception as exc:
-                if not cancel_event.is_set():
-                    signals.failed.emit(str(exc))
-
         try:
-            self._start_bounded_task(
-                token,
-                work,
-            )
+            self.image_task_controller.start_expanded_search(query, service)
         except (TaskCapacityExceeded, RuntimeError) as exc:
-            self._expanded_search_request = None
-            self._async_signals.discard(signals)
             self.expanded_search_button.setEnabled(True)
             self.expanded_search_button.setText("扩大搜索")
             QMessageBox.warning(self, "扩大搜索暂时不可用", str(exc))
@@ -3556,8 +2954,7 @@ class MainWindow(QMainWindow):
     def _cancel_expanded_search_request(self) -> None:
         if self._expanded_search_request is None:
             return
-        self._cancel_request(self._expanded_search_request)
-        self._expanded_search_request = None
+        self.image_task_controller.cancel_expanded_search()
         if hasattr(self, "expanded_search_button"):
             self.expanded_search_button.setEnabled(True)
             self.expanded_search_button.setText("扩大搜索")
@@ -3709,7 +3106,7 @@ class MainWindow(QMainWindow):
             return max(0.0, deadline - time.monotonic())
 
         def abort(monitoring_was_active: bool) -> bool:
-            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
+            self.shutdown_coordinator.abort_session_end(monitoring_was_active)
             self.backup_timer.start()
             self._quit_in_progress = False
             self.force_quit = False
@@ -3728,8 +3125,7 @@ class MainWindow(QMainWindow):
         self._set_interactions_enabled(False)
         self.search_timer.stop()
         self._cancel_item_search_request()
-        monitoring_was_active = self.clipboard_service.timer.isActive()
-        self.clipboard_service.prepare_for_shutdown()
+        monitoring_was_active = self.shutdown_coordinator.prepare_session_end()
 
         note_updates = self.detail.pending_note_updates()
         if self.detail.current_item is not None:
@@ -3808,9 +3204,7 @@ class MainWindow(QMainWindow):
             return abort(monitoring_was_active)
         self._clear_background_request_state()
 
-        if not self.clipboard_service.wait_for_idle(remaining()):
-            return abort(monitoring_was_active)
-        if not self.clipboard_service.shutdown(timeout=remaining()):
+        if not self.shutdown_coordinator.finish_session_end(remaining()):
             return abort(monitoring_was_active)
 
         return self._finalize_shutdown(
@@ -3826,15 +3220,10 @@ class MainWindow(QMainWindow):
     ) -> bool:
         self._closing = True
         self._async_signals.clear()
-        shutdown_ai_ocr_task_executor(timeout=max(0.0, executor_timeout))
-        if thumbnail_timeout_ms is None:
-            self.grid.shutdown_thumbnail_loader()
-            self.detail.shutdown_thumbnail_loader()
-        else:
-            timeout_ms = max(0, int(thumbnail_timeout_ms))
-            self.grid.shutdown_thumbnail_loader(timeout_ms=timeout_ms)
-            self.detail.shutdown_thumbnail_loader(timeout_ms=timeout_ms)
-        self.database.close()
+        self.shutdown_coordinator.finalize_core(
+            executor_timeout=executor_timeout,
+            thumbnail_timeout_ms=thumbnail_timeout_ms,
+        )
         self.tray.hide()
         application = QApplication.instance()
         if application is not None:
@@ -3922,74 +3311,27 @@ class MainWindow(QMainWindow):
             )
             return False
         self._clear_background_request_state()
-        if not (self.grid.wait_for_thumbnail_idle() and self.detail.wait_for_thumbnail_idle()):
-            self.grid.resume_thumbnail_loader()
-            self.detail.resume_thumbnail_loader()
-            self._quit_in_progress = False
-            self.force_quit = False
-            self._set_interactions_enabled(True)
-            self.backup_timer.start()
-            if self.current_item_id:
-                self.update_detail(self.current_item_id)
-            QMessageBox.warning(
-                self,
-                "ClipSave 正在结束缩略图任务",
-                "图片预览任务尚未结束，ClipSave 已取消退出。请稍后再次退出。",
-            )
-            return False
-        monitoring_was_active = self.clipboard_service.timer.isActive()
-        self.clipboard_service.stop()
-        if not self.clipboard_service.wait_for_idle(10.0):
-            self.grid.resume_thumbnail_loader()
-            self.detail.resume_thumbnail_loader()
-            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
+        shutdown_result = self.shutdown_coordinator.shutdown_interactive_resources()
+        if not shutdown_result.succeeded:
             self.backup_timer.start()
             self._quit_in_progress = False
             self.force_quit = False
             self._set_interactions_enabled(True)
             if self.current_item_id:
                 self.update_detail(self.current_item_id)
-            QMessageBox.warning(
-                self,
-                "ClipSave 正在保存",
-                "仍有剪贴板内容正在写入本地磁盘。为避免数据丢失，ClipSave 暂时不会退出。请稍后再次退出。",
-            )
-            return False
-        try:
-            self.database.create_backup()
-        except Exception as exc:
-            self.grid.resume_thumbnail_loader()
-            self.detail.resume_thumbnail_loader()
-            self.database.recovery_report["backup_error"] = str(exc)
-            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
-            self.backup_timer.start()
-            self._quit_in_progress = False
-            self.force_quit = False
-            self._set_interactions_enabled(True)
-            if self.current_item_id:
-                self.update_detail(self.current_item_id)
-            QMessageBox.warning(
-                self,
-                "数据库备份失败",
-                f"退出前无法创建最新数据库备份，ClipSave 已取消退出。\n\n{exc}",
-            )
-            return False
-        persistence_stopped = self.clipboard_service.shutdown()
-        if not persistence_stopped:
-            self.grid.resume_thumbnail_loader()
-            self.detail.resume_thumbnail_loader()
-            self.clipboard_service.resume_after_failed_shutdown(monitoring_was_active)
-            self.backup_timer.start()
-            self._quit_in_progress = False
-            self.force_quit = False
-            self._set_interactions_enabled(True)
-            if self.current_item_id:
-                self.update_detail(self.current_item_id)
-            QMessageBox.warning(
-                self,
-                "ClipSave 正在保存",
-                "仍有剪贴板内容正在写入本地磁盘。为避免数据丢失，ClipSave 暂时不会退出。请稍后再次退出。",
-            )
+            if shutdown_result.failure is ShutdownFailure.THUMBNAILS:
+                title = "ClipSave 正在结束缩略图任务"
+                message = "图片预览任务尚未结束，ClipSave 已取消退出。请稍后再次退出。"
+            elif shutdown_result.failure is ShutdownFailure.BACKUP:
+                title = "数据库备份失败"
+                message = (
+                    "退出前无法创建最新数据库备份，ClipSave 已取消退出。"
+                    f"\n\n{shutdown_result.error}"
+                )
+            else:
+                title = "ClipSave 正在保存"
+                message = "仍有剪贴板内容正在写入本地磁盘。为避免数据丢失，ClipSave 暂时不会退出。请稍后再次退出。"
+            QMessageBox.warning(self, title, message)
             return False
         return self._finalize_shutdown(executor_timeout=2.0)
 

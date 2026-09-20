@@ -21,11 +21,7 @@ from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
 
 import clipsave_app.services as services_module
-from clipsave_app.constants import (
-    MAX_AI_RESPONSE_BYTES,
-    MAX_CLIPBOARD_IMAGE_BYTES,
-    MAX_CLIPBOARD_TEXT_BYTES,
-)
+from clipsave_app.constants import MAX_CLIPBOARD_IMAGE_BYTES, MAX_CLIPBOARD_TEXT_BYTES
 from clipsave_app.database import LibraryDatabase
 from clipsave_app.services import (
     AIService,
@@ -137,6 +133,9 @@ class ClipboardServiceTests(unittest.TestCase):
         self.database.close()
         self.temp.cleanup()
 
+    def test_constructor_does_not_start_persistence_worker(self):
+        self.assertIsNone(self.service._worker)
+
     def test_image_key_uses_stable_pixel_content(self):
         image = QImage(32, 24, QImage.Format.Format_RGBA8888)
         image.fill(QColor("#21a8fb"))
@@ -219,7 +218,9 @@ class ClipboardServiceTests(unittest.TestCase):
         self.assertEqual(self.service.last_clipboard_sequence, 17)
 
     def test_shutdown_fully_joins_worker_in_bounded_slices(self):
+        self.service._ensure_worker_started()
         worker = self.service._worker
+        self.assertIsNotNone(worker)
         with patch.object(worker, "join", wraps=worker.join) as join:
             self.assertTrue(self.service.shutdown(timeout=0.1))
 
@@ -230,7 +231,9 @@ class ClipboardServiceTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
 
     def test_failed_shutdown_can_restart_worker_and_accept_tasks(self):
+        self.service._ensure_worker_started()
         original_worker = self.service._worker
+        self.assertIsNotNone(original_worker)
 
         self.assertFalse(self.service.shutdown(timeout=0.0))
         original_worker.join(1)

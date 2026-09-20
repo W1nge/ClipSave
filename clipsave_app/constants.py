@@ -4,6 +4,8 @@ import ctypes
 from ctypes import wintypes
 from pathlib import Path
 
+from .app_paths import AppPaths
+
 
 def _windows_local_appdata() -> Path:
     buffer = ctypes.create_unicode_buffer(32768)
@@ -43,17 +45,18 @@ APP_NAME = "ClipSave"
 APP_VERSION = "1.1.2"
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
 LOCAL_ROOT = _configured_local_root()
-DATA_DIR = LOCAL_ROOT / "Data"
-LIBRARY_DIR = LOCAL_ROOT / "Library"
-PICTURE_DIR = LIBRARY_DIR / "Pictures"
-MARKDOWN_DIR = LIBRARY_DIR / "Markdown"
-LEGACY_DATA_DIR = BASE_DIR / "data"
-LEGACY_PICTURE_DIR = BASE_DIR / "Picture"
-LEGACY_MARKDOWN_DIR = BASE_DIR / "Markdown"
-THUMB_DIR = DATA_DIR / "thumbnails"
-DATABASE_PATH = DATA_DIR / "clipsave.db"
-SETTINGS_PATH = DATA_DIR / "settings.json"
-MAINTENANCE_DIR = DATA_DIR / "maintenance"
+APP_PATHS = AppPaths.build(base_dir=BASE_DIR, local_root=LOCAL_ROOT)
+DATA_DIR = APP_PATHS.data_dir
+LIBRARY_DIR = APP_PATHS.library_dir
+PICTURE_DIR = APP_PATHS.picture_dir
+MARKDOWN_DIR = APP_PATHS.markdown_dir
+LEGACY_DATA_DIR = APP_PATHS.legacy_data_dir
+LEGACY_PICTURE_DIR = APP_PATHS.legacy_picture_dir
+LEGACY_MARKDOWN_DIR = APP_PATHS.legacy_markdown_dir
+THUMB_DIR = APP_PATHS.thumb_dir
+DATABASE_PATH = APP_PATHS.database_path
+SETTINGS_PATH = APP_PATHS.settings_path
+MAINTENANCE_DIR = APP_PATHS.maintenance_dir
 INSTANCE_SERVER = "ClipSave.Desktop.Instance.v2"
 MAX_IMPORT_BYTES = 250 * 1024 * 1024
 MAX_MARKDOWN_BYTES = 20 * 1024 * 1024

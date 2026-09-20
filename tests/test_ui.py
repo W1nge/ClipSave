@@ -2342,7 +2342,6 @@ class MainWindowTests(unittest.TestCase):
         item_id = self.window.current_items[0]["id"]
         ai_request = (object(), AsyncSignals())
         ocr_request = (object(), AsyncSignals())
-        expected_hash = self.database.get_item(item_id)["content_hash"]
         self.window._ai_requests[item_id] = ai_request
         self.window._ocr_requests[item_id] = ocr_request
         with patch.object(self.window, "_cancel_and_wait_for_async_tasks", return_value=False), patch.object(

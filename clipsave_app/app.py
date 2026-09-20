@@ -15,10 +15,9 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtNetwork import QAbstractSocket, QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from .constants import APP_NAME, INSTANCE_SERVER
-from .database import LibraryDatabase
+from .constants import APP_NAME, APP_PATHS, INSTANCE_SERVER
 from .main_window import MainWindow
-from .settings import Settings
+from .runtime import ApplicationRuntime
 from .storage import ensure_storage_directories, migrate_legacy_layout
 from .startup import set_start_with_windows
 
@@ -498,24 +497,34 @@ def main() -> int:
         QMessageBox.critical(None, "ClipSave 无法启动", str(exc))
         return 1
     try:
-        database = LibraryDatabase()
+        runtime = ApplicationRuntime.create(APP_PATHS)
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         QMessageBox.critical(None, "ClipSave 无法启动", str(exc))
         return 1
-    settings = Settings()
+    database = runtime.database
+    settings = runtime.settings
     startup_error = None
     if smoke_profile_path is None:
         try:
             set_start_with_windows(bool(settings.get("start_with_windows", False)))
         except OSError as exc:
             startup_error = str(exc)
-    window = MainWindow(
-        database,
-        settings,
-        icon,
-        scan_on_start=_should_scan_library(migration_result, database),
-        reconcile_on_start=True,
-    )
+    try:
+        window = MainWindow(
+            database,
+            settings,
+            icon,
+            scan_on_start=_should_scan_library(migration_result, database),
+            reconcile_on_start=True,
+            paths=APP_PATHS,
+            clipboard_service=runtime.clipboard_service,
+            runtime=runtime,
+        )
+    except Exception as exc:
+        runtime.close(timeout=2.0)
+        single.close()
+        QMessageBox.critical(None, "ClipSave 无法启动", str(exc))
+        return 1
     window_holder.append(window)
     app.commitDataRequest.connect(
         lambda manager: _commit_session_data(window, manager)
@@ -644,5 +653,7 @@ def main() -> int:
         sys.excepthook = original_excepthook
     if registered:
         _windows_hotkey_api().UnregisterHotKey(None, GLOBAL_HOTKEY_ID)
+    if not runtime.close(timeout=2.0):
+        exit_code = exit_code or 1
     single.close()
     return exit_code

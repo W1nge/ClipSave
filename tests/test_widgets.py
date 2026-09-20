@@ -25,7 +25,6 @@ from PySide6.QtGui import QColor, QEnterEvent, QImage, QPainter, QPixmap, QTextD
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
-    QDialog,
     QFrame,
     QLabel,
     QProxyStyle,

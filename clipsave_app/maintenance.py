@@ -13,7 +13,6 @@ from send2trash import send2trash
 from .constants import LIBRARY_DIR, MAINTENANCE_DIR
 from .database import LibraryDatabase
 from .storage import delete_managed_file, is_under_local_store, iter_safe_files, recycle_managed_file
-from .storage import open_managed_binary
 
 
 CONFIRMATION_PHRASE = "DELETE_INDEXED_DUPLICATES"
@@ -205,58 +204,42 @@ def clean_indexed_duplicates(
             if digest != record.get("sha256"):
                 result["skipped"] += 1
                 continue
-            with database._lock:
-                indexed = database.indexed_file_for_hash(digest)
+            with database.hold_verified_indexed_file(digest, library_root) as indexed:
                 if indexed is None:
                     result["skipped"] += 1
                     continue
-                indexed_path = Path(indexed["path"])
+                indexed_path = indexed.path
                 if (
                     not is_under_local_store(indexed_path)
                     or _path_key(indexed_path) == _path_key(path)
                 ):
                     result["skipped"] += 1
                     continue
-                with open_managed_binary(
-                    indexed_path, "rb", library_root, identity_locked=True
-                ) as keeper:
-                    keeper_stat = os.fstat(keeper.fileno())
-                    if LibraryDatabase._stream_hash(keeper) != digest:
-                        result["skipped"] += 1
-                        continue
-                    current_indexed = database.indexed_file_for_hash(digest)
-                    if (
-                        current_indexed is None
-                        or current_indexed["id"] != indexed["id"]
-                        or _path_key(current_indexed["path"]) != _path_key(indexed_path)
-                    ):
-                        result["skipped"] += 1
-                        continue
-                    final_stat = path.stat()
-                    if (
-                        keeper_stat.st_size != record["size"]
-                        or not is_under_local_store(path)
-                        or final_stat.st_size != stat.st_size
-                        or final_stat.st_mtime_ns != stat.st_mtime_ns
-                        or getattr(final_stat, "st_ino", None) != getattr(stat, "st_ino", None)
-                    ):
-                        result["skipped"] += 1
-                        continue
-                    if permanent:
-                        delete_managed_file(
-                            path,
-                            library_root,
-                            expected_sha256=digest,
-                            expected_size=stat.st_size,
-                        )
-                    else:
-                        recycle_managed_file(
-                            path,
-                            library_root,
-                            send2trash,
-                            expected_sha256=digest,
-                            expected_size=stat.st_size,
-                        )
+                final_stat = path.stat()
+                if (
+                    indexed.size_bytes != record["size"]
+                    or not is_under_local_store(path)
+                    or final_stat.st_size != stat.st_size
+                    or final_stat.st_mtime_ns != stat.st_mtime_ns
+                    or getattr(final_stat, "st_ino", None) != getattr(stat, "st_ino", None)
+                ):
+                    result["skipped"] += 1
+                    continue
+                if permanent:
+                    delete_managed_file(
+                        path,
+                        library_root,
+                        expected_sha256=digest,
+                        expected_size=stat.st_size,
+                    )
+                else:
+                    recycle_managed_file(
+                        path,
+                        library_root,
+                        send2trash,
+                        expected_sha256=digest,
+                        expected_size=stat.st_size,
+                    )
             result["deleted"] += 1
             result["deleted_bytes"] += stat.st_size
         except Exception as exc:
