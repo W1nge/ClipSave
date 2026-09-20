@@ -12,9 +12,9 @@ from PySide6.QtWidgets import (
     QTableView,
 )
 
-from .item_gestures import _ItemRightClickGesture, _ItemTripleClickGesture
+from .item_gestures import ItemRightClickGesture, ItemTripleClickGesture
 from .item_models import AssetItemModel
-from .ui_primitives import AutoHideScrollBar, _WheelRemainder, _half_speed_wheel_event
+from .ui_primitives import AutoHideScrollBar, WheelRemainder, half_speed_wheel_event
 
 
 class _AssetTableFavoriteDelegate(QStyledItemDelegate):
@@ -99,16 +99,16 @@ class AssetTable(QTableView):
         self.doubleClicked.connect(self._index_activated)
         self.selected_id: int | None = None
         self._suppress_selection_signal = False
-        self._wheel_remainder = _WheelRemainder()
+        self._wheel_remainder = WheelRemainder()
         self._favorite_press_row = -1
-        self._right_click = _ItemRightClickGesture(self)
-        self._left_click = _ItemTripleClickGesture(self)
+        self._right_click = ItemRightClickGesture(self)
+        self._left_click = ItemTripleClickGesture(self)
         self._layout_updates_suspended = False
         self._content_column_resize_mode = None
         self._content_column_width = 0
 
     def wheelEvent(self, event) -> None:
-        scaled_event = _half_speed_wheel_event(event, self._wheel_remainder)
+        scaled_event = half_speed_wheel_event(event, self._wheel_remainder)
         super().wheelEvent(scaled_event)
         event.setAccepted(scaled_event.isAccepted())
 

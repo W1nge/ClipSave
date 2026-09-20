@@ -7,7 +7,7 @@ from pathlib import Path
 from . import storage
 
 
-class _SQLiteLeafLock:
+class SQLiteLeafLock:
     """Hold a managed database leaf stable while SQLite opens it by path."""
 
     def __init__(
@@ -38,7 +38,7 @@ class _SQLiteLeafLock:
         create: bool,
         writable: bool,
         replaceable: bool = False,
-    ) -> "_SQLiteLeafLock":
+    ) -> "SQLiteLeafLock":
         candidate = Path(os.path.abspath(path))
         root = Path(os.path.abspath(managed_root))
         if replaceable and writable:
@@ -203,4 +203,7 @@ class _SQLiteLeafLock:
                 self.path.unlink()
             except OSError:
                 pass
+
+
+_SQLiteLeafLock = SQLiteLeafLock
 

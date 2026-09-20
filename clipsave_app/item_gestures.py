@@ -4,7 +4,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 
-class _ItemRightClickGesture:
+class ItemRightClickGesture:
     """Emit detail for one right click on any library item."""
 
     def __init__(self, view) -> None:
@@ -27,7 +27,7 @@ class _ItemRightClickGesture:
         self._pressed_id = None
         self.view.detail_requested.emit(item_id)
 
-class _ItemTripleClickGesture:
+class ItemTripleClickGesture:
     """Keep double-click immediate while recognizing a following third click."""
 
     def __init__(self, view) -> None:
@@ -75,4 +75,8 @@ class _ItemTripleClickGesture:
     def _clear_pending(self) -> None:
         self._pending_id = None
         self._timer.stop()
+
+
+_ItemRightClickGesture = ItemRightClickGesture
+_ItemTripleClickGesture = ItemTripleClickGesture
 

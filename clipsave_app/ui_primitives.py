@@ -112,7 +112,7 @@ _TEXT_MENU_ACTION_ICONS = {
 }
 
 
-class _ThemedTextContextMenuMixin:
+class ThemedTextContextMenuMixin:
     def _create_themed_context_menu(self) -> QMenu:
         menu = self.createStandardContextMenu()
         menu.setObjectName("TextContextMenu")
@@ -132,11 +132,11 @@ class _ThemedTextContextMenuMixin:
         event.accept()
 
 
-class ThemedLineEdit(_ThemedTextContextMenuMixin, QLineEdit):
+class ThemedLineEdit(ThemedTextContextMenuMixin, QLineEdit):
     pass
 
 
-class ThemedTextEdit(_ThemedTextContextMenuMixin, QTextEdit):
+class ThemedTextEdit(ThemedTextContextMenuMixin, QTextEdit):
     pass
 
 
@@ -578,17 +578,17 @@ class AutoHideScrollBar(QScrollBar):
 
 
 @dataclass
-class _WheelRemainder:
+class WheelRemainder:
     pixel_x: float = 0.0
     pixel_y: float = 0.0
     angle_x: float = 0.0
     angle_y: float = 0.0
 
 
-def _half_speed_wheel_event(
-    event: QWheelEvent, remainder: _WheelRemainder | None = None
+def half_speed_wheel_event(
+    event: QWheelEvent, remainder: WheelRemainder | None = None
 ) -> QWheelEvent:
-    remainder = remainder or _WheelRemainder()
+    remainder = remainder or WheelRemainder()
     pixel_delta = event.pixelDelta()
     angle_delta = event.angleDelta()
     pixel_x = pixel_delta.x() / 2 + remainder.pixel_x
@@ -613,6 +613,11 @@ def _half_speed_wheel_event(
         event.source(),
         event.device(),
     )
+
+
+_ThemedTextContextMenuMixin = ThemedTextContextMenuMixin
+_WheelRemainder = WheelRemainder
+_half_speed_wheel_event = half_speed_wheel_event
 
 
 class WindowTitleBar(QFrame):

@@ -46,8 +46,11 @@ from .database_schema import (
 )
 from .import_staging import prepare_import
 from .library_models import CollectionSummary, LibraryItem, TagSummary
-from .sqlite_leaf_lock import _SQLiteLeafLock as _SQLiteLeafLock
+from .sqlite_leaf_lock import SQLiteLeafLock
 from .storage import is_under_local_store
+
+
+_SQLiteLeafLock = SQLiteLeafLock
 
 
 class ImportFileResult(Enum):
@@ -95,8 +98,8 @@ class LibraryDatabase:
         self._lock = threading.RLock()
         self._mutation_generation = 0
         self._recovery = DatabaseRecoveryManager(self)
-        self._database_leaf_lock: _SQLiteLeafLock | None = None
-        self._sidecar_leaf_locks: list[_SQLiteLeafLock] = []
+        self._database_leaf_lock: SQLiteLeafLock | None = None
+        self._sidecar_leaf_locks: list[SQLiteLeafLock] = []
         self.last_scan_report = {
             "scanned": 0,
             "added": 0,
@@ -178,19 +181,19 @@ class LibraryDatabase:
     def _open_connection(self) -> sqlite3.Connection:
         with storage.hold_managed_directory(self.path.parent):
             storage.validate_managed_write_path(self.path, self.path.parent)
-            leaf_lock = _SQLiteLeafLock.acquire(
+            leaf_lock = SQLiteLeafLock.acquire(
                 self.path,
                 self.path.parent,
                 create=not self.path.exists(),
                 writable=True,
             )
-            sidecar_locks: list[_SQLiteLeafLock] = []
+            sidecar_locks: list[SQLiteLeafLock] = []
             connection = None
             try:
                 leaf_lock.verify()
                 for sidecar in (Path(f"{self.path}-wal"), Path(f"{self.path}-shm")):
                     sidecar_locks.append(
-                        _SQLiteLeafLock.acquire(
+                        SQLiteLeafLock.acquire(
                             sidecar,
                             self.path.parent,
                             create=not sidecar.exists(),
@@ -242,9 +245,9 @@ class LibraryDatabase:
     @contextmanager
     def _hold_atomic_replace_source(
         path: Path, managed_root: Path
-    ) -> Iterator[_SQLiteLeafLock]:
+    ) -> Iterator[SQLiteLeafLock]:
         """Keep a validated source identity open while allowing its atomic rename."""
-        lock = _SQLiteLeafLock.acquire(
+        lock = SQLiteLeafLock.acquire(
             path,
             managed_root,
             create=False,

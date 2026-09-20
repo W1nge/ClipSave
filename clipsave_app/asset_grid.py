@@ -32,7 +32,7 @@ from .asset_grid_transition import (
     _GridTransitionCard,
     _grid_transition_card_elevated,
 )
-from .item_gestures import _ItemRightClickGesture, _ItemTripleClickGesture
+from .item_gestures import ItemRightClickGesture, ItemTripleClickGesture
 from .item_models import AssetItemModel
 from .sidebar import Sidebar
 from .thumbnail_service import (
@@ -43,8 +43,8 @@ from .thumbnail_service import (
 )
 from .ui_primitives import (
     AutoHideScrollBar,
-    _WheelRemainder,
-    _half_speed_wheel_event,
+    WheelRemainder,
+    half_speed_wheel_event,
     dark_theme_active,
 )
 
@@ -110,9 +110,9 @@ class AssetGrid(QListView):
         self._thumbnail_refresh_timer.timeout.connect(self._refresh_thumbnail_generation)
         self._favorite_press_row = -1
         self._suppress_selection_signal = False
-        self._wheel_remainder = _WheelRemainder()
-        self._right_click = _ItemRightClickGesture(self)
-        self._left_click = _ItemTripleClickGesture(self)
+        self._wheel_remainder = WheelRemainder()
+        self._right_click = ItemRightClickGesture(self)
+        self._left_click = ItemTripleClickGesture(self)
         self.selectionModel().currentChanged.connect(self._index_selected)
         self.selectionModel().selectionChanged.connect(self._selection_changed)
         self.doubleClicked.connect(self._index_activated)
@@ -148,7 +148,7 @@ class AssetGrid(QListView):
         self._thumbnail_refresh_timer.start()
 
     def wheelEvent(self, event) -> None:
-        scaled_event = _half_speed_wheel_event(event, self._wheel_remainder)
+        scaled_event = half_speed_wheel_event(event, self._wheel_remainder)
         super().wheelEvent(scaled_event)
         event.setAccepted(scaled_event.isAccepted())
 

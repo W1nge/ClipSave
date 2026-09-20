@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .item_models import TYPE_LABELS, format_local_timestamp, human_size, normalized_thumbnail_path
-from .markdown_view import _SafeMarkdownBrowser, _set_markdown_content
+from .markdown_view import SafeMarkdownBrowser, set_markdown_content
 from .thumbnail_service import (
     ThumbnailDecodeQueue,
     _ThumbnailCacheKey,
@@ -176,7 +176,7 @@ class DetailPanel(QScrollArea):
         self.image_preview.setMinimumWidth(0)
         self.image_preview.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.image_preview.setObjectName("DetailPreview")
-        self.text_preview = _SafeMarkdownBrowser()
+        self.text_preview = SafeMarkdownBrowser()
         self.text_preview.setOpenExternalLinks(False)
         self.text_preview.setMinimumHeight(190)
         self.preview_stack.addWidget(self.image_preview)
@@ -393,7 +393,7 @@ class DetailPanel(QScrollArea):
                 self._thumbnail_loader.request(key, self._thumbnail_generation)
         else:
             if item["kind"] == "markdown":
-                _set_markdown_content(self.text_preview, item["content"])
+                set_markdown_content(self.text_preview, item["content"])
             else:
                 self.text_preview.setPlainText(item["content"])
             self.preview_stack.setCurrentWidget(self.text_preview)

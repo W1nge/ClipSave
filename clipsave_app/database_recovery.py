@@ -15,7 +15,7 @@ from typing import BinaryIO, Callable
 
 from . import storage
 from .database_schema import InvalidDatabaseSchema, validate_connection_schema
-from .sqlite_leaf_lock import _SQLiteLeafLock
+from .sqlite_leaf_lock import SQLiteLeafLock
 
 
 class BackupValidation(Enum):
@@ -82,7 +82,7 @@ def quick_check(
     leaf_lock = None
     try:
         with storage.hold_managed_directory(path.parent):
-            leaf_lock = _SQLiteLeafLock.acquire(
+            leaf_lock = SQLiteLeafLock.acquire(
                 path, path.parent, create=False, writable=False
             )
             leaf_lock.verify()
@@ -160,7 +160,7 @@ def backup_validation_state(
 
 def read_schema_version_read_only(path: Path, *, busy_timeout_ms: int) -> int:
     connection = None
-    leaf_lock = _SQLiteLeafLock.acquire(
+    leaf_lock = SQLiteLeafLock.acquire(
         path,
         path.parent,
         create=False,
@@ -471,7 +471,7 @@ class DatabaseRecoveryManager:
             storage.validate_managed_write_path(temporary, db.backup_dir)
             storage.validate_managed_write_path(target, db.backup_dir)
             with storage.hold_managed_directory(db.backup_dir, db.path.parent):
-                destination_lock = _SQLiteLeafLock.acquire(
+                destination_lock = SQLiteLeafLock.acquire(
                     temporary,
                     db.backup_dir,
                     create=True,

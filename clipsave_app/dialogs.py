@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .markdown_view import _SafeMarkdownBrowser, _set_markdown_content
+from .markdown_view import SafeMarkdownBrowser, set_markdown_content
 from .ui_primitives import (
     AutoHideScrollBar,
     DialogTitleBar,
@@ -76,10 +76,10 @@ class MarkdownDialog(QDialog):
             external.clicked.connect(lambda: _startfile_or_warn(self, path))
             top.addWidget(external)
             layout.addLayout(top)
-        browser = _SafeMarkdownBrowser()
+        browser = SafeMarkdownBrowser()
         browser.setObjectName("MarkdownBrowser")
         browser.setOpenExternalLinks(False)
-        _set_markdown_content(browser, content)
+        set_markdown_content(browser, content)
         self.browser = browser
         layout.addWidget(browser)
         root.addWidget(content_widget, 1)
@@ -106,7 +106,7 @@ class TextDialog(QDialog):
         content_widget.setObjectName("DialogContent")
         layout = QVBoxLayout(content_widget)
         layout.setContentsMargins(18, 14, 18, 18)
-        browser = _SafeMarkdownBrowser()
+        browser = SafeMarkdownBrowser()
         browser.setObjectName("MarkdownBrowser")
         browser.setOpenExternalLinks(False)
         browser.setPlainText(content)

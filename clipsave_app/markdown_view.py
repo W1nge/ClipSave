@@ -3,10 +3,10 @@ from __future__ import annotations
 from PySide6.QtCore import QByteArray, QUrl, Qt
 from PySide6.QtWidgets import QTextBrowser, QTextEdit
 
-from .ui_primitives import _ThemedTextContextMenuMixin
+from .ui_primitives import ThemedTextContextMenuMixin
 
 
-class _SafeMarkdownBrowser(_ThemedTextContextMenuMixin, QTextBrowser):
+class SafeMarkdownBrowser(ThemedTextContextMenuMixin, QTextBrowser):
     _ALLOWED_RESOURCE_SCHEMES = {"qrc"}
 
     def __init__(self, parent=None):
@@ -28,8 +28,12 @@ class _SafeMarkdownBrowser(_ThemedTextContextMenuMixin, QTextBrowser):
 MAX_RICH_MARKDOWN_BYTES = 2 * 1024 * 1024
 
 
-def _set_markdown_content(browser: QTextBrowser, content: str) -> None:
+def set_markdown_content(browser: QTextBrowser, content: str) -> None:
     if len(content.encode("utf-8")) > MAX_RICH_MARKDOWN_BYTES:
         browser.setPlainText(content)
     else:
         browser.setMarkdown(content)
+
+
+_SafeMarkdownBrowser = SafeMarkdownBrowser
+_set_markdown_content = set_markdown_content
