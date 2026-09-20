@@ -15,10 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable
 
-from .database_files import (
-    archive_identical_database,
-    copy_database_snapshot,
-    rebind_migrated_paths,
+from .database_files import copy_database_snapshot
+
+from .storage_migration import (
+    StorageMigrationOps,
+    StorageMigrationPaths,
+    migrate_legacy_layout as _run_storage_migration,
 )
 
 from .constants import (
@@ -884,123 +886,11 @@ def _copy_or_move_contents(source: Path, target: Path) -> int:
 
 def _copy_legacy_database_snapshot(source: Path, destination: Path) -> None:
     validate_managed_write_path(destination, destination.parent)
-    temporary = destination.with_name(f".{destination.name}.migration-{uuid.uuid4().hex}.tmp")
+    temporary = destination.with_name(
+        f".{destination.name}.migration-{uuid.uuid4().hex}.tmp"
+    )
     validate_managed_write_path(temporary, destination.parent)
     copy_database_snapshot(source, destination, temporary)
-
-
-def _archive_identical_legacy_database(legacy_database: Path, active_database: Path) -> None:
-    archive_identical_database(legacy_database, active_database)
-
-
-def _managed_files_identical(
-    source: Path, destination: Path, source_root: Path, destination_root: Path
-) -> bool:
-    try:
-        with open_managed_binary(
-            source, "rb", source_root, identity_locked=True
-        ) as source_handle, open_managed_binary(
-            destination, "rb", destination_root, identity_locked=True
-        ) as destination_handle:
-            source_stat = os.fstat(source_handle.fileno())
-            destination_stat = os.fstat(destination_handle.fileno())
-            if source_stat.st_size != destination_stat.st_size:
-                return False
-            source_digest = hashlib.sha256()
-            destination_digest = hashlib.sha256()
-            while chunk := source_handle.read(1024 * 1024):
-                source_digest.update(chunk)
-            while chunk := destination_handle.read(1024 * 1024):
-                destination_digest.update(chunk)
-            return source_digest.digest() == destination_digest.digest()
-    except (OSError, RuntimeError):
-        return False
-
-
-def _copy_library_file_without_delete(
-    source: Path, destination: Path, source_root: Path, destination_root: Path
-) -> bool:
-    if _is_link_or_junction(source) or _is_link_or_junction(destination):
-        return False
-    if destination.exists():
-        return _managed_files_identical(source, destination, source_root, destination_root)
-    created_destination = False
-    copied_digest = hashlib.sha256()
-    copied_size = 0
-    try:
-        with open_managed_binary(
-            source, "rb", source_root, identity_locked=True
-        ) as source_handle, open_managed_binary(
-            destination, "xb", destination_root
-        ) as destination_handle:
-            created_destination = True
-            source_stat = os.fstat(source_handle.fileno())
-            if not stat.S_ISREG(source_stat.st_mode):
-                raise RuntimeError(f"Migration source is not a regular file: {source}")
-            while chunk := source_handle.read(1024 * 1024):
-                destination_handle.write(chunk)
-                copied_digest.update(chunk)
-                copied_size += len(chunk)
-            destination_handle.flush()
-            os.fsync(destination_handle.fileno())
-        return _managed_files_identical(source, destination, source_root, destination_root)
-    except (FileExistsError, OSError, RuntimeError):
-        if created_destination:
-            try:
-                delete_managed_file(
-                    destination,
-                    destination_root,
-                    expected_sha256=copied_digest.hexdigest(),
-                    expected_size=copied_size,
-                )
-            except (OSError, RuntimeError):
-                pass
-        return False
-
-
-def _copy_library_contents_for_migration(
-    source: Path,
-    target: Path,
-    source_root: Path,
-    target_root: Path,
-    moves: list[tuple[Path, Path]],
-) -> None:
-    if _is_link_or_junction(source) or _is_link_or_junction(target) or _paths_overlap(source, target):
-        return
-    if not source.exists() or not source.is_dir():
-        return
-    if target.exists() and not target.is_dir():
-        return
-    target.mkdir(parents=True, exist_ok=True)
-    if _is_link_or_junction(target):
-        return
-    try:
-        children = list(source.iterdir())
-    except OSError:
-        return
-    for child in children:
-        if _is_link_or_junction(child):
-            continue
-        destination = target / child.name
-        if child.is_dir():
-            _copy_library_contents_for_migration(
-                child, destination, source_root, target_root, moves
-            )
-            continue
-        if not child.is_file() or _is_link_or_junction(destination):
-            continue
-        if destination.exists() and not _managed_files_identical(
-            child, destination, source_root, target_root
-        ):
-            stem, suffix = child.stem, child.suffix
-            index = 2
-            while destination.exists():
-                destination = target / f"{stem} (migrated {index}){suffix}"
-                index += 1
-        if _copy_library_file_without_delete(
-            child, destination, source_root, target_root
-        ):
-            moves.append((child, destination))
 
 
 def _path_key(path: Path | str) -> str:
@@ -1008,86 +898,29 @@ def _path_key(path: Path | str) -> str:
     return os.path.normcase(os.path.normpath(str(value)))
 
 
-def _rebind_migrated_database_paths(
-    database_path: Path, moves: list[tuple[Path, Path]]
-) -> int:
-    return rebind_migrated_paths(database_path, moves)
-
-
-def _remove_empty_migration_directories(path: Path) -> None:
-    if not path.exists() or not path.is_dir() or _is_link_or_junction(path):
-        return
-    try:
-        children = list(path.iterdir())
-    except OSError:
-        return
-    for child in children:
-        if child.is_dir() and not _is_link_or_junction(child):
-            _remove_empty_migration_directories(child)
-    try:
-        path.rmdir()
-    except OSError:
-        pass
-
-
-def _finalize_library_migration(
-    moves: list[tuple[Path, Path]], source_root: Path, destination_root: Path
-) -> None:
-    for source, destination in moves:
-        try:
-            _delete_source_if_identical(source, destination, source_root, destination_root)
-        except (OSError, RuntimeError):
-            pass
-    _remove_empty_migration_directories(source_root)
-
-
 def migrate_legacy_layout() -> dict[str, int]:
-    """Move the first-generation local store out of the install directory.
-
-    Database snapshots include committed WAL content. Library files are copied
-    first, rebound to their existing database rows, and only then removed from
-    the legacy directory.
-    """
-    result = {"pictures": 0, "markdown": 0, "data": 0}
-    if _is_link_or_junction(LIBRARY_DIR) or _is_link_or_junction(DATA_DIR):
-        return result
-    LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if _is_link_or_junction(LIBRARY_DIR) or _is_link_or_junction(DATA_DIR):
-        return result
-    legacy_database = LEGACY_DATA_DIR / "clipsave.db"
-    active_database = DATA_DIR / "clipsave.db"
-    if legacy_database.is_file() and not active_database.exists():
-        _copy_legacy_database_snapshot(legacy_database, active_database)
-    if legacy_database.is_file() and active_database.is_file():
-        _archive_identical_legacy_database(legacy_database, active_database)
-    picture_moves: list[tuple[Path, Path]] = []
-    markdown_moves: list[tuple[Path, Path]] = []
-    _copy_library_contents_for_migration(
-        LEGACY_PICTURE_DIR, PICTURE_DIR, LEGACY_PICTURE_DIR, PICTURE_DIR, picture_moves
+    return _run_storage_migration(
+        StorageMigrationPaths(
+            base_dir=BASE_DIR,
+            legacy_data_dir=LEGACY_DATA_DIR,
+            legacy_picture_dir=LEGACY_PICTURE_DIR,
+            legacy_markdown_dir=LEGACY_MARKDOWN_DIR,
+            data_dir=DATA_DIR,
+            library_dir=LIBRARY_DIR,
+            picture_dir=PICTURE_DIR,
+            markdown_dir=MARKDOWN_DIR,
+        ),
+        StorageMigrationOps(
+            is_link_or_junction=_is_link_or_junction,
+            paths_overlap=_paths_overlap,
+            open_managed_binary=open_managed_binary,
+            delete_managed_file=delete_managed_file,
+            delete_source_if_identical=_delete_source_if_identical,
+            copy_verify_delete_file=_copy_verify_delete_file,
+            copy_or_move_contents=_copy_or_move_contents,
+            copy_legacy_database_snapshot=_copy_legacy_database_snapshot,
+        ),
     )
-    _copy_library_contents_for_migration(
-        LEGACY_MARKDOWN_DIR, MARKDOWN_DIR, LEGACY_MARKDOWN_DIR, MARKDOWN_DIR, markdown_moves
-    )
-    all_library_moves = picture_moves + markdown_moves
-    _rebind_migrated_database_paths(active_database, all_library_moves)
-    _finalize_library_migration(picture_moves, LEGACY_PICTURE_DIR, PICTURE_DIR)
-    _finalize_library_migration(markdown_moves, LEGACY_MARKDOWN_DIR, MARKDOWN_DIR)
-    result["pictures"] = len(picture_moves)
-    result["markdown"] = len(markdown_moves)
-    result["data"] = _copy_or_move_contents(LEGACY_DATA_DIR, DATA_DIR)
-    legacy_history = BASE_DIR / "clipsave_history.json"
-    history_target = DATA_DIR / legacy_history.name
-    if (
-        legacy_history.exists()
-        and not _is_link_or_junction(legacy_history)
-        and not _is_link_or_junction(history_target)
-        and not _paths_overlap(legacy_history, history_target)
-        and not history_target.exists()
-    ):
-        if _copy_verify_delete_file(legacy_history, history_target, BASE_DIR, DATA_DIR):
-            result["data"] += 1
-    return result
 
 
 def validate_storage_layout() -> None:
