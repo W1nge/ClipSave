@@ -632,10 +632,10 @@ class MainWindowTests(unittest.TestCase):
         ), patch(
             "clipsave_app.main_window.synchronize_maximized_work_area"
         ) as synchronize:
-            self.window._maximized_bounds_sync_pending = True
+            self.window.native_window_controller.maximized_bounds_sync_pending = True
             self.window._synchronize_maximized_bounds()
 
-        self.assertFalse(self.window._maximized_bounds_sync_pending)
+        self.assertFalse(self.window.native_window_controller.maximized_bounds_sync_pending)
         synchronize.assert_called_once_with(int(self.window.winId()))
 
     def test_toggle_maximized_uses_native_restore_for_aero_snap(self):
@@ -672,13 +672,13 @@ class MainWindowTests(unittest.TestCase):
         ), patch(
             "clipsave_app.main_window.apply_windows_backdrop", side_effect=[failed, applied]
         ) as backdrop:
-            self.window._native_backdrop_hwnd = None
+            self.window.window_effects_controller.native_backdrop_hwnd = None
             self.window._apply_native_backdrop()
             self.window._apply_native_backdrop()
 
         self.assertEqual(backdrop.call_count, 2)
-        self.assertEqual(self.window._native_backdrop_hwnd, 123)
-        self.assertEqual(self.window._native_backdrop_result, applied)
+        self.assertEqual(self.window.window_effects_controller.native_backdrop_hwnd, 123)
+        self.assertEqual(self.window.window_effects_controller.native_backdrop_result, applied)
 
     def test_native_backdrop_force_failure_invalidates_cached_hwnd(self):
         applied = BackdropResult(BackdropBackend.DESKTOP_ACRYLIC, True)
@@ -689,14 +689,14 @@ class MainWindowTests(unittest.TestCase):
             "clipsave_app.main_window.apply_windows_backdrop",
             side_effect=[applied, failed, applied],
         ) as backdrop:
-            self.window._native_backdrop_hwnd = None
+            self.window.window_effects_controller.native_backdrop_hwnd = None
             self.window._apply_native_backdrop()
             self.window._apply_native_backdrop(force=True)
             self.window._apply_native_backdrop()
 
         self.assertEqual(backdrop.call_count, 3)
-        self.assertEqual(self.window._native_backdrop_hwnd, 123)
-        self.assertEqual(self.window._native_backdrop_result, applied)
+        self.assertEqual(self.window.window_effects_controller.native_backdrop_hwnd, 123)
+        self.assertEqual(self.window.window_effects_controller.native_backdrop_result, applied)
 
     def test_solid_backdrop_switches_top_level_surfaces_to_opaque_theme(self):
         solid = BackdropResult(BackdropBackend.SOLID, True)
@@ -742,7 +742,7 @@ class MainWindowTests(unittest.TestCase):
                 message = wintypes.MSG()
                 message.hWnd = int(self.window.winId())
                 message.message = native_message
-                self.window._material_refresh_pending = False
+                self.window.window_effects_controller.material_refresh_pending = False
                 with patch.object(
                     self.window, "_schedule_material_refresh"
                 ) as schedule, patch(
@@ -765,8 +765,8 @@ class MainWindowTests(unittest.TestCase):
             "clipsave_app.main_window.unregister_windows_power_saving_notification",
             return_value=True,
         ) as unregister:
-            self.window._power_saving_notification_handle = None
-            self.window._power_saving_notification_hwnd = None
+            self.window.window_effects_controller.power_notification_handle = None
+            self.window.window_effects_controller.power_notification_hwnd = None
             self.window._ensure_power_saving_notification()
             self.window._ensure_power_saving_notification()
             self.window._ensure_power_saving_notification()
@@ -776,23 +776,23 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(register.call_args_list[1].args, (456,))
         self.assertEqual(register.call_count, 2)
         self.assertEqual([call.args for call in unregister.call_args_list], [(55,), (66,)])
-        self.assertIsNone(self.window._power_saving_notification_handle)
-        self.assertIsNone(self.window._power_saving_notification_hwnd)
+        self.assertIsNone(self.window.window_effects_controller.power_notification_handle)
+        self.assertIsNone(self.window.window_effects_controller.power_notification_hwnd)
 
     def test_system_material_refresh_coalesces_and_reapplies_backdrop(self):
         self.settings.data["follow_system_theme"] = False
         with patch.object(self.window, "_refresh_material_from_system") as refresh:
-            self.window._material_refresh_pending = False
+            self.window.window_effects_controller.material_refresh_pending = False
             self.window._schedule_material_refresh()
             self.window._schedule_material_refresh()
-            self.assertTrue(self.window._material_refresh_pending)
+            self.assertTrue(self.window.window_effects_controller.material_refresh_pending)
             self.app.processEvents()
         refresh.assert_called_once_with()
 
-        self.window._material_refresh_pending = True
+        self.window.window_effects_controller.material_refresh_pending = True
         with patch.object(self.window, "_apply_native_backdrop") as backdrop:
             self.window._refresh_material_from_system()
-        self.assertFalse(self.window._material_refresh_pending)
+        self.assertFalse(self.window.window_effects_controller.material_refresh_pending)
         backdrop.assert_called_once_with(force=True)
 
     def test_move_resize_and_detail_toggle_do_not_force_window_back_on_screen(self):
@@ -861,13 +861,13 @@ class MainWindowTests(unittest.TestCase):
         self.window.select_item(item_id)
         self.assertFalse(self.window.detail.isVisible())
         self.window.toggle_detail()
-        self.window._detail_animation_timer.stop()
+        self.window.detail_animation_controller.timer.stop()
         overlay = self.window.grid._sidebar_transition_overlay
         self.assertIsNotNone(overlay)
-        self.assertTrue(self.window._detail_animation_active)
+        self.assertTrue(self.window.detail_animation_controller.active)
         self.assertTrue(self.window.detail._width_transition_active)
         self.assertLessEqual(
-            self.window._detail_animation_timer.interval(),
+            self.window.detail_animation_controller.timer.interval(),
             34,
         )
 
@@ -893,7 +893,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(
             widths,
             [
-                round(self.window._detail_animation_target_width * progress)
+                round(self.window.detail_animation_controller.target_width * progress)
                 for progress in (0.0, 0.25, 0.5, 0.75, 1.0)
             ],
         )
@@ -922,7 +922,7 @@ class MainWindowTests(unittest.TestCase):
         fixed_content_width = content_widths[-1]
         self.window._finish_detail_animation()
         self.app.processEvents()
-        self.assertFalse(self.window._detail_animation_active)
+        self.assertFalse(self.window.detail_animation_controller.active)
         self.assertFalse(self.window.detail._width_transition_active)
         self.assertFalse(self.window.detail._width_transition_layout_frozen)
         self.assertTrue(self.window.detail.isVisible())
@@ -952,25 +952,25 @@ class MainWindowTests(unittest.TestCase):
             wraps=self.window.grid.set_layout_updates_suspended,
         ) as layout_updates:
             self.window.toggle_detail()
-            self.window._detail_animation_timer.stop()
+            self.window.detail_animation_controller.timer.stop()
             self.window._set_detail_animation_progress(0.65)
             width_before_reverse = self.window.detail.width()
 
             self.window.hide_detail()
-            self.window._detail_animation_timer.stop()
-            self.assertTrue(self.window._detail_animation_active)
+            self.window.detail_animation_controller.timer.stop()
+            self.assertTrue(self.window.detail_animation_controller.active)
             self.assertEqual(
-                self.window._detail_animation_start_progress,
+                self.window.detail_animation_controller.start_progress,
                 0.65,
             )
             self.window._set_detail_animation_progress(0.35)
             self.assertLess(self.window.detail.width(), width_before_reverse)
 
             self.window.toggle_detail()
-            self.window._detail_animation_timer.stop()
-            self.assertTrue(self.window._detail_animation_active)
+            self.window.detail_animation_controller.timer.stop()
+            self.assertTrue(self.window.detail_animation_controller.active)
             self.assertEqual(
-                self.window._detail_animation_start_progress,
+                self.window.detail_animation_controller.start_progress,
                 0.35,
             )
             self.window._finish_detail_animation()
@@ -993,7 +993,7 @@ class MainWindowTests(unittest.TestCase):
         item_id = self.window.current_items[0]["id"]
         self.window.select_item(item_id)
         self.window.toggle_detail()
-        self.window._detail_animation_timer.stop()
+        self.window.detail_animation_controller.timer.stop()
         opening = self.window.grid._sidebar_transition_overlay
         self.assertIsNotNone(opening)
         self.assertEqual(opening.expanded_columns, hidden_columns)
@@ -1019,7 +1019,7 @@ class MainWindowTests(unittest.TestCase):
 
         shown_columns = self.window.grid.columns
         self.window.hide_detail()
-        self.window._detail_animation_timer.stop()
+        self.window.detail_animation_controller.timer.stop()
         closing = self.window.grid._sidebar_transition_overlay
         self.assertIsNotNone(closing)
         self.assertEqual(closing.collapsed_columns, shown_columns)
@@ -1059,7 +1059,7 @@ class MainWindowTests(unittest.TestCase):
             wraps=self.window.grid.delegate.render_transition_preview,
         ) as render_preview:
             self.window.toggle_detail()
-            self.window._detail_animation_timer.stop()
+            self.window.detail_animation_controller.timer.stop()
             overlay = self.window.grid._sidebar_transition_overlay
             self.assertIsNotNone(overlay)
             state_count = sum(
@@ -1084,7 +1084,7 @@ class MainWindowTests(unittest.TestCase):
             wraps=self.window.grid.delegate._paint_preview_content,
         ) as paint_content:
             self.window.hide_detail()
-            self.window._detail_animation_timer.stop()
+            self.window.detail_animation_controller.timer.stop()
         self.assertEqual(paint_content.call_count, 0)
         self.window._finish_detail_animation()
 
@@ -1235,8 +1235,8 @@ class MainWindowTests(unittest.TestCase):
                 self.app.processEvents()
 
             self.assertTrue(startup_window.sidebar.collapsed)
-            self.assertFalse(startup_window._sidebar_setting_timer.isActive())
-            self.assertIsNone(startup_window._pending_sidebar_collapsed)
+            self.assertFalse(startup_window.sidebar_interaction_controller.setting_timer.isActive())
+            self.assertIsNone(startup_window.sidebar_interaction_controller.pending_collapsed)
             self.assertNotIn(
                 "sidebar_collapsed",
                 [call.args[0] for call in save_setting.call_args_list],
@@ -1252,15 +1252,15 @@ class MainWindowTests(unittest.TestCase):
             (self.window.quit_application, (), False),
             (self.window.quit_application_for_session_end, (1.0,), True),
         ):
-            self.window._pending_sidebar_collapsed = True
-            self.window._sidebar_setting_timer.start()
+            self.window.sidebar_interaction_controller.pending_collapsed = True
+            self.window.sidebar_interaction_controller.setting_timer.start()
             self.window._closing = True
             try:
                 with patch.object(self.window, "_save_setting") as save_setting:
                     self.assertEqual(quit_method(*args), expected)
                 save_setting.assert_called_once_with("sidebar_collapsed", True)
-                self.assertFalse(self.window._sidebar_setting_timer.isActive())
-                self.assertIsNone(self.window._pending_sidebar_collapsed)
+                self.assertFalse(self.window.sidebar_interaction_controller.setting_timer.isActive())
+                self.assertIsNone(self.window.sidebar_interaction_controller.pending_collapsed)
             finally:
                 self.window._closing = False
 

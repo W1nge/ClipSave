@@ -202,7 +202,7 @@ def _smoke_failure(window, uncaught_exceptions: list[str]) -> str | None:
 
 
 def _smoke_backdrop_status(window) -> str:
-    backdrop_result = getattr(window, "_native_backdrop_result", None)
+    backdrop_result = window.window_effects_controller.native_backdrop_result
     backdrop_backend = getattr(
         getattr(backdrop_result, "backend", None), "value", "none"
     )

@@ -88,9 +88,9 @@ class AppTests(unittest.TestCase):
 
     def test_smoke_backdrop_status_is_available_before_shutdown(self):
         window = MagicMock()
-        window._native_backdrop_result.backend.value = "win10_effect_acrylic"
-        window._native_backdrop_result.success = True
-        window._native_backdrop_result.native_error = None
+        window.window_effects_controller.native_backdrop_result.backend.value = "win10_effect_acrylic"
+        window.window_effects_controller.native_backdrop_result.success = True
+        window.window_effects_controller.native_backdrop_result.native_error = None
 
         status = app._smoke_backdrop_status(window)
 

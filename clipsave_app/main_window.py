@@ -140,154 +140,6 @@ class MainWindow(QMainWindow):
     ITEM_PAGE_SIZE = 500
 
     @property
-    def _native_backdrop_hwnd(self):
-        return self.window_effects_controller.native_backdrop_hwnd
-
-    @_native_backdrop_hwnd.setter
-    def _native_backdrop_hwnd(self, value) -> None:
-        self.window_effects_controller.native_backdrop_hwnd = value
-
-    @property
-    def _native_backdrop_result(self):
-        return self.window_effects_controller.native_backdrop_result
-
-    @_native_backdrop_result.setter
-    def _native_backdrop_result(self, value) -> None:
-        self.window_effects_controller.native_backdrop_result = value
-
-    @property
-    def _windows_backdrop_window_hwnd(self):
-        return self.window_effects_controller.backdrop_window_hwnd
-
-    @_windows_backdrop_window_hwnd.setter
-    def _windows_backdrop_window_hwnd(self, value) -> None:
-        self.window_effects_controller.backdrop_window_hwnd = value
-
-    @property
-    def _power_saving_notification_hwnd(self):
-        return self.window_effects_controller.power_notification_hwnd
-
-    @_power_saving_notification_hwnd.setter
-    def _power_saving_notification_hwnd(self, value) -> None:
-        self.window_effects_controller.power_notification_hwnd = value
-
-    @property
-    def _power_saving_notification_handle(self):
-        return self.window_effects_controller.power_notification_handle
-
-    @_power_saving_notification_handle.setter
-    def _power_saving_notification_handle(self, value) -> None:
-        self.window_effects_controller.power_notification_handle = value
-
-    @property
-    def _material_refresh_pending(self) -> bool:
-        return self.window_effects_controller.material_refresh_pending
-
-    @_material_refresh_pending.setter
-    def _material_refresh_pending(self, value: bool) -> None:
-        self.window_effects_controller.material_refresh_pending = bool(value)
-
-    @property
-    def _interactive_resize_active(self) -> bool:
-        return self.native_window_controller.interactive_resize_active
-
-    @_interactive_resize_active.setter
-    def _interactive_resize_active(self, value: bool) -> None:
-        self.native_window_controller.interactive_resize_active = bool(value)
-
-    @property
-    def _maximized_bounds_sync_pending(self) -> bool:
-        return self.native_window_controller.maximized_bounds_sync_pending
-
-    @_maximized_bounds_sync_pending.setter
-    def _maximized_bounds_sync_pending(self, value: bool) -> None:
-        self.native_window_controller.maximized_bounds_sync_pending = bool(value)
-
-    @property
-    def _detail_animation_active(self) -> bool:
-        return self.detail_animation_controller.active
-
-    @_detail_animation_active.setter
-    def _detail_animation_active(self, value: bool) -> None:
-        self.detail_animation_controller.active = bool(value)
-
-    @property
-    def _detail_animation_target_visible(self) -> bool:
-        return self.detail_animation_controller.target_visible
-
-    @_detail_animation_target_visible.setter
-    def _detail_animation_target_visible(self, value: bool) -> None:
-        self.detail_animation_controller.target_visible = bool(value)
-
-    @property
-    def _detail_animation_progress(self) -> float:
-        return self.detail_animation_controller.progress
-
-    @_detail_animation_progress.setter
-    def _detail_animation_progress(self, value: float) -> None:
-        self.detail_animation_controller.progress = float(value)
-
-    @property
-    def _detail_animation_start_progress(self) -> float:
-        return self.detail_animation_controller.start_progress
-
-    @_detail_animation_start_progress.setter
-    def _detail_animation_start_progress(self, value: float) -> None:
-        self.detail_animation_controller.start_progress = float(value)
-
-    @property
-    def _detail_animation_end_progress(self) -> float:
-        return self.detail_animation_controller.end_progress
-
-    @_detail_animation_end_progress.setter
-    def _detail_animation_end_progress(self, value: float) -> None:
-        self.detail_animation_controller.end_progress = float(value)
-
-    @property
-    def _detail_animation_target_width(self) -> int:
-        return self.detail_animation_controller.target_width
-
-    @_detail_animation_target_width.setter
-    def _detail_animation_target_width(self, value: int) -> None:
-        self.detail_animation_controller.target_width = int(value)
-
-    @property
-    def _detail_animation_timer(self):
-        return self.detail_animation_controller.timer
-
-    @property
-    def _detail_animation_elapsed(self):
-        return self.detail_animation_controller.elapsed
-
-    @property
-    def _detail_width(self) -> int:
-        return self.detail_animation_controller.saved_width
-
-    @_detail_width.setter
-    def _detail_width(self, value: int) -> None:
-        self.detail_animation_controller.saved_width = int(value)
-
-    @property
-    def _sidebar_animation_active(self) -> bool:
-        return self.sidebar_interaction_controller.animation_active
-
-    @_sidebar_animation_active.setter
-    def _sidebar_animation_active(self, value: bool) -> None:
-        self.sidebar_interaction_controller.animation_active = bool(value)
-
-    @property
-    def _pending_sidebar_collapsed(self) -> bool | None:
-        return self.sidebar_interaction_controller.pending_collapsed
-
-    @_pending_sidebar_collapsed.setter
-    def _pending_sidebar_collapsed(self, value: bool | None) -> None:
-        self.sidebar_interaction_controller.pending_collapsed = value
-
-    @property
-    def _sidebar_setting_timer(self):
-        return self.sidebar_interaction_controller.setting_timer
-
-    @property
     def current_items(self):
         return self.library_state.items
 
@@ -506,8 +358,8 @@ class MainWindow(QMainWindow):
             set_layout_updates_suspended=lambda value: self.grid.set_layout_updates_suspended(
                 value
             ),
-            sidebar_animation_active=lambda: self._sidebar_animation_active,
-            detail_animation_active=lambda: self._detail_animation_active,
+            sidebar_animation_active=lambda: self.sidebar_interaction_controller.animation_active,
+            detail_animation_active=lambda: self.detail_animation_controller.active,
             resize_hit_test=lambda *args: self._windows_resize_hit_test(*args),
             enable_resize_frame=lambda hwnd: enable_native_resize_frame(hwnd),
             clear_resize_handles=lambda: self._clear_resize_handles(),
@@ -544,9 +396,9 @@ class MainWindow(QMainWindow):
             body_layout=self._body_layout,
             settings_get=lambda key, default=None: self.settings.get(key, default),
             save_setting=lambda key, value: self._save_setting(key, value),
-            detail_animation_active=lambda: self._detail_animation_active,
+            detail_animation_active=lambda: self.detail_animation_controller.active,
             finish_detail_animation=lambda: self._finish_detail_animation(),
-            interactive_resize_active=lambda: self._interactive_resize_active,
+            interactive_resize_active=lambda: self.native_window_controller.interactive_resize_active,
             parent=self,
         )
         self.sidebar_interaction_controller.connect_signals()
@@ -558,8 +410,8 @@ class MainWindow(QMainWindow):
             body_layout=self._body_layout,
             detail_button=self.detail_button,
             sidebar=self.sidebar,
-            sidebar_animation_active=lambda: self._sidebar_animation_active,
-            interactive_resize_active=lambda: self._interactive_resize_active,
+            sidebar_animation_active=lambda: self.sidebar_interaction_controller.animation_active,
+            interactive_resize_active=lambda: self.native_window_controller.interactive_resize_active,
             parent=self,
         )
         self.build_tray()
@@ -905,7 +757,11 @@ class MainWindow(QMainWindow):
         result: BackdropResult | None = None,
         dark: bool | None = None,
     ) -> None:
-        effective = result if result is not None else self._native_backdrop_result
+        effective = (
+            result
+            if result is not None
+            else self.window_effects_controller.native_backdrop_result
+        )
         backend = effective.backend.value if effective is not None else None
         stylesheet = stylesheet_for_theme(
             self.dark_theme if dark is None else dark,
@@ -915,13 +771,13 @@ class MainWindow(QMainWindow):
             self.setStyleSheet(stylesheet)
 
     def _schedule_material_refresh(self) -> None:
-        if self._material_refresh_pending:
+        if self.window_effects_controller.material_refresh_pending:
             return
-        self._material_refresh_pending = True
+        self.window_effects_controller.material_refresh_pending = True
         QTimer.singleShot(0, self._refresh_material_from_system)
 
     def _refresh_material_from_system(self) -> None:
-        self._material_refresh_pending = False
+        self.window_effects_controller.material_refresh_pending = False
         if self._closing or self._quit_in_progress:
             return
         if self.settings.get("follow_system_theme", True):
@@ -955,14 +811,20 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._update_resize_handles()
-        if is_windows_qt_platform() and not self._interactive_resize_active:
+        if (
+            is_windows_qt_platform()
+            and not self.native_window_controller.interactive_resize_active
+        ):
             self._sync_windows_backdrop_geometry_now()
         if hasattr(self, "copy_toast"):
             self.copy_toast.reposition()
 
     def moveEvent(self, event) -> None:
         super().moveEvent(event)
-        if is_windows_qt_platform() and not self._interactive_resize_active:
+        if (
+            is_windows_qt_platform()
+            and not self.native_window_controller.interactive_resize_active
+        ):
             self._sync_windows_backdrop_geometry_now()
 
     def toggle_maximized(self) -> None:
@@ -996,13 +858,13 @@ class MainWindow(QMainWindow):
         return super().nativeEvent(event_type, message)
 
     def _schedule_maximized_bounds_sync(self) -> None:
-        if self._maximized_bounds_sync_pending:
+        if self.native_window_controller.maximized_bounds_sync_pending:
             return
-        self._maximized_bounds_sync_pending = True
+        self.native_window_controller.maximized_bounds_sync_pending = True
         QTimer.singleShot(0, self._synchronize_maximized_bounds)
 
     def _synchronize_maximized_bounds(self) -> None:
-        self._maximized_bounds_sync_pending = False
+        self.native_window_controller.maximized_bounds_sync_pending = False
         if self._closing or self._quit_in_progress or not is_windows_qt_platform():
             return
         self.native_window_controller.sync_maximized_work_area()
@@ -1452,7 +1314,7 @@ class MainWindow(QMainWindow):
                 self.detail.set_ocr_busy(True)
 
     def toggle_detail(self) -> None:
-        if self._detail_animation_target_visible:
+        if self.detail_animation_controller.target_visible:
             self.hide_detail()
         else:
             if self.current_item_id:
@@ -1461,7 +1323,7 @@ class MainWindow(QMainWindow):
 
     def show_item_detail(self, item_id: int) -> None:
         if (
-            self._detail_animation_target_visible
+            self.detail_animation_controller.target_visible
             and self.current_item_id == item_id
         ):
             self.hide_detail()
@@ -1738,7 +1600,7 @@ class MainWindow(QMainWindow):
         self.select_item(item_id)
         if detail_was_visible:
             self.update_detail(item_id)
-            if not self._detail_animation_target_visible:
+            if not self.detail_animation_controller.target_visible:
                 self._start_detail_animation(True)
 
     def _delete_finished(
