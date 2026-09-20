@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -10,6 +11,20 @@ from PySide6.QtGui import QImage
 from .database import ImportFileDetails, LibraryDatabase
 from .services import TaskCapacityExceeded, ai_ocr_task_executor
 from .task_supervisor import TaskSupervisor
+
+
+@dataclass(frozen=True, slots=True)
+class CancelledDeleteRestore:
+    item_id: int
+    was_selected: bool
+    detail_was_visible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MutationCleanup:
+    pending: bool = False
+    copy_finished: bool = False
+    delete_restores: tuple[CancelledDeleteRestore, ...] = ()
 
 
 class LibraryMutationController(QObject):
@@ -139,6 +154,92 @@ class LibraryMutationController(QObject):
             return
         self.copy_request = None
         self.supervisor.cancel(request[0])
+
+    def finish_import(self, token: object, marker: QObject) -> bool:
+        if self.import_request != (token, marker):
+            return False
+        self.import_request = None
+        return True
+
+    def finish_copy(self, token: object, marker: QObject) -> bool:
+        self.supervisor.finish_bounded(token)
+        request = self.copy_request
+        if request is None or request[:2] != (token, marker):
+            return False
+        self.copy_request = None
+        return True
+
+    def finish_delete(
+        self,
+        item_id: int,
+        token: object,
+        marker: QObject,
+    ) -> CancelledDeleteRestore | None:
+        request = self.delete_requests.get(item_id)
+        if request is None or request[:2] != (token, marker):
+            return None
+        self.delete_requests.pop(item_id, None)
+        self.pending_delete_item_ids.discard(item_id)
+        _token, _marker, was_selected, detail_was_visible = request
+        return CancelledDeleteRestore(
+            item_id=item_id,
+            was_selected=was_selected,
+            detail_was_visible=detail_was_visible,
+        )
+
+    def cancel_for_shutdown(self) -> set[object]:
+        tokens: set[object] = set()
+        if self.copy_request is not None:
+            token, _marker, _item_id = self.copy_request
+            self.supervisor.cancel(token)
+            tokens.add(token)
+        for token, _marker, _was_selected, _detail_was_visible in self.delete_requests.values():
+            self.supervisor.cancel(token)
+            tokens.add(token)
+        return tokens
+
+    def cleanup_cancelled(self, cancelled_tokens: set[object]) -> MutationCleanup:
+        pending = False
+        copy_finished = False
+        restores: list[CancelledDeleteRestore] = []
+
+        if self.copy_request is not None:
+            token, _marker, _item_id = self.copy_request
+            if token in cancelled_tokens:
+                if self.supervisor.token_done(token):
+                    self.copy_request = None
+                    self.supervisor.finish_bounded(token)
+                    copy_finished = True
+                else:
+                    pending = True
+
+        for item_id, request in list(self.delete_requests.items()):
+            token, _marker, was_selected, detail_was_visible = request
+            if token not in cancelled_tokens:
+                continue
+            if not self.supervisor.token_done(token):
+                pending = True
+                continue
+            self.delete_requests.pop(item_id, None)
+            self.pending_delete_item_ids.discard(item_id)
+            restores.append(
+                CancelledDeleteRestore(
+                    item_id=item_id,
+                    was_selected=was_selected,
+                    detail_was_visible=detail_was_visible,
+                )
+            )
+
+        return MutationCleanup(
+            pending=pending,
+            copy_finished=copy_finished,
+            delete_restores=tuple(restores),
+        )
+
+    def clear_background_state(self) -> None:
+        self.copy_request = None
+        self.delete_requests.clear()
+        self.pending_delete_item_ids.clear()
 
     def start_delete(
         self,

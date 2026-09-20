@@ -1763,7 +1763,6 @@ class MainWindowTests(unittest.TestCase):
         stale_token, stale_signals = object(), AsyncSignals()
         active_token, active_signals = object(), AsyncSignals()
         self.window._ai_requests[first_id] = (active_token, active_signals)
-        self.window._async_signals.update((stale_signals, active_signals))
         first_hash = self.database.get_item(first_id)["content_hash"]
         self.window._ai_succeeded(
             stale_token,
@@ -1777,7 +1776,6 @@ class MainWindowTests(unittest.TestCase):
 
         token, signals = object(), AsyncSignals()
         self.window._ai_requests[first_id] = (token, signals)
-        self.window._async_signals.add(signals)
         expanded_ids = [item["id"] for item in self.window.current_items]
         self.window.search.setText("nonmatching expanded query")
         self.window.search_timer.stop()
@@ -1799,7 +1797,6 @@ class MainWindowTests(unittest.TestCase):
         old_token, old_signals = object(), AsyncSignals()
         new_token, new_signals = object(), AsyncSignals()
         self.window._expanded_search_request = (new_token, new_signals)
-        self.window._async_signals.update((old_signals, new_signals))
         self.window._expanded_search_succeeded(old_token, old_signals, "", ["stale"])
         self.assertEqual([item["id"] for item in self.window.current_items], previous_ids)
 
@@ -2677,7 +2674,6 @@ class MainWindowTests(unittest.TestCase):
         token = object()
         signals = AsyncSignals()
         self.window._ocr_requests[image_id] = (token, signals)
-        self.window._async_signals.add(signals)
         expected_hash = self.database.get_item(image_id)["content_hash"]
         self.window._ocr_succeeded(
             token,
@@ -2698,7 +2694,6 @@ class MainWindowTests(unittest.TestCase):
         ocr_request = (object(), AsyncSignals())
         self.window._ai_requests[item_id] = ai_request
         self.window._ocr_requests[item_id] = ocr_request
-        self.window._async_signals.update((ai_request[1], ocr_request[1]))
 
         with patch(
             "clipsave_app.main_window.QMessageBox.question",
@@ -2763,7 +2758,6 @@ class MainWindowTests(unittest.TestCase):
         token = object()
         signals = AsyncSignals()
         self.window._startup_scan_request = (token, signals)
-        self.window._async_signals.add(signals)
 
         self.window._startup_scan_failed(token, signals, "scan failed")
 

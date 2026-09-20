@@ -56,6 +56,18 @@ class ImmediateExecutor:
         return ImmediateHandle(target)
 
 
+class ManualHandle:
+    def __init__(self):
+        self.done_event = threading.Event()
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def wait(self, timeout=None):
+        return self.done_event.wait(timeout)
+
+
 class Snapshot:
     decoded_bytes = 16
 
@@ -140,3 +152,80 @@ class MutationControllerTests(unittest.TestCase):
         recycle.assert_called_once()
         self.assertEqual(database.removed, [9])
         self.assertEqual(results[0][3]["outcome"], "deleted")
+
+    def test_shutdown_cleanup_waits_for_copy_and_returns_delete_restore(self):
+        supervisor = TaskSupervisor()
+        controller = LibraryMutationController(FakeDatabase(), supervisor)
+        copy_token = object()
+        delete_token = object()
+        copy_handle = ManualHandle()
+        supervisor.track_bounded(copy_token, copy_handle)
+        controller.copy_request = (copy_token, object(), 5)
+        controller.delete_requests[9] = (delete_token, object(), True, True)
+        controller.pending_delete_item_ids.add(9)
+
+        cancelled = controller.cancel_for_shutdown()
+
+        self.assertEqual(cancelled, {copy_token, delete_token})
+        self.assertTrue(copy_handle.cancelled)
+        cleanup = controller.cleanup_cancelled(cancelled)
+        self.assertTrue(cleanup.pending)
+        self.assertEqual(len(cleanup.delete_restores), 1)
+        restore = cleanup.delete_restores[0]
+        self.assertEqual(restore.item_id, 9)
+        self.assertTrue(restore.was_selected)
+        self.assertTrue(restore.detail_was_visible)
+        self.assertNotIn(9, controller.delete_requests)
+        self.assertNotIn(9, controller.pending_delete_item_ids)
+        self.assertIsNotNone(controller.copy_request)
+
+        copy_handle.done_event.set()
+        cleanup = controller.cleanup_cancelled(cancelled)
+
+        self.assertFalse(cleanup.pending)
+        self.assertTrue(cleanup.copy_finished)
+        self.assertIsNone(controller.copy_request)
+        self.assertNotIn(copy_token, supervisor.bounded_tasks)
+
+    def test_clear_background_state_does_not_clear_active_import(self):
+        controller = LibraryMutationController(FakeDatabase(), TaskSupervisor())
+        import_request = (object(), object())
+        controller.import_request = import_request
+        controller.copy_request = (object(), object(), 1)
+        controller.delete_requests[2] = (object(), object(), False, False)
+        controller.pending_delete_item_ids.add(2)
+
+        controller.clear_background_state()
+
+        self.assertIs(controller.import_request, import_request)
+        self.assertIsNone(controller.copy_request)
+        self.assertFalse(controller.delete_requests)
+        self.assertFalse(controller.pending_delete_item_ids)
+
+    def test_finish_methods_claim_only_matching_requests(self):
+        controller = LibraryMutationController(FakeDatabase(), TaskSupervisor())
+        import_token, import_marker = object(), object()
+        copy_token, copy_marker = object(), object()
+        delete_token, delete_marker = object(), object()
+        controller.import_request = (import_token, import_marker)
+        controller.copy_request = (copy_token, copy_marker, 4)
+        controller.delete_requests[9] = (delete_token, delete_marker, True, False)
+        controller.pending_delete_item_ids.add(9)
+
+        self.assertFalse(controller.finish_import(import_token, object()))
+        self.assertFalse(controller.finish_copy(copy_token, object()))
+        self.assertIsNone(controller.finish_delete(9, delete_token, object()))
+        self.assertIsNotNone(controller.import_request)
+        self.assertIsNotNone(controller.copy_request)
+        self.assertIn(9, controller.delete_requests)
+
+        self.assertTrue(controller.finish_import(import_token, import_marker))
+        self.assertTrue(controller.finish_copy(copy_token, copy_marker))
+        restore = controller.finish_delete(9, delete_token, delete_marker)
+        self.assertIsNotNone(restore)
+        self.assertTrue(restore.was_selected)
+        self.assertFalse(restore.detail_was_visible)
+        self.assertIsNone(controller.import_request)
+        self.assertIsNone(controller.copy_request)
+        self.assertNotIn(9, controller.delete_requests)
+        self.assertNotIn(9, controller.pending_delete_item_ids)

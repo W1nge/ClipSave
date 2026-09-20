@@ -499,7 +499,6 @@ class MainWindow(QMainWindow):
         self.force_quit = False
         self._grid_dirty = True
         self._table_dirty = True
-        self._async_signals: set[QObject] = set()
         self._expanded_search_query = ""
         self._expanded_search_terms: tuple[str, ...] = ()
         self._session_hidden_item_ids: set[int] = set()
@@ -1748,11 +1747,10 @@ class MainWindow(QMainWindow):
         self._show_copy_confirmation()
 
     def _copy_image_succeeded(self, token: object, signals: AsyncSignals, item_id: int, image: QImage) -> None:
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
-        if self._closing or self._copy_request != (token, signals, item_id):
+        if not self.mutation_controller.finish_copy(token, signals):
             return
-        self._copy_request = None
+        if self._closing:
+            return
         self.clipboard_service.suppress_image(image)
         QApplication.clipboard().setImage(image)
         self._show_copy_confirmation()
@@ -1762,11 +1760,10 @@ class MainWindow(QMainWindow):
         self.copy_toast.show_confirmation()
 
     def _copy_image_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
-        if self._closing or self._copy_request is None or self._copy_request[:2] != (token, signals):
+        if not self.mutation_controller.finish_copy(token, signals):
             return
-        self._copy_request = None
+        if self._closing:
+            return
         QMessageBox.warning(self, "复制失败", message)
         self.show_status("复制失败：图片文件无法读取")
 
@@ -1839,18 +1836,15 @@ class MainWindow(QMainWindow):
     def _delete_finished(
         self, token: object, signals: AsyncSignals, item_id: int, result: object
     ) -> None:
-        request = self._delete_requests.get(item_id)
-        if request is None or request[:2] != (token, signals):
+        restore = self.mutation_controller.finish_delete(item_id, token, signals)
+        if restore is None:
             return
-        self._delete_requests.pop(item_id, None)
-        self._pending_delete_item_ids.discard(item_id)
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
         if self._closing:
             return
         details = result if isinstance(result, dict) else {"outcome": "deleted"}
         outcome = details.get("outcome")
-        _token, _signals, was_selected, detail_was_visible = request
+        was_selected = restore.was_selected
+        detail_was_visible = restore.detail_was_visible
         if outcome == "cancelled":
             self._restore_delete_view(item_id, was_selected, detail_was_visible)
             self.show_status("删除已取消")
@@ -1896,17 +1890,16 @@ class MainWindow(QMainWindow):
         self.show_status(status)
 
     def _delete_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
-        request = self._delete_requests.get(item_id)
-        if request is None or request[:2] != (token, signals):
+        restore = self.mutation_controller.finish_delete(item_id, token, signals)
+        if restore is None:
             return
-        self._delete_requests.pop(item_id, None)
-        self._pending_delete_item_ids.discard(item_id)
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
         if self._closing:
             return
-        _token, _signals, was_selected, detail_was_visible = request
-        self._restore_delete_view(item_id, was_selected, detail_was_visible)
+        self._restore_delete_view(
+            item_id,
+            restore.was_selected,
+            restore.detail_was_visible,
+        )
         QMessageBox.warning(self, "删除失败", f"文件或内容无法删除，内容未删除。\n\n{message}")
         self.show_status("删除失败：内容未能删除")
 
@@ -2066,10 +2059,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "文件导入失败", str(exc))
 
     def _import_finished(self, token: object, signals: AsyncSignals, result: dict) -> None:
-        self._async_signals.discard(signals)
-        if self._closing or self._quit_in_progress or self._import_request != (token, signals):
+        if not self.mutation_controller.finish_import(token, signals):
             return
-        self._import_request = None
+        if self._closing or self._quit_in_progress:
+            return
         self._refresh_library_async()
         for item_id in result.get("image_ids", ()):
             self._schedule_auto_image_tasks(int(item_id))
@@ -2099,10 +2092,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "部分文件导入失败", f"以下文件无法导入，其他文件已继续处理：\n\n{details}")
 
     def _import_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
-        self._async_signals.discard(signals)
-        if self._closing or self._quit_in_progress or self._import_request != (token, signals):
+        if not self.mutation_controller.finish_import(token, signals):
             return
-        self._import_request = None
+        if self._closing or self._quit_in_progress:
+            return
         QMessageBox.warning(self, "文件导入失败", message)
 
     def open_settings(self) -> None:
@@ -2135,15 +2128,9 @@ class MainWindow(QMainWindow):
             self.apply_theme(force=True)
         if result:
             if previous_auto_ocr and not self.settings.get("auto_ocr", False):
-                self._cancel_automatic_requests(
-                    self._automatic_ocr_items,
-                    self._ocr_requests,
-                )
+                self._cancel_automatic_requests("ocr")
             if previous_auto_description and not self.settings.get("auto_description", False):
-                self._cancel_automatic_requests(
-                    self._automatic_ai_items,
-                    self._ai_requests,
-                )
+                self._cancel_automatic_requests("ai")
 
     @staticmethod
     def _bulk_progress_state(
@@ -2318,13 +2305,11 @@ class MainWindow(QMainWindow):
         except (KeyError, TypeError, ValueError):
             return 0
 
-    def _cancel_automatic_requests(self, item_ids: set[int], requests: dict[int, tuple[object, AsyncSignals]]) -> None:
-        for item_id in list(item_ids):
-            item_ids.discard(item_id)
-            self._cancel_request(requests.pop(item_id, None))
+    def _cancel_automatic_requests(self, operation: str) -> None:
+        for item_id in self.image_task_controller.cancel_automatic(operation):
             if self.current_item_id != item_id:
                 continue
-            if requests is self._ai_requests:
+            if operation == "ai":
                 self.detail.set_ai_busy(False)
             else:
                 self.detail.set_ocr_busy(False)
@@ -2400,7 +2385,6 @@ class MainWindow(QMainWindow):
             )
 
     def _startup_scan_failed(self, token: object, signals: QObject, message: str) -> None:
-        self._async_signals.discard(signals)
         if not self.maintenance_controller.finish_scan(token, signals) or self._closing:
             return
         self.startup_scan_error = message
@@ -2416,126 +2400,59 @@ class MainWindow(QMainWindow):
         if not cancelled_tokens:
             return
 
-        def token_done(token: object) -> bool:
-            return self._task_supervisor.token_done(token)
-
         def poll() -> None:
             if self._closing:
                 return
-            pending = False
-            for requests, kind in (
-                (self._ai_requests, "ai"),
-                (self._ocr_requests, "ocr"),
-            ):
-                for item_id, request in list(requests.items()):
-                    token, signals = request
-                    if token not in cancelled_tokens:
-                        continue
-                    if not token_done(token):
-                        pending = True
-                        continue
-                    requests.pop(item_id, None)
-                    if kind == "ai":
-                        self._automatic_ai_items.discard(item_id)
-                    else:
-                        self._automatic_ocr_items.discard(item_id)
-                    self._async_signals.discard(signals)
-                    self._finish_async_token(token)
-                    if self.current_item_id == item_id:
-                        if kind == "ai":
-                            self.detail.set_ai_busy(False)
-                        else:
-                            self.detail.set_ocr_busy(False)
-            if self._expanded_search_request is not None:
-                token, signals = self._expanded_search_request
-                if token in cancelled_tokens:
-                    if token_done(token):
-                        self._expanded_search_request = None
-                        self._async_signals.discard(signals)
-                        self._finish_async_token(token)
-                        self.expanded_search_button.setEnabled(True)
-                        self.expanded_search_button.setText("扩大搜索")
-                    else:
-                        pending = True
-            if self._copy_request is not None:
-                token, signals, _item_id = self._copy_request
-                if token in cancelled_tokens:
-                    if token_done(token):
-                        self._copy_request = None
-                        self._async_signals.discard(signals)
-                    else:
-                        pending = True
-            for item_id, request in list(self._delete_requests.items()):
-                token, signals, was_selected, detail_was_visible = request
-                if token not in cancelled_tokens:
-                    continue
-                if not token_done(token):
-                    pending = True
-                    continue
-                self._delete_requests.pop(item_id, None)
-                self._pending_delete_item_ids.discard(item_id)
-                self._async_signals.discard(signals)
-                self._finish_async_token(token)
-                if not self._closing:
-                    self._restore_delete_view(item_id, was_selected, detail_was_visible)
-            if pending:
+            image_cleanup = self.image_task_controller.cleanup_cancelled(cancelled_tokens)
+            mutation_cleanup = self.mutation_controller.cleanup_cancelled(cancelled_tokens)
+
+            if self.current_item_id in image_cleanup.ai_item_ids:
+                self.detail.set_ai_busy(False)
+            if self.current_item_id in image_cleanup.ocr_item_ids:
+                self.detail.set_ocr_busy(False)
+            if image_cleanup.expanded_search_finished:
+                self.expanded_search_button.setEnabled(True)
+                self.expanded_search_button.setText("扩大搜索")
+            for restore in mutation_cleanup.delete_restores:
+                self._restore_delete_view(
+                    restore.item_id,
+                    restore.was_selected,
+                    restore.detail_was_visible,
+                )
+            if image_cleanup.pending or mutation_cleanup.pending:
                 QTimer.singleShot(100, poll)
 
         QTimer.singleShot(0, poll)
 
-    def _cancel_request(self, request: tuple[object, AsyncSignals] | None) -> None:
+    def _cancel_request(self, request: tuple[object, QObject] | None) -> None:
         if request is None:
             return
         token, signals = request
         self._cancel_async_token(token)
-        self._async_signals.discard(signals)
 
     def _cancel_item_requests(self, item_id: int) -> None:
-        self._automatic_ai_items.discard(item_id)
-        self._automatic_ocr_items.discard(item_id)
-        self._cancel_request(self._ai_requests.pop(item_id, None))
-        self._cancel_request(self._ocr_requests.pop(item_id, None))
+        self.image_task_controller.cancel_item(item_id)
 
     def _cancel_background_requests(self) -> set[object]:
         self._cancel_library_refresh_request()
         self._cancel_item_search_request()
         self._cancel_item_page_request()
-        cancelled_tokens: set[object] = set()
-        expanded_search_request = self._expanded_search_request
-        self._cancel_request(expanded_search_request)
-        if expanded_search_request is not None:
-            cancelled_tokens.add(expanded_search_request[0])
-        for request in list(self._ai_requests.values()):
-            self._cancel_request(request)
-            cancelled_tokens.add(request[0])
-        for request in list(self._ocr_requests.values()):
-            self._cancel_request(request)
-            cancelled_tokens.add(request[0])
-        if self._copy_request is not None:
-            self._cancel_async_token(self._copy_request[0])
-            self._async_signals.discard(self._copy_request[1])
-            cancelled_tokens.add(self._copy_request[0])
-        for token, _signals, _was_selected, _detail_was_visible in self._delete_requests.values():
-            self._cancel_async_token(token)
-            cancelled_tokens.add(token)
+        cancelled_tokens = self.image_task_controller.cancel_for_shutdown()
+        cancelled_tokens.update(self.mutation_controller.cancel_for_shutdown())
         bulk_token = self.bulk_image_controller.cancel()
         if bulk_token is not None:
             cancelled_tokens.add(bulk_token)
         return cancelled_tokens
 
     def _clear_background_request_state(self) -> None:
-        self._expanded_search_request = None
+        self.image_task_controller.clear_state()
+        self.mutation_controller.clear_background_state()
         self.expanded_search_button.setEnabled(True)
         self.expanded_search_button.setText("扩大搜索")
-        self._ai_requests.clear()
-        self._ocr_requests.clear()
-        self._copy_request = None
-        self._delete_requests.clear()
-        self._pending_delete_item_ids.clear()
 
     def _cancel_and_wait_request(
         self,
-        request: tuple[object, AsyncSignals] | None,
+        request: tuple[object, QObject] | None,
         timeout: float,
         *,
         process_events: bool = True,
@@ -2581,7 +2498,6 @@ class MainWindow(QMainWindow):
     ) -> bool:
         is_ai = operation == "ai"
         requests = self._ai_requests if is_ai else self._ocr_requests
-        automatic_items = self._automatic_ai_items if is_ai else self._automatic_ocr_items
         invalid_title = "AI 描述" if is_ai else "OCR"
         invalid_message = (
             "当前只支持为图片生成 AI 描述。"
@@ -2627,8 +2543,7 @@ class MainWindow(QMainWindow):
         if item_id in requests:
             if automatic:
                 return False
-            automatic_items.discard(item_id)
-            self._cancel_request(requests.pop(item_id, None))
+            self.image_task_controller.cancel_operation(item_id, operation)
         if self.current_item_id == item_id:
             if is_ai:
                 self.detail.set_ai_busy(True)
@@ -2663,12 +2578,21 @@ class MainWindow(QMainWindow):
         text: str,
         expected_content_hash: str,
     ) -> None:
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
-        if self._ocr_requests.get(item_id) != (token, signals):
+        if not self.image_task_controller.is_current_operation(
+            item_id,
+            "ocr",
+            token,
+            signals,
+        ):
+            self._finish_async_token(token)
             return
         if self._closing or self._quit_in_progress:
-            self._automatic_ocr_items.discard(item_id)
+            self.image_task_controller.finish_operation(
+                item_id,
+                "ocr",
+                token,
+                signals,
+            )
             return
         try:
             saved = self.database.update_ocr_if_current(
@@ -2678,29 +2602,38 @@ class MainWindow(QMainWindow):
             self._ocr_failed(token, signals, item_id, f"OCR 结果无法保存：{exc}")
             return
         if not saved:
-            self._ocr_requests.pop(item_id, None)
-            self._automatic_ocr_items.discard(item_id)
+            self.image_task_controller.finish_operation(
+                item_id,
+                "ocr",
+                token,
+                signals,
+            )
             if self.current_item_id == item_id:
                 self.detail.set_ocr_busy(False)
             self.show_status("图片已变化，已丢弃过期的 OCR 结果")
             return
-        self._ocr_requests.pop(item_id, None)
-        self._automatic_ocr_items.discard(item_id)
+        self.image_task_controller.finish_operation(
+            item_id,
+            "ocr",
+            token,
+            signals,
+        )
         self._refresh_after_mutation()
         if self.current_item_id == item_id:
             self.update_detail(item_id)
         self.show_status("OCR 识别完成" if text else "图片中未识别到文字")
 
     def _ocr_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
-        if self._ocr_requests.get(item_id) != (token, signals):
+        matched, automatic = self.image_task_controller.finish_operation(
+            item_id,
+            "ocr",
+            token,
+            signals,
+        )
+        if not matched:
             return
-        automatic = item_id in self._automatic_ocr_items
-        self._automatic_ocr_items.discard(item_id)
         if self._closing or self._quit_in_progress:
             return
-        self._ocr_requests.pop(item_id, None)
         if self.current_item_id == item_id:
             self.detail.set_ocr_busy(False, failed=True)
         if automatic:
@@ -2741,13 +2674,10 @@ class MainWindow(QMainWindow):
         query: str,
         terms: object,
     ) -> None:
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
+        if not self.image_task_controller.finish_expanded_search(token, signals):
+            return
         if self._closing:
             return
-        if self._expanded_search_request != (token, signals):
-            return
-        self._expanded_search_request = None
         self.expanded_search_button.setEnabled(True)
         self.expanded_search_button.setText("扩大搜索")
         if self.search.text().strip() != query:
@@ -2761,13 +2691,10 @@ class MainWindow(QMainWindow):
         self.show_status(f"搜索范围已扩大：使用 {len(self._expanded_search_terms):,} 个搜索词")
 
     def _expanded_search_failed(self, token: object, signals: AsyncSignals, message: str) -> None:
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
+        if not self.image_task_controller.finish_expanded_search(token, signals):
+            return
         if self._closing:
             return
-        if self._expanded_search_request != (token, signals):
-            return
-        self._expanded_search_request = None
         self.expanded_search_button.setEnabled(True)
         self.expanded_search_button.setText("扩大搜索")
         QMessageBox.warning(self, "扩大搜索失败", message)
@@ -2788,12 +2715,21 @@ class MainWindow(QMainWindow):
         description: str,
         expected_content_hash: str,
     ) -> None:
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
-        if self._ai_requests.get(item_id) != (token, signals):
+        if not self.image_task_controller.is_current_operation(
+            item_id,
+            "ai",
+            token,
+            signals,
+        ):
+            self._finish_async_token(token)
             return
         if self._closing or self._quit_in_progress:
-            self._automatic_ai_items.discard(item_id)
+            self.image_task_controller.finish_operation(
+                item_id,
+                "ai",
+                token,
+                signals,
+            )
             return
         try:
             saved = self.database.update_ai_if_current(
@@ -2805,29 +2741,38 @@ class MainWindow(QMainWindow):
             self._ai_failed(token, signals, item_id, f"AI 结果无法保存：{exc}")
             return
         if not saved:
-            self._ai_requests.pop(item_id, None)
-            self._automatic_ai_items.discard(item_id)
+            self.image_task_controller.finish_operation(
+                item_id,
+                "ai",
+                token,
+                signals,
+            )
             if self.current_item_id == item_id:
                 self.detail.set_ai_busy(False)
             self.show_status("图片已变化，已丢弃过期的 AI 结果")
             return
-        self._ai_requests.pop(item_id, None)
-        self._automatic_ai_items.discard(item_id)
+        self.image_task_controller.finish_operation(
+            item_id,
+            "ai",
+            token,
+            signals,
+        )
         self._refresh_after_mutation()
         if self.current_item_id == item_id:
             self.update_detail(item_id)
         self.show_status("AI 描述已生成")
 
     def _ai_failed(self, token: object, signals: AsyncSignals, item_id: int, message: str) -> None:
-        self._async_signals.discard(signals)
-        self._finish_async_token(token)
-        if self._ai_requests.get(item_id) != (token, signals):
+        matched, automatic = self.image_task_controller.finish_operation(
+            item_id,
+            "ai",
+            token,
+            signals,
+        )
+        if not matched:
             return
-        automatic = item_id in self._automatic_ai_items
-        self._automatic_ai_items.discard(item_id)
         if self._closing or self._quit_in_progress:
             return
-        self._ai_requests.pop(item_id, None)
         if self.current_item_id == item_id:
             self.detail.set_ai_busy(False, failed=True)
         if automatic:
@@ -2991,7 +2936,6 @@ class MainWindow(QMainWindow):
         thumbnail_timeout_ms: int | None = None,
     ) -> bool:
         self._closing = True
-        self._async_signals.clear()
         self.shutdown_coordinator.finalize_core(
             executor_timeout=executor_timeout,
             thumbnail_timeout_ms=thumbnail_timeout_ms,
