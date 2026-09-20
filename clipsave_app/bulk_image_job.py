@@ -9,12 +9,27 @@ from typing import Protocol
 from .bulk_checkpoint import BulkImageCheckpoint, save_checkpoint
 from .database import LibraryDatabase
 from .file_preflight import OperationCancelled, preflight_image_file
+from .image_work_coordinator import ImageWorkCoordinator, image_task_estimate
 
 
 class ImageAnalysisService(Protocol):
-    def ocr_image(self, image, cancel_event, *, expected_sha256: str) -> str: ...
+    def ocr_image(
+        self,
+        image,
+        cancel_event,
+        *,
+        expected_sha256: str,
+        source_root: Path | None = None,
+    ) -> str: ...
 
-    def describe_image(self, image, cancel_event, *, expected_sha256: str) -> str: ...
+    def describe_image(
+        self,
+        image,
+        cancel_event,
+        *,
+        expected_sha256: str,
+        source_root: Path | None = None,
+    ) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,10 +54,12 @@ class BulkImageJob:
         database: LibraryDatabase,
         service: ImageAnalysisService,
         checkpoint_path: Path,
+        work_coordinator: ImageWorkCoordinator | None = None,
     ) -> None:
         self.database = database
         self.service = service
         self.checkpoint_path = Path(checkpoint_path)
+        self.work_coordinator = work_coordinator or ImageWorkCoordinator()
 
     def run(
         self,
@@ -85,18 +102,47 @@ class BulkImageJob:
                 continue
 
             try:
+                try:
+                    external = bool(item["external"])
+                except (KeyError, IndexError, TypeError):
+                    external = False
+                processor_kwargs = {"expected_sha256": item["content_hash"]}
+                if external:
+                    processor_kwargs["source_root"] = Path(item["path"]).parent
+                estimated_bytes = image_task_estimate(item)
                 if current.stage == "ocr":
                     progress(current.processed, total, item_id, "正在 OCR")
-                    ocr_text = self.service.ocr_image(
-                        image_snapshot,
-                        cancel_event,
-                        expected_sha256=item["content_hash"],
-                    )
+                    if (
+                        current.pending_stage == "ocr"
+                        and current.pending_content_hash == item["content_hash"]
+                    ):
+                        ocr_text = current.pending_text
+                    else:
+                        if current.pending_stage:
+                            current = current.clear_pending()
+                            save_checkpoint(self.checkpoint_path, current)
+                        ocr_text = self.work_coordinator.run_bounded(
+                            item_id,
+                            "ocr",
+                            lambda task_cancel_event: self.service.ocr_image(
+                                image_snapshot,
+                                task_cancel_event,
+                                **processor_kwargs,
+                            ),
+                            estimated_bytes=estimated_bytes,
+                            cancel_event=cancel_event,
+                        )
+                        current = current.with_pending(
+                            "ocr",
+                            str(ocr_text),
+                            str(item["content_hash"]),
+                        )
+                        save_checkpoint(self.checkpoint_path, current)
                     image_snapshot.require_current()
                     if not self.database.update_ocr_if_current(
                         item_id,
                         item["content_hash"],
-                        ocr_text,
+                        str(ocr_text),
                     ):
                         current, checkpoint_error = self._advance_and_save(current, "skipped")
                         if checkpoint_error:
@@ -108,16 +154,37 @@ class BulkImageJob:
                     save_checkpoint(self.checkpoint_path, current)
 
                 progress(current.processed, total, item_id, "正在生成描述")
-                description = self.service.describe_image(
-                    image_snapshot,
-                    cancel_event,
-                    expected_sha256=item["content_hash"],
-                )
+                if (
+                    current.pending_stage == "description"
+                    and current.pending_content_hash == item["content_hash"]
+                ):
+                    description = current.pending_text
+                else:
+                    if current.pending_stage:
+                        current = current.clear_pending()
+                        save_checkpoint(self.checkpoint_path, current)
+                    description = self.work_coordinator.run_bounded(
+                        item_id,
+                        "ai",
+                        lambda task_cancel_event: self.service.describe_image(
+                            image_snapshot,
+                            task_cancel_event,
+                            **processor_kwargs,
+                        ),
+                        estimated_bytes=estimated_bytes,
+                        cancel_event=cancel_event,
+                    )
+                    current = current.with_pending(
+                        "description",
+                        str(description),
+                        str(item["content_hash"]),
+                    )
+                    save_checkpoint(self.checkpoint_path, current)
                 image_snapshot.require_current()
                 if not self.database.update_ai_if_current(
                     item_id,
                     item["content_hash"],
-                    description,
+                    str(description),
                 ):
                     current, checkpoint_error = self._advance_and_save(current, "skipped")
                     if checkpoint_error:

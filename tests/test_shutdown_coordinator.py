@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from clipsave_app.shutdown_coordinator import ShutdownCoordinator, ShutdownFailure
 
@@ -40,3 +40,16 @@ class ShutdownCoordinatorTests(unittest.TestCase):
         grid.resume_thumbnail_loader.assert_called_once_with()
         detail.resume_thumbnail_loader.assert_called_once_with()
         clipboard.shutdown.assert_not_called()
+
+    def test_finalize_core_does_not_close_database_when_executor_shutdown_times_out(self):
+        coordinator, database, _clipboard, grid, detail = self.make_coordinator()
+
+        with patch(
+            "clipsave_app.shutdown_coordinator.shutdown_ai_ocr_task_executor",
+            return_value=False,
+        ):
+            self.assertFalse(coordinator.finalize_core(executor_timeout=0.0))
+
+        grid.shutdown_thumbnail_loader.assert_not_called()
+        detail.shutdown_thumbnail_loader.assert_not_called()
+        database.close.assert_not_called()

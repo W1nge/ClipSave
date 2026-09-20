@@ -335,9 +335,9 @@ class LibraryMutationController(QObject):
 
         try:
             self.supervisor.start_thread(token, work)
-        except Exception as exc:
+        except Exception:
             self.delete_requests.pop(item_id, None)
             self.pending_delete_item_ids.discard(item_id)
-            self.delete_failed.emit(token, marker, item_id, str(exc))
+            raise
         return request
 

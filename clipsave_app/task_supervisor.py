@@ -57,7 +57,14 @@ class TaskSupervisor:
             if token in self.regular_tasks or token in self.bounded_tasks:
                 raise ValueError("Task token is already active")
             self.regular_tasks[token] = (cancel_event, thread)
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            with self.lock:
+                current = self.regular_tasks.get(token)
+                if current is not None and current[1] is thread:
+                    self.regular_tasks.pop(token, None)
+            raise
         return cancel_event
 
     def track_bounded(self, token: object, handle: CancellableHandle) -> None:

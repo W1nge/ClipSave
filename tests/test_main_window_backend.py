@@ -34,6 +34,10 @@ class MainWindowBackendTests(unittest.TestCase):
             self.assertIs(backend.maintenance.supervisor, backend.tasks)
             self.assertIs(backend.images.supervisor, backend.tasks)
             self.assertIs(backend.mutations.supervisor, backend.tasks)
+            self.assertIs(
+                backend.images.work_coordinator,
+                backend.bulk_images.work_coordinator,
+            )
             self.assertEqual(
                 backend.bulk_images.checkpoint_path,
                 checkpoint_path(settings.path),

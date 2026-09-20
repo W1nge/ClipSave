@@ -11,6 +11,11 @@ from PySide6.QtCore import QObject, Signal
 from .ai_service import AIService
 from .database import LibraryDatabase
 from .file_preflight import OperationCancelled, preflight_image_file
+from .image_work_coordinator import (
+    ImageWorkBusy,
+    ImageWorkCoordinator,
+    image_task_estimate,
+)
 from .task_executor import TaskCapacityExceeded, ai_ocr_task_executor
 from .task_supervisor import TaskSupervisor
 
@@ -67,11 +72,13 @@ class ImageTaskController(QObject):
         *,
         database: LibraryDatabase | None = None,
         start_bounded: Callable[..., object] | None = None,
+        work_coordinator: ImageWorkCoordinator | None = None,
     ) -> None:
         super().__init__(parent)
         self.supervisor = supervisor
         self.database = database
         self._start_bounded = start_bounded
+        self.work_coordinator = work_coordinator or ImageWorkCoordinator()
         self.ai_requests: dict[int, tuple[object, QObject]] = {}
         self.ocr_requests: dict[int, tuple[object, QObject]] = {}
         self.automatic_ai_items: set[int] = set()
@@ -105,18 +112,16 @@ class ImageTaskController(QObject):
             )
 
         requests = self.ai_requests if operation == "ai" else self.ocr_requests
-        if item_id in requests:
-            if automatic:
-                return ImageOperationPreparation(
-                    ImageOperationPreparationState.ALREADY_RUNNING,
-                    item=item,
-                )
-            self.cancel_operation(item_id, operation)
+        if item_id in requests or self.work_coordinator.is_active(item_id, operation):
+            return ImageOperationPreparation(
+                ImageOperationPreparationState.ALREADY_RUNNING,
+                item=item,
+            )
 
         return ImageOperationPreparation(
             ImageOperationPreparationState.READY,
             item=item,
-            estimated_bytes=self._image_task_estimate(item),
+            estimated_bytes=image_task_estimate(item),
         )
 
     def automatic_operations_for_item(
@@ -137,24 +142,17 @@ class ImageTaskController(QObject):
             auto_ocr
             and not str(item["ocr_text"] or "").strip()
             and item_id not in self.ocr_requests
+            and not self.work_coordinator.is_active(item_id, "ocr")
         ):
             operations.append("ocr")
         if (
             auto_description
             and not str(item["ai_description"] or "").strip()
             and item_id not in self.ai_requests
+            and not self.work_coordinator.is_active(item_id, "ai")
         ):
             operations.append("ai")
         return tuple(operations)
-
-    @staticmethod
-    def _image_task_estimate(item) -> int:
-        try:
-            width = max(0, int(item["width"] or 0))
-            height = max(0, int(item["height"] or 0))
-            return width * height * 4
-        except (KeyError, TypeError, ValueError):
-            return 0
 
     def start_image_operation(
         self,
@@ -178,25 +176,38 @@ class ImageTaskController(QObject):
             automatic_items.add(item_id)
 
         def work(cancel_event: threading.Event) -> None:
+            claimed = False
+            handed_off = False
             try:
+                if not self.work_coordinator.claim(item_id, operation, token):
+                    raise ImageWorkBusy("相同图片任务正在运行，请稍后重试。")
+                claimed = True
                 image_snapshot = preflight_image_file(Path(item["path"]))
                 processor = service.describe_image if is_ai else service.ocr_image
-                result_text = processor(
-                    image_snapshot,
-                    cancel_event,
-                    expected_sha256=expected_hash,
-                )
+                try:
+                    external = bool(item["external"])
+                except (KeyError, IndexError, TypeError):
+                    external = False
+                processor_kwargs = {"expected_sha256": expected_hash}
+                if external:
+                    processor_kwargs["source_root"] = Path(item["path"]).parent
+                result_text = processor(image_snapshot, cancel_event, **processor_kwargs)
                 image_snapshot.require_current()
                 if cancel_event.is_set():
                     return
                 signal = self.ai_succeeded if is_ai else self.ocr_succeeded
                 signal.emit(token, marker, item_id, result_text, expected_hash)
+                handed_off = True
             except OperationCancelled:
                 return
             except Exception as exc:
                 if not cancel_event.is_set():
                     signal = self.ai_failed if is_ai else self.ocr_failed
                     signal.emit(token, marker, item_id, str(exc))
+                    handed_off = True
+            finally:
+                if claimed and not handed_off:
+                    self.work_coordinator.release(item_id, operation, token)
 
         try:
             self._submit_bounded(token, work, estimated_bytes=estimated_bytes)
@@ -271,6 +282,7 @@ class ImageTaskController(QObject):
         marker: QObject,
     ) -> tuple[bool, bool]:
         self.supervisor.finish_bounded(token)
+        self.work_coordinator.release(item_id, operation, token)
         is_ai = operation == "ai"
         requests = self.ai_requests if is_ai else self.ocr_requests
         automatic_items = self.automatic_ai_items if is_ai else self.automatic_ocr_items
@@ -292,6 +304,7 @@ class ImageTaskController(QObject):
     ) -> ImageOperationCompletion:
         if not self.is_current_operation(item_id, operation, token, marker):
             self.supervisor.finish_bounded(token)
+            self.work_coordinator.release(item_id, operation, token)
             return ImageOperationCompletion(matched=False)
         if self.database is None:
             matched, automatic = self.finish_operation(
@@ -393,6 +406,8 @@ class ImageTaskController(QObject):
                 requests.pop(item_id, None)
                 automatic_items.discard(item_id)
                 self.supervisor.finish_bounded(token)
+                operation = "ai" if requests is self.ai_requests else "ocr"
+                self.work_coordinator.release(item_id, operation, token)
                 completed.append(item_id)
 
         expanded_finished = False
@@ -414,6 +429,12 @@ class ImageTaskController(QObject):
         )
 
     def clear_state(self) -> None:
+        for operation, requests in (
+            ("ai", self.ai_requests),
+            ("ocr", self.ocr_requests),
+        ):
+            for item_id, (token, _marker) in requests.items():
+                self.work_coordinator.release(item_id, operation, token)
         self.ai_requests.clear()
         self.ocr_requests.clear()
         self.automatic_ai_items.clear()

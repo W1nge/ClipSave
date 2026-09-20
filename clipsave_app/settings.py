@@ -144,9 +144,13 @@ class Settings:
         backup_temporary = None
         try:
             current = _read_settings(self.path)
-            if current is not None:
+            backup_source = current
+            if backup_source is None:
+                backup_source = _read_settings(self.backup_path)
+            if backup_source is not None:
                 backup_data = DEFAULTS.copy()
-                backup_data.update(current)
+                backup_data.update(backup_source)
+                backup_data["ai_api_key"] = ""
                 backup_temporary = _write_json_temp(self.backup_path, backup_data)
                 os.replace(backup_temporary, self.backup_path)
                 backup_temporary = None

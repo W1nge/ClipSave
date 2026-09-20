@@ -160,12 +160,17 @@ class ShutdownCoordinator:
         self.grid.resume_thumbnail_loader()
         self.detail.resume_thumbnail_loader()
 
+    def stop_compute_executor(self, timeout: float) -> bool:
+        return shutdown_ai_ocr_task_executor(timeout=max(0.0, timeout))
+
     def finalize_core(
         self,
         *,
         executor_timeout: float,
         thumbnail_timeout_ms: int | None = None,
-    ) -> None:
+    ) -> bool:
+        if not self.stop_compute_executor(executor_timeout):
+            return False
         if thumbnail_timeout_ms is None:
             self.grid.shutdown_thumbnail_loader()
             self.detail.shutdown_thumbnail_loader()
@@ -174,10 +179,10 @@ class ShutdownCoordinator:
             self.grid.shutdown_thumbnail_loader(timeout_ms=timeout_ms)
             self.detail.shutdown_thumbnail_loader(timeout_ms=timeout_ms)
         if self.runtime is None:
-            shutdown_ai_ocr_task_executor(timeout=max(0.0, executor_timeout))
             self.database.close()
+            return True
         else:
-            self.runtime.close_core(executor_timeout=executor_timeout)
+            return self.runtime.close_core(executor_timeout=0.0)
 
     def _recover_interactive_resources(self, monitoring_was_active: bool) -> None:
         self.resume_thumbnails()

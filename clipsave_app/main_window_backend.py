@@ -9,6 +9,7 @@ from .bulk_checkpoint import checkpoint_path
 from .bulk_image_controller import BulkImageController
 from .database import LibraryDatabase
 from .image_task_controller import ImageTaskController
+from .image_work_coordinator import ImageWorkCoordinator
 from .library_controller import LibraryController
 from .library_metadata_controller import LibraryMetadataController
 from .maintenance_controller import LibraryMaintenanceController
@@ -41,6 +42,7 @@ class MainWindowBackend:
         self.tasks = TaskSupervisor()
         self._start_regular_hook = start_regular
         self._cancel_regular_hook = cancel_regular
+        self.image_work = ImageWorkCoordinator()
         self.library = LibraryController(database, self.tasks, parent=parent)
         self.metadata = LibraryMetadataController(database)
         self.maintenance = LibraryMaintenanceController(
@@ -53,6 +55,7 @@ class MainWindowBackend:
             parent=parent,
             database=database,
             start_bounded=start_bounded,
+            work_coordinator=self.image_work,
         )
         self.mutations = LibraryMutationController(
             database,
@@ -64,6 +67,7 @@ class MainWindowBackend:
             checkpoint_path(Path(settings.path)),
             start_task=self.start_regular,
             cancel_task=self.cancel_regular,
+            work_coordinator=self.image_work,
             parent=parent,
         )
 

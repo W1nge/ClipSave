@@ -152,6 +152,30 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.get("ai_api_key"), "previous")
         self.assertTrue(settings.get("close_to_tray"))
 
+    def test_clearing_api_key_scrubs_secret_from_primary_and_backup(self):
+        settings = Settings(self.path)
+        settings.set("ai_api_key", "SECRET_OLD_KEY")
+        settings.set("ai_api_key", "")
+
+        primary = json.loads(self.path.read_text(encoding="utf-8"))
+        backup = json.loads(settings.backup_path.read_text(encoding="utf-8"))
+        self.assertEqual(primary["ai_api_key"], "")
+        self.assertEqual(backup["ai_api_key"], "")
+
+    def test_clearing_recovered_api_key_scrubs_legacy_backup_secret(self):
+        backup_path = self.path.with_name(f"{self.path.name}.bak")
+        self.path.write_text("{broken", encoding="utf-8")
+        backup_path.write_text(
+            json.dumps({"ai_api_key": "LEGACY_SECRET", "view_mode": "list"}),
+            encoding="utf-8",
+        )
+        settings = Settings(self.path)
+        self.assertEqual(settings.get("ai_api_key"), "LEGACY_SECRET")
+
+        settings.set("ai_api_key", "")
+
+        self.assertEqual(json.loads(backup_path.read_text(encoding="utf-8"))["ai_api_key"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

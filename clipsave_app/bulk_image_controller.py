@@ -16,6 +16,7 @@ from .bulk_checkpoint import (
 )
 from .bulk_image_job import BulkImageJob, BulkImageResult
 from .database import LibraryDatabase
+from .image_work_coordinator import ImageWorkCoordinator
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +41,7 @@ class BulkImageController(QObject):
         *,
         start_task: Callable[[object, Callable[[threading.Event], None]], object],
         cancel_task: Callable[[object], None] | None = None,
+        work_coordinator: ImageWorkCoordinator | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -47,6 +49,7 @@ class BulkImageController(QObject):
         self.checkpoint_path = Path(checkpoint_path)
         self._start_task = start_task
         self._cancel_task = cancel_task
+        self.work_coordinator = work_coordinator or ImageWorkCoordinator()
         self.request: object | None = None
         self.progress_state = self._initial_progress_state()
         self._worker_progress.connect(self._on_worker_progress)
@@ -139,7 +142,12 @@ class BulkImageController(QObject):
         )
 
         def work(cancel_event: threading.Event) -> None:
-            job = BulkImageJob(self.database, service, self.checkpoint_path)
+            job = BulkImageJob(
+                self.database,
+                service,
+                self.checkpoint_path,
+                self.work_coordinator,
+            )
             result = job.run(
                 checkpoint,
                 cancel_event,

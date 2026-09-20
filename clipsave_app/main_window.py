@@ -1585,19 +1585,24 @@ class MainWindow(QMainWindow):
         was_selected = self.current_item_id == item_id
         detail_was_visible = self.detail.isVisible()
         library_root = self.database.library_dir
-        request = self.mutation_controller.start_delete(
-            item_snapshot,
-            was_selected=was_selected,
-            detail_was_visible=detail_was_visible,
-            is_managed=self.database.is_managed_path,
-            recycle=lambda path, root, **kwargs: recycle_managed_file(
-                path,
-                root,
-                send2trash,
-                **kwargs,
-            ),
-            library_root=library_root,
-        )
+        try:
+            self.mutation_controller.start_delete(
+                item_snapshot,
+                was_selected=was_selected,
+                detail_was_visible=detail_was_visible,
+                is_managed=self.database.is_managed_path,
+                recycle=lambda path, root, **kwargs: recycle_managed_file(
+                    path,
+                    root,
+                    send2trash,
+                    **kwargs,
+                ),
+                library_root=library_root,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", f"删除任务无法启动。\n\n{exc}")
+            self.show_status("删除失败：后台任务无法启动")
+            return
         self._cancel_item_requests(item_id)
         if was_selected:
             self.current_item_id = None
@@ -1606,8 +1611,6 @@ class MainWindow(QMainWindow):
             self.detail.clear_item()
         self._apply_items(self.current_items)
         self.show_status("正在删除内容…")
-        if item_id not in self.mutation_controller.delete_requests:
-            self._delete_failed(request[0], request[1], item_id, "删除任务无法启动")
 
     def _restore_delete_view(self, item_id: int, was_selected: bool, detail_was_visible: bool) -> None:
         # Failure/cancellation recovery is rare and must restore selection against
@@ -2310,10 +2313,15 @@ class MainWindow(QMainWindow):
                     "图片索引缺少内容校验值，请重新导入后再试。",
                 )
             return False
-        if preparation.state in {
-            ImageOperationPreparationState.ALREADY_RUNNING,
-            ImageOperationPreparationState.DATABASE_UNAVAILABLE,
-        }:
+        if preparation.state is ImageOperationPreparationState.ALREADY_RUNNING:
+            if not automatic:
+                self.show_status(
+                    "该图片的 AI 描述任务正在运行"
+                    if is_ai
+                    else "该图片的 OCR 任务正在运行"
+                )
+            return False
+        if preparation.state is ImageOperationPreparationState.DATABASE_UNAVAILABLE:
             return False
         item = preparation.item
         if item is None:
@@ -2711,6 +2719,9 @@ class MainWindow(QMainWindow):
             return abort(monitoring_was_active)
         self._clear_background_request_state()
 
+        if not self.shutdown_coordinator.stop_compute_executor(remaining()):
+            return abort(monitoring_was_active)
+
         if not self.shutdown_coordinator.finish_session_end(remaining()):
             return abort(monitoring_was_active)
 
@@ -2725,11 +2736,12 @@ class MainWindow(QMainWindow):
         executor_timeout: float,
         thumbnail_timeout_ms: int | None = None,
     ) -> bool:
-        self._closing = True
-        self.shutdown_coordinator.finalize_core(
+        if not self.shutdown_coordinator.finalize_core(
             executor_timeout=executor_timeout,
             thumbnail_timeout_ms=thumbnail_timeout_ms,
-        )
+        ):
+            return False
+        self._closing = True
         self.tray.hide()
         application = QApplication.instance()
         if application is not None:
@@ -2826,6 +2838,17 @@ class MainWindow(QMainWindow):
             )
             return False
         self._clear_background_request_state()
+        if not self.shutdown_coordinator.stop_compute_executor(2.0):
+            self.backup_timer.start()
+            self._quit_in_progress = False
+            self.force_quit = False
+            self._set_interactions_enabled(True)
+            QMessageBox.warning(
+                self,
+                "ClipSave 正在结束 AI/OCR 线程",
+                "后台 AI/OCR 执行线程仍在结束。ClipSave 已取消退出，请稍后再次退出。",
+            )
+            return False
         shutdown_result = self.shutdown_coordinator.shutdown_interactive_resources()
         if not shutdown_result.succeeded:
             self.backup_timer.start()

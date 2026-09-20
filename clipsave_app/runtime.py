@@ -31,15 +31,17 @@ class ApplicationRuntime:
             raise
         return cls(paths, database, settings, clipboard_service)
 
-    def close_core(self, *, executor_timeout: float = 2.0) -> None:
+    def close_core(self, *, executor_timeout: float = 2.0) -> bool:
         if self._core_closed:
-            return
-        shutdown_ai_ocr_task_executor(timeout=max(0.0, executor_timeout))
+            return True
+        if not shutdown_ai_ocr_task_executor(timeout=max(0.0, executor_timeout)):
+            return False
         self.database.close()
         self._core_closed = True
+        return True
 
     def close(self, *, timeout: float = 2.0) -> bool:
         clipboard_stopped = self.clipboard_service.shutdown(timeout=max(0.0, timeout))
-        if clipboard_stopped:
-            self.close_core(executor_timeout=timeout)
-        return clipboard_stopped
+        if not clipboard_stopped:
+            return False
+        return self.close_core(executor_timeout=timeout)

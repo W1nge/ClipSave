@@ -1,6 +1,7 @@
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from clipsave_app.task_supervisor import TaskSupervisor
 
@@ -64,3 +65,14 @@ class TaskSupervisorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             supervisor.track_bounded(token, FakeBoundedHandle())
         self.assertTrue(supervisor.wait_for_token(token, 1.0))
+
+    def test_thread_start_failure_rolls_back_registered_token(self):
+        supervisor = TaskSupervisor()
+        token = object()
+
+        with patch("threading.Thread.start", side_effect=RuntimeError("no threads")):
+            with self.assertRaisesRegex(RuntimeError, "no threads"):
+                supervisor.start_thread(token, lambda _cancel: None)
+
+        self.assertNotIn(token, supervisor.regular_tasks)
+        self.assertTrue(supervisor.token_done(token))

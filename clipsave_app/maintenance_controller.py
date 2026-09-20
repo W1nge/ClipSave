@@ -46,7 +46,12 @@ class LibraryMaintenanceController(QObject):
                 if not cancel_event.is_set():
                     self.scan_failed.emit(token, marker, str(exc))
 
-        self.supervisor.start_thread(token, work)
+        try:
+            self.supervisor.start_thread(token, work)
+        except Exception as exc:
+            self.scan_failed.emit(token, marker, str(exc))
+            if self.startup_request == request:
+                self.startup_request = None
         return request
 
     def start_backup_if_dirty(self) -> tuple[object, QObject] | None:
@@ -69,7 +74,12 @@ class LibraryMaintenanceController(QObject):
             except Exception as exc:
                 self.backup_failed.emit(token, marker, str(exc))
 
-        self.supervisor.start_thread(token, work)
+        try:
+            self.supervisor.start_thread(token, work)
+        except Exception as exc:
+            self.backup_failed.emit(token, marker, str(exc))
+            if self.backup_request == request:
+                self.backup_request = None
         return request
 
     def finish_scan(self, token: object, marker: QObject) -> bool:

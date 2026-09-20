@@ -948,6 +948,29 @@ class AIServiceTests(unittest.TestCase):
             with patch("clipsave_app.services.PICTURE_DIR", Path(temporary) / "Other"):
                 self.assertEqual(service._picture_root(), explicit_root)
 
+    def test_external_image_can_be_encoded_with_explicit_identity_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            managed = root / "Pictures"
+            managed.mkdir()
+            external_dir = root / "External"
+            external_dir.mkdir()
+            external = external_dir / "outside.png"
+            PILImage.new("RGB", (8, 6), "red").save(external)
+            service = AIService(
+                "http://localhost/v1",
+                "",
+                "vision",
+                picture_root=managed,
+            )
+
+            with self.assertRaises(RuntimeError):
+                service._encode_image(external)
+            encoded = service._encode_image(external, source_root=external_dir)
+
+            with PILImage.open(io.BytesIO(base64.b64decode(encoded))) as image:
+                self.assertEqual(image.size, (8, 6))
+
     def test_preflight_rejects_truncated_image_payload(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "truncated.jpg"
@@ -971,6 +994,34 @@ class AIServiceTests(unittest.TestCase):
         self.assertTrue(request.get_header("User-agent").startswith("ClipSave/"))
         self.assertEqual(request.get_header("Accept"), "application/json")
         self.assertLessEqual(response.read_limit, 64 * 1024)
+
+    def test_loopback_http_service_can_use_api_key(self):
+        service = AIService("http://127.0.0.1:11434/v1", "local-secret", "vision")
+        response = FakeResponse(json.dumps({"ok": True}).encode("utf-8"))
+
+        with patch.object(service, "_open_request", return_value=response) as open_request:
+            self.assertEqual(service._post("/test", {}), {"ok": True})
+
+        request = open_request.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer local-secret")
+
+    def test_remote_plain_http_refuses_api_key_before_network_request(self):
+        service = AIService("http://example.com/v1", "remote-secret", "vision")
+
+        with patch.object(service, "_open_request") as open_request:
+            with self.assertRaisesRegex(RuntimeError, "HTTPS"):
+                service._post("/test", {})
+
+        open_request.assert_not_called()
+
+    def test_non_https_non_loopback_scheme_refuses_api_key_before_network_request(self):
+        service = AIService("ftp://example.com/v1", "remote-secret", "vision")
+
+        with patch.object(service, "_open_request") as open_request:
+            with self.assertRaisesRegex(RuntimeError, "HTTPS"):
+                service._post("/test", {})
+
+        open_request.assert_not_called()
 
     def test_cloudflare_1010_error_has_actionable_message(self):
         service = AIService("https://example.com/v1", "secret", "vision")

@@ -1,6 +1,7 @@
 import os
 import time
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -87,3 +88,26 @@ class MaintenanceControllerTests(unittest.TestCase):
         self.assertIsNotNone(request)
         self.assertIs(dirty_controller.start_backup_if_dirty(), None)
         self.assertTrue(self.wait_for(lambda: dirty.backups == 1))
+
+    def test_scan_start_failure_reports_error_and_clears_request(self):
+        controller = LibraryMaintenanceController(FakeDatabase(), TaskSupervisor())
+        failures = []
+        controller.scan_failed.connect(lambda token, marker, message: failures.append(message))
+
+        with patch.object(controller.supervisor, "start_thread", side_effect=RuntimeError("no threads")):
+            controller.start_scan(True, False)
+
+        self.assertIsNone(controller.startup_request)
+        self.assertEqual(failures, ["no threads"])
+
+    def test_backup_start_failure_reports_error_and_does_not_poison_periodic_backup(self):
+        controller = LibraryMaintenanceController(FakeDatabase(dirty=True), TaskSupervisor())
+        failures = []
+        controller.backup_failed.connect(lambda token, marker, message: failures.append(message))
+
+        with patch.object(controller.supervisor, "start_thread", side_effect=RuntimeError("no threads")):
+            request = controller.start_backup_if_dirty()
+
+        self.assertIsNotNone(request)
+        self.assertIsNone(controller.backup_request)
+        self.assertEqual(failures, ["no threads"])

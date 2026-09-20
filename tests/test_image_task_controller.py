@@ -2,6 +2,7 @@ import os
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -10,6 +11,7 @@ from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QApplication
 
 from clipsave_app.image_task_controller import ImageTaskController
+from clipsave_app.image_work_coordinator import ImageWorkCoordinator
 from clipsave_app.task_supervisor import TaskSupervisor
 
 
@@ -19,10 +21,15 @@ class FakeSnapshot:
 
 
 class FakeService:
-    def describe_image(self, _snapshot, _cancel, *, expected_sha256):
+    def __init__(self):
+        self.source_roots = []
+
+    def describe_image(self, _snapshot, _cancel, *, expected_sha256, source_root=None):
+        self.source_roots.append(source_root)
         return f"description:{expected_sha256[:4]}"
 
-    def ocr_image(self, _snapshot, _cancel, *, expected_sha256):
+    def ocr_image(self, _snapshot, _cancel, *, expected_sha256, source_root=None):
+        self.source_roots.append(source_root)
         return f"ocr:{expected_sha256[:4]}"
 
     def expand_search_query(self, query, _cancel):
@@ -118,6 +125,29 @@ class ImageTaskControllerTests(unittest.TestCase):
         self.assertIn(7, controller.automatic_ai_items)
         self.assertEqual(results[0][2], 7)
         self.assertEqual(results[0][3], "description:aaaa")
+
+    @patch("clipsave_app.image_task_controller.preflight_image_file", return_value=FakeSnapshot())
+    @patch("clipsave_app.image_task_controller.ai_ocr_task_executor", return_value=ImmediateExecutor())
+    def test_external_image_operation_passes_parent_as_identity_root(self, _executor, _preflight):
+        controller = ImageTaskController(TaskSupervisor())
+        service = FakeService()
+        item = {
+            "id": 8,
+            "path": str(Path("external") / "image.png"),
+            "content_hash": "b" * 64,
+            "external": 1,
+        }
+
+        controller.start_image_operation(
+            item,
+            service,
+            operation="ocr",
+            automatic=False,
+            estimated_bytes=16,
+        )
+        self.app.processEvents()
+
+        self.assertEqual(service.source_roots, [Path("external")])
 
     @patch("clipsave_app.image_task_controller.ai_ocr_task_executor", return_value=ImmediateExecutor())
     def test_expanded_search_has_controller_owned_request(self, _executor):
@@ -332,6 +362,106 @@ class ImageTaskControllerTests(unittest.TestCase):
             automatic=True,
         )
         self.assertEqual(duplicate.state.value, "already_running")
+
+        manual_duplicate = controller.prepare_image_operation(
+            7,
+            service,
+            operation="ai",
+            automatic=False,
+        )
+        self.assertEqual(manual_duplicate.state.value, "already_running")
+
+    def test_prepare_rejects_operation_owned_by_shared_coordinator(self):
+        item = {
+            "id": 7,
+            "kind": "image",
+            "path": "image.png",
+            "content_hash": "a" * 64,
+            "width": 20,
+            "height": 10,
+        }
+        coordinator = ImageWorkCoordinator()
+        owner = object()
+        self.assertTrue(coordinator.claim(7, "ocr", owner))
+        controller = ImageTaskController(
+            TaskSupervisor(),
+            database=FakeDatabase(item=item),
+            work_coordinator=coordinator,
+        )
+        service = FakeService()
+        service.configured = True
+
+        result = controller.prepare_image_operation(
+            7,
+            service,
+            operation="ocr",
+            automatic=False,
+        )
+
+        self.assertEqual(result.state.value, "already_running")
+        coordinator.release(7, "ocr", owner)
+
+    def test_clear_state_releases_outstanding_coordinator_claims(self):
+        coordinator = ImageWorkCoordinator()
+        controller = ImageTaskController(
+            TaskSupervisor(),
+            work_coordinator=coordinator,
+        )
+        ai_token = object()
+        ocr_token = object()
+        controller.ai_requests[7] = (ai_token, QObject(controller))
+        controller.ocr_requests[8] = (ocr_token, QObject(controller))
+        self.assertTrue(coordinator.claim(7, "ai", ai_token))
+        self.assertTrue(coordinator.claim(8, "ocr", ocr_token))
+
+        controller.clear_state()
+
+        self.assertFalse(coordinator.is_active(7, "ai"))
+        self.assertFalse(coordinator.is_active(8, "ocr"))
+        self.assertFalse(controller.ai_requests)
+        self.assertFalse(controller.ocr_requests)
+
+    @patch("clipsave_app.image_task_controller.preflight_image_file", return_value=FakeSnapshot())
+    @patch("clipsave_app.image_task_controller.ai_ocr_task_executor", return_value=ImmediateExecutor())
+    def test_operation_claim_is_held_until_result_commit(self, _executor, _preflight):
+        item = {
+            "id": 12,
+            "kind": "image",
+            "path": "image.png",
+            "content_hash": "d" * 64,
+            "external": 0,
+        }
+        database = FakeDatabase(item=item, saved=True)
+        coordinator = ImageWorkCoordinator()
+        controller = ImageTaskController(
+            TaskSupervisor(),
+            database=database,
+            work_coordinator=coordinator,
+        )
+        service = FakeService()
+        results = []
+        controller.ocr_succeeded.connect(lambda *args: results.append(args))
+
+        token, marker = controller.start_image_operation(
+            item,
+            service,
+            operation="ocr",
+            automatic=False,
+            estimated_bytes=16,
+        )
+
+        self.assertTrue(coordinator.is_active(12, "ocr"))
+        self.assertEqual(results[0][3], "ocr:dddd")
+        completion = controller.commit_operation(
+            12,
+            "ocr",
+            token,
+            marker,
+            "d" * 64,
+            results[0][3],
+        )
+        self.assertTrue(completion.saved)
+        self.assertFalse(coordinator.is_active(12, "ocr"))
 
     def test_automatic_operations_for_item_owns_result_and_request_checks(self):
         item = {

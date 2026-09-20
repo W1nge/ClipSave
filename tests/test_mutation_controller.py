@@ -153,6 +153,24 @@ class MutationControllerTests(unittest.TestCase):
         self.assertEqual(database.removed, [9])
         self.assertEqual(results[0][3]["outcome"], "deleted")
 
+    def test_delete_start_failure_rolls_back_controller_state_and_raises(self):
+        supervisor = TaskSupervisor()
+        controller = LibraryMutationController(FakeDatabase(), supervisor)
+
+        with patch.object(supervisor, "start_thread", side_effect=RuntimeError("no threads")):
+            with self.assertRaisesRegex(RuntimeError, "no threads"):
+                controller.start_delete(
+                    {"id": 9, "path": None, "content_hash": None, "file_size": 0},
+                    was_selected=True,
+                    detail_was_visible=True,
+                    is_managed=lambda _path: False,
+                    recycle=Mock(),
+                    library_root=Path("."),
+                )
+
+        self.assertNotIn(9, controller.delete_requests)
+        self.assertNotIn(9, controller.pending_delete_item_ids)
+
     def test_shutdown_cleanup_waits_for_copy_and_returns_delete_restore(self):
         supervisor = TaskSupervisor()
         controller = LibraryMutationController(FakeDatabase(), supervisor)

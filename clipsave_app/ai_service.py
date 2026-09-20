@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import io
 import json
 import os
@@ -142,8 +143,35 @@ class AIService:
         opener = urllib.request.build_opener(AIService._SameOriginRedirectHandler())
         return opener.open(request, timeout=timeout)
 
+    @staticmethod
+    def _is_loopback_host(hostname: str | None) -> bool:
+        if not hostname:
+            return False
+        host = hostname.rstrip(".").casefold()
+        if host == "localhost" or host.endswith(".localhost"):
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    def _validate_api_key_transport(self) -> None:
+        if not self.api_key:
+            return
+        parsed = urllib.parse.urlsplit(self.base_url)
+        scheme = parsed.scheme.casefold()
+        if scheme == "https":
+            return
+        if scheme == "http" and self._is_loopback_host(parsed.hostname):
+            return
+        raise RuntimeError(
+            "AI 服务使用 API Key 时必须使用 HTTPS；"
+            "本机 localhost/127.0.0.1/::1 服务仍允许使用 HTTP。"
+        )
+
     def _post(self, path: str, payload: dict, cancel_event: threading.Event | None = None) -> dict:
         _raise_if_cancelled(cancel_event)
+        self._validate_api_key_transport()
         deadline = time.monotonic() + self.REQUEST_DEADLINE_SECONDS
         headers = {
             "Accept": "application/json",
@@ -335,6 +363,7 @@ class AIService:
         cancel_event: threading.Event | None = None,
         *,
         expected_sha256: str | None = None,
+        source_root: Path | None = None,
         max_dimension: int = DESCRIPTION_MAX_IMAGE_DIMENSION,
         quality: int = DESCRIPTION_JPEG_QUALITY,
     ) -> str:
@@ -347,7 +376,7 @@ class AIService:
         with open_managed_binary(
             snapshot.path,
             "rb",
-            self._picture_root(),
+            source_root if source_root is not None else self._picture_root(),
             identity_locked=True,
         ) as handle:
             current = os.fstat(handle.fileno())
@@ -393,6 +422,7 @@ class AIService:
         cancel_event: threading.Event | None = None,
         *,
         expected_sha256: str | None = None,
+        source_root: Path | None = None,
         image_max_dimension: int | None = None,
         image_quality: int | None = None,
         allow_empty: bool = False,
@@ -401,6 +431,7 @@ class AIService:
             source,
             cancel_event,
             expected_sha256=expected_sha256,
+            source_root=source_root,
             max_dimension=image_max_dimension or self.DESCRIPTION_MAX_IMAGE_DIMENSION,
             quality=image_quality or self.DESCRIPTION_JPEG_QUALITY,
         )
@@ -429,12 +460,14 @@ class AIService:
         cancel_event: threading.Event | None = None,
         *,
         expected_sha256: str | None = None,
+        source_root: Path | None = None,
     ) -> str:
         return self._vision_completion(
             self.OCR_PROMPT,
             source,
             cancel_event,
             expected_sha256=expected_sha256,
+            source_root=source_root,
             image_max_dimension=self.OCR_MAX_IMAGE_DIMENSION,
             image_quality=self.OCR_JPEG_QUALITY,
             allow_empty=True,
@@ -446,12 +479,14 @@ class AIService:
         cancel_event: threading.Event | None = None,
         *,
         expected_sha256: str | None = None,
+        source_root: Path | None = None,
     ) -> str:
         return self._vision_completion(
             self.IMAGE_DESCRIPTION_PROMPT,
             source,
             cancel_event,
             expected_sha256=expected_sha256,
+            source_root=source_root,
             image_max_dimension=self.DESCRIPTION_MAX_IMAGE_DIMENSION,
             image_quality=self.DESCRIPTION_JPEG_QUALITY,
         )

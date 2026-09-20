@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from clipsave_app.app_paths import AppPaths
 from clipsave_app.runtime import ApplicationRuntime
@@ -28,6 +29,28 @@ class ApplicationRuntimeTests(unittest.TestCase):
             runtime = ApplicationRuntime.create(
                 AppPaths.build(base_dir=root / "app", local_root=root / "profile")
             )
-            runtime.close_core(executor_timeout=0.0)
-            runtime.close_core(executor_timeout=0.0)
-            self.assertTrue(runtime._core_closed)
+            try:
+                self.assertTrue(runtime.close_core(executor_timeout=1.0))
+                self.assertTrue(runtime.close_core(executor_timeout=0.0))
+                self.assertTrue(runtime._core_closed)
+            finally:
+                if not runtime._core_closed:
+                    runtime.database.close()
+
+    def test_close_core_keeps_database_open_when_executor_does_not_stop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = ApplicationRuntime.create(
+                AppPaths.build(base_dir=root / "app", local_root=root / "profile")
+            )
+            try:
+                with patch(
+                    "clipsave_app.runtime.shutdown_ai_ocr_task_executor",
+                    return_value=False,
+                ), patch.object(runtime.database, "close") as close_database:
+                    self.assertFalse(runtime.close_core(executor_timeout=0.0))
+
+                close_database.assert_not_called()
+                self.assertFalse(runtime._core_closed)
+            finally:
+                runtime.database.close()

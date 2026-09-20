@@ -1376,14 +1376,18 @@ class MainWindowTests(unittest.TestCase):
 
             self.window.search.setText("second async target")
             self.window.search_timer.stop()
+            before = time.monotonic()
             self.window._refresh_search_items_async()
+            self.assertLess(time.monotonic() - before, 0.1)
+            self.assertIsNotNone(self.window.library_controller.search_request)
+
+            first_release.set()
             self.assertTrue(
                 wait_for(
                     lambda: self.window.library_controller.search_request is None
                     and [item["id"] for item in self.window.current_items] == [second_id]
                 )
             )
-            first_release.set()
             self.app.processEvents()
 
         self.assertEqual(
@@ -2298,6 +2302,26 @@ class MainWindowTests(unittest.TestCase):
         self.assertIsNone(self.database.get_item(text_id))
         show_status.assert_called_with("内容已删除")
 
+    def test_delete_task_start_failure_keeps_item_visible_and_reports_error(self):
+        item_id = self.window.current_items[0]["id"]
+        with patch(
+            "clipsave_app.main_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch.object(
+            self.window.mutation_controller,
+            "start_delete",
+            side_effect=RuntimeError("no threads"),
+        ), patch(
+            "clipsave_app.main_window.QMessageBox.warning"
+        ) as warning, patch.object(self.window, "show_status") as show_status:
+            self.window.delete_item(item_id)
+
+        self.assertIsNotNone(self.database.get_item(item_id))
+        self.assertIn(item_id, {item["id"] for item in self.window.current_items})
+        warning.assert_called_once()
+        self.assertIn("no threads", warning.call_args.args[2])
+        show_status.assert_called_with("删除失败：后台任务无法启动")
+
     def test_delete_recycle_runs_in_background_and_hides_item_while_pending(self):
         image_path = Path(self.temp.name) / "slow-delete.png"
         image = QImage(32, 32, QImage.Format.Format_RGB32)
@@ -2425,6 +2449,28 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.force_quit)
         self.assertIs(self.window.image_task_controller.ai_requests[item_id], ai_request)
         self.assertIs(self.window.image_task_controller.ocr_requests[item_id], ocr_request)
+
+    def test_quit_does_not_shutdown_interactive_resources_when_executor_will_not_stop(self):
+        with patch.object(
+            self.window, "_cancel_and_wait_for_async_tasks", return_value=True
+        ), patch.object(
+            self.window.shutdown_coordinator,
+            "stop_compute_executor",
+            return_value=False,
+        ), patch.object(
+            self.window.shutdown_coordinator,
+            "shutdown_interactive_resources",
+        ) as shutdown_interactive, patch(
+            "clipsave_app.main_window.QMessageBox.warning"
+        ) as warning:
+            self.assertFalse(self.window.quit_application())
+
+        shutdown_interactive.assert_not_called()
+        warning.assert_called_once()
+        self.assertFalse(self.window._closing)
+        self.assertFalse(self.window._quit_in_progress)
+        self.assertFalse(self.window.force_quit)
+        self.assertTrue(self.window.centralWidget().isEnabled())
 
     def test_quit_late_failure_restores_completed_expanded_search_button(self):
         token = object()
@@ -2801,6 +2847,29 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window._quit_in_progress)
         self.assertTrue(self.window.centralWidget().isEnabled())
         self.assertTrue(all(shortcut.isEnabled() for shortcut in self.window.shortcuts))
+
+    def test_session_shutdown_aborts_before_clipboard_shutdown_when_executor_will_not_stop(self):
+        with patch.object(
+            self.window, "_cancel_and_wait_for_async_tasks", return_value=True
+        ), patch.object(
+            self.window.shutdown_coordinator,
+            "stop_compute_executor",
+            return_value=False,
+        ), patch.object(
+            self.window.clipboard_service,
+            "shutdown",
+        ) as clipboard_shutdown, patch.object(
+            self.window.clipboard_service,
+            "resume_after_failed_shutdown",
+        ) as resume:
+            self.assertFalse(self.window.quit_application_for_session_end(0.2))
+
+        clipboard_shutdown.assert_not_called()
+        resume.assert_called_once()
+        self.assertFalse(self.window._closing)
+        self.assertFalse(self.window._quit_in_progress)
+        self.assertFalse(self.window.force_quit)
+        self.assertTrue(self.window.centralWidget().isEnabled())
 
     def test_successful_session_shutdown_creates_backup_and_closes_database(self):
         application = QApplication.instance()

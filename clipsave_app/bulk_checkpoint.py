@@ -9,11 +9,12 @@ from .atomic_files import sync_directory, write_json_temp
 
 
 CHECKPOINT_FILENAME = "bulk-image-job.json"
-CHECKPOINT_VERSION = 1
-MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
+CHECKPOINT_VERSION = 2
+MAX_CHECKPOINT_BYTES = 32 * 1024 * 1024
 MAX_CHECKPOINT_ITEMS = 1_000_000
 _STAGES = {"ocr", "description"}
 _OUTCOMES = {"completed", "skipped", "failed"}
+_HEX = frozenset("0123456789abcdefABCDEF")
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,9 @@ class BulkImageCheckpoint:
     completed: int = 0
     skipped: int = 0
     failed: int = 0
+    pending_stage: str = ""
+    pending_text: str = ""
+    pending_content_hash: str = ""
     version: int = CHECKPOINT_VERSION
 
     @property
@@ -43,7 +47,40 @@ class BulkImageCheckpoint:
     def at_stage(self, stage: str) -> "BulkImageCheckpoint":
         if stage not in _STAGES:
             raise ValueError(f"Invalid bulk image stage: {stage}")
-        return replace(self, stage=stage)
+        return replace(
+            self,
+            stage=stage,
+            pending_stage="",
+            pending_text="",
+            pending_content_hash="",
+        )
+
+    def with_pending(
+        self,
+        stage: str,
+        text: str,
+        content_hash: str,
+    ) -> "BulkImageCheckpoint":
+        if stage != self.stage or stage not in _STAGES:
+            raise ValueError("Pending bulk result does not match the current stage")
+        checkpoint = replace(
+            self,
+            pending_stage=stage,
+            pending_text=text,
+            pending_content_hash=content_hash,
+        )
+        _validate_checkpoint(checkpoint)
+        return checkpoint
+
+    def clear_pending(self) -> "BulkImageCheckpoint":
+        if not self.pending_stage and not self.pending_text and not self.pending_content_hash:
+            return self
+        return replace(
+            self,
+            pending_stage="",
+            pending_text="",
+            pending_content_hash="",
+        )
 
     def advance(self, outcome: str) -> "BulkImageCheckpoint":
         if outcome not in _OUTCOMES:
@@ -60,6 +97,9 @@ class BulkImageCheckpoint:
             self,
             next_index=self.next_index + 1,
             stage="ocr",
+            pending_stage="",
+            pending_text="",
+            pending_content_hash="",
             **counters,
         )
 
@@ -87,7 +127,8 @@ def load_checkpoint(path: Path) -> BulkImageCheckpoint | None:
         raise ValueError("Bulk image checkpoint cannot be read") from exc
     if not isinstance(value, dict):
         raise ValueError("Bulk image checkpoint must be an object")
-    expected_keys = {
+    version = value.get("version")
+    legacy_keys = {
         "version",
         "image_ids",
         "next_index",
@@ -96,16 +137,30 @@ def load_checkpoint(path: Path) -> BulkImageCheckpoint | None:
         "skipped",
         "failed",
     }
-    if set(value) != expected_keys or not isinstance(value.get("image_ids"), list):
+    current_keys = legacy_keys | {
+        "pending_stage",
+        "pending_text",
+        "pending_content_hash",
+    }
+    expected_keys = legacy_keys if version == 1 else current_keys
+    if (
+        type(version) is not int
+        or version not in {1, CHECKPOINT_VERSION}
+        or set(value) != expected_keys
+        or not isinstance(value.get("image_ids"), list)
+    ):
         raise ValueError("Bulk image checkpoint has an invalid structure")
     checkpoint = BulkImageCheckpoint(
-        version=value["version"],
+        version=CHECKPOINT_VERSION,
         image_ids=tuple(value["image_ids"]),
         next_index=value["next_index"],
         stage=value["stage"],
         completed=value["completed"],
         skipped=value["skipped"],
         failed=value["failed"],
+        pending_stage=value.get("pending_stage", ""),
+        pending_text=value.get("pending_text", ""),
+        pending_content_hash=value.get("pending_content_hash", ""),
     )
     _validate_checkpoint(checkpoint)
     return checkpoint
@@ -152,3 +207,17 @@ def _validate_checkpoint(checkpoint: BulkImageCheckpoint) -> None:
         raise ValueError("Bulk image checkpoint counters do not match its position")
     if checkpoint.next_index == checkpoint.total and checkpoint.stage != "ocr":
         raise ValueError("Completed bulk image checkpoint has an invalid stage")
+    if checkpoint.pending_stage:
+        if checkpoint.pending_stage != checkpoint.stage:
+            raise ValueError("Bulk image checkpoint pending stage is inconsistent")
+        if type(checkpoint.pending_text) is not str:
+            raise ValueError("Bulk image checkpoint pending text is invalid")
+        digest = checkpoint.pending_content_hash
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(character not in _HEX for character in digest)
+        ):
+            raise ValueError("Bulk image checkpoint pending hash is invalid")
+    elif checkpoint.pending_text or checkpoint.pending_content_hash:
+        raise ValueError("Bulk image checkpoint has orphaned pending data")

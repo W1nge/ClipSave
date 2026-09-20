@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,6 +57,60 @@ class BulkImageCheckpointTests(unittest.TestCase):
             save_checkpoint(self.path, checkpoint)
 
         sync.assert_called_once_with(self.path.parent)
+
+    def test_pending_provider_result_round_trip_binds_stage_and_content_hash(self):
+        checkpoint = new_checkpoint([11]).with_pending(
+            "ocr",
+            "recognized text",
+            "a" * 64,
+        )
+
+        save_checkpoint(self.path, checkpoint)
+        loaded = load_checkpoint(self.path)
+
+        self.assertEqual(loaded, checkpoint)
+        self.assertEqual(loaded.pending_stage, "ocr")
+        self.assertEqual(loaded.pending_text, "recognized text")
+        self.assertEqual(loaded.pending_content_hash, "a" * 64)
+
+    def test_legacy_v1_checkpoint_loads_as_v2_without_pending_result(self):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "image_ids": [11],
+                    "next_index": 0,
+                    "stage": "ocr",
+                    "completed": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = load_checkpoint(self.path)
+
+        self.assertEqual(loaded.version, 2)
+        self.assertEqual(loaded.current_item_id, 11)
+        self.assertEqual(loaded.pending_stage, "")
+        self.assertEqual(loaded.pending_text, "")
+        self.assertEqual(loaded.pending_content_hash, "")
+
+    def test_checkpoint_version_requires_an_actual_integer(self):
+        payload = {
+            "version": True,
+            "image_ids": [11],
+            "next_index": 0,
+            "stage": "ocr",
+            "completed": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "invalid structure"):
+            load_checkpoint(self.path)
 
 
 if __name__ == "__main__":
