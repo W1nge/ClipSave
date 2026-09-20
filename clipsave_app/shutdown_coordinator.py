@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from enum import Enum
 from collections.abc import Callable
 
+from .clipboard_service import ClipboardService
 from .database import LibraryDatabase
 from .runtime import ApplicationRuntime
-from .services import ClipboardService, shutdown_ai_ocr_task_executor
+from .task_executor import shutdown_ai_ocr_task_executor
 
 
 class ShutdownFailure(Enum):

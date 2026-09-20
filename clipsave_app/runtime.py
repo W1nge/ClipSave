@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .app_paths import AppPaths
+from .clipboard_service import ClipboardService
 from .constants import APP_PATHS
 from .database import LibraryDatabase
-from .services import ClipboardService, shutdown_ai_ocr_task_executor
 from .settings import Settings
+from .task_executor import shutdown_ai_ocr_task_executor
 
 
 @dataclass(slots=True)

@@ -9,7 +9,7 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
 
 from .database import ImportFileDetails, LibraryDatabase
-from .services import TaskCapacityExceeded, ai_ocr_task_executor
+from .task_executor import TaskCapacityExceeded, ai_ocr_task_executor
 from .task_supervisor import TaskSupervisor
 
 

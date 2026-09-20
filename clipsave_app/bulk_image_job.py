@@ -8,7 +8,7 @@ from typing import Protocol
 
 from .bulk_checkpoint import BulkImageCheckpoint, save_checkpoint
 from .database import LibraryDatabase
-from .services import OperationCancelled, preflight_image_file
+from .file_preflight import OperationCancelled, preflight_image_file
 
 
 class ImageAnalysisService(Protocol):

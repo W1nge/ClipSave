@@ -29,9 +29,11 @@ from PySide6.QtWidgets import (
 )
 from send2trash import send2trash
 
+from .ai_service import AIService
 from .bulk_checkpoint import checkpoint_path
 from .bulk_image_controller import BulkImageCompletion, BulkImageController
 from .app_paths import AppPaths
+from .clipboard_service import ClipboardService
 from .constants import APP_NAME, LIBRARY_DIR
 from .database import LibraryDatabase
 from .detail_animation_controller import DetailAnimationController
@@ -46,15 +48,11 @@ from .image_task_controller import ImageTaskController
 from .monitoring_controller import MonitoringController
 from .mutation_controller import LibraryMutationController
 from .native_window_controller import NativeWindowController, windows_resize_hit_test
+from .file_preflight import preflight_image_file
 from .shutdown_coordinator import ShutdownCoordinator, ShutdownFailure
 from .services import (
-    AIService,
     BackdropResult,
-    ClipboardService,
-    TaskCapacityExceeded,
-    ai_ocr_task_executor,
     apply_windows_backdrop,
-    preflight_image_file,
     register_windows_power_saving_notification,
     release_windows_backdrop,
     unregister_windows_power_saving_notification,
@@ -64,6 +62,7 @@ from .sidebar_interaction_controller import SidebarInteractionController
 from .startup import set_start_with_windows
 from .storage import is_under_local_store, recycle_managed_file
 from .styles import stylesheet_for_theme
+from .task_executor import TaskCapacityExceeded, ai_ocr_task_executor
 from .task_supervisor import TaskSupervisor
 from .window_effects_controller import WindowEffectsController
 from .windows_frame import (

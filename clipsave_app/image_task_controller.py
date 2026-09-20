@@ -7,13 +7,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-from .services import (
-    AIService,
-    OperationCancelled,
-    TaskCapacityExceeded,
-    ai_ocr_task_executor,
-    preflight_image_file,
-)
+from .ai_service import AIService
+from .file_preflight import OperationCancelled, preflight_image_file
+from .task_executor import TaskCapacityExceeded, ai_ocr_task_executor
 from .task_supervisor import TaskSupervisor
 
 
