@@ -45,36 +45,28 @@ class _SQLiteLeafLock:
             raise ValueError("Replaceable SQLite identity locks must be read-only")
         storage.validate_managed_write_path(candidate, root)
         if os.name == "nt":
-            access = storage._GENERIC_READ
-            if writable:
-                access |= storage._GENERIC_WRITE
-            share_mode = storage._FILE_SHARE_READ | storage._FILE_SHARE_WRITE
-            if replaceable:
-                share_mode = storage._FILE_SHARE_READ | storage._FILE_SHARE_DELETE
             creator = None
             created_candidate = False
             handle = None
             try:
                 if create:
-                    creator = storage._create_file(
+                    creator = storage.create_windows_identity_leaf(
                         candidate,
-                        access | storage._FILE_READ_ATTRIBUTES,
-                        storage._CREATE_NEW,
-                        share_mode=share_mode,
+                        writable=writable,
+                        replaceable=replaceable,
                     )
                     created_candidate = True
-                handle = storage._verified_windows_handle(
+                handle = storage.open_verified_windows_identity(
                     candidate,
                     root,
-                    access,
-                    storage._OPEN_EXISTING,
-                    share_mode,
+                    writable=writable,
+                    replaceable=replaceable,
                 )
             except BaseException:
                 if handle is not None:
-                    storage._close_handle(handle)
+                    storage.close_windows_handle(handle)
                 if creator is not None:
-                    storage._close_handle(creator)
+                    storage.close_windows_handle(creator)
                     creator = None
                 if created_candidate:
                     try:
@@ -84,16 +76,15 @@ class _SQLiteLeafLock:
                 raise
             finally:
                 if creator is not None:
-                    storage._close_handle(creator)
+                    storage.close_windows_handle(creator)
             try:
-                information = storage._file_information(handle)
+                information = storage.inspect_windows_identity(handle)
             except BaseException:
-                storage._close_handle(handle)
+                storage.close_windows_handle(handle)
                 raise
             identity = (
-                int(information.volume_serial_number),
-                (int(information.file_index_high) << 32)
-                | int(information.file_index_low),
+                information.volume_serial_number,
+                information.file_index,
             )
             return cls(
                 candidate,
@@ -136,44 +127,34 @@ class _SQLiteLeafLock:
         candidate = Path(os.path.abspath(path or self.path))
         storage.validate_managed_write_path(candidate, self.managed_root)
         if os.name == "nt":
-            information = storage._file_information(self.handle)
+            information = storage.inspect_windows_identity(self.handle)
             identity = (
-                int(information.volume_serial_number),
-                (int(information.file_index_high) << 32)
-                | int(information.file_index_low),
+                information.volume_serial_number,
+                information.file_index,
             )
-            expected_path = storage._normalized_requested_path(candidate)
-            if storage._final_path_from_handle(self.handle) != expected_path:
+            expected_path = storage.normalized_windows_requested_path(candidate)
+            if information.final_path != expected_path:
                 raise RuntimeError(
                     f"SQLite database leaf identity changed during open: {candidate}"
                 )
-            if int(information.number_of_links) != 1:
+            if information.number_of_links != 1:
                 raise RuntimeError(
                     f"SQLite database leaf has multiple hard links: {candidate}"
                 )
-            access = storage._GENERIC_READ
-            if self.writable:
-                access |= storage._GENERIC_WRITE
-            probe = storage._verified_windows_handle(
+            probe = storage.open_verified_windows_identity(
                 candidate,
                 self.managed_root,
-                access,
-                storage._OPEN_EXISTING,
-                (
-                    storage._FILE_SHARE_READ | storage._FILE_SHARE_DELETE
-                    if self.replaceable
-                    else storage._FILE_SHARE_READ | storage._FILE_SHARE_WRITE
-                ),
+                writable=self.writable,
+                replaceable=self.replaceable,
             )
             try:
-                probe_information = storage._file_information(probe)
+                probe_information = storage.inspect_windows_identity(probe)
                 probe_identity = (
-                    int(probe_information.volume_serial_number),
-                    (int(probe_information.file_index_high) << 32)
-                    | int(probe_information.file_index_low),
+                    probe_information.volume_serial_number,
+                    probe_information.file_index,
                 )
             finally:
-                storage._close_handle(probe)
+                storage.close_windows_handle(probe)
             if identity != self.identity or probe_identity != self.identity:
                 raise RuntimeError(
                     f"SQLite database leaf identity changed during open: {candidate}"
@@ -205,7 +186,7 @@ class _SQLiteLeafLock:
         if handle is None:
             return
         if os.name == "nt":
-            storage._close_handle(handle)
+            storage.close_windows_handle(handle)
         else:
             os.close(handle)
 

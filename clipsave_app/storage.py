@@ -11,6 +11,7 @@ import uuid
 from ctypes import wintypes
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Callable
 
@@ -316,6 +317,80 @@ def _verified_windows_handle(
             raise
     finally:
         _close_handle(root_handle)
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsFileIdentity:
+    volume_serial_number: int
+    file_index: int
+    number_of_links: int
+    final_path: str
+
+
+def create_windows_identity_leaf(
+    path: Path,
+    *,
+    writable: bool,
+    replaceable: bool = False,
+) -> int:
+    """Create a Windows leaf handle for a later identity-verified path open."""
+    if replaceable and writable:
+        raise ValueError("Replaceable Windows identity handles must be read-only")
+    access = _GENERIC_READ | _FILE_READ_ATTRIBUTES
+    if writable:
+        access |= _GENERIC_WRITE
+    share_mode = _FILE_SHARE_READ | _FILE_SHARE_WRITE
+    if replaceable:
+        share_mode = _FILE_SHARE_READ | _FILE_SHARE_DELETE
+    return _create_file(
+        Path(path),
+        access,
+        _CREATE_NEW,
+        share_mode=share_mode,
+    )
+
+
+def open_verified_windows_identity(
+    path: Path,
+    managed_root: Path,
+    *,
+    writable: bool,
+    replaceable: bool = False,
+) -> int:
+    """Open a managed Windows leaf with identity/reparse/hard-link checks."""
+    if replaceable and writable:
+        raise ValueError("Replaceable Windows identity handles must be read-only")
+    access = _GENERIC_READ | (_GENERIC_WRITE if writable else 0)
+    share_mode = _FILE_SHARE_READ | _FILE_SHARE_WRITE
+    if replaceable:
+        share_mode = _FILE_SHARE_READ | _FILE_SHARE_DELETE
+    return _verified_windows_handle(
+        Path(path),
+        Path(managed_root),
+        access,
+        _OPEN_EXISTING,
+        share_mode,
+    )
+
+
+def inspect_windows_identity(handle: int) -> WindowsFileIdentity:
+    """Return the stable identity and canonical path of an open Windows handle."""
+    information = _file_information(handle)
+    return WindowsFileIdentity(
+        volume_serial_number=int(information.volume_serial_number),
+        file_index=(int(information.file_index_high) << 32)
+        | int(information.file_index_low),
+        number_of_links=int(information.number_of_links),
+        final_path=_final_path_from_handle(handle),
+    )
+
+
+def normalized_windows_requested_path(path: Path) -> str:
+    return _normalized_requested_path(Path(path))
+
+
+def close_windows_handle(handle: int) -> None:
+    _close_handle(handle)
 
 
 def open_managed_binary(
