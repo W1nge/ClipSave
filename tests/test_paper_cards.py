@@ -26,6 +26,7 @@ class PaperCardTests(unittest.TestCase):
         now = dt.datetime(2026, 9, 21, 18, 0, tzinfo=timezone)
 
         self.assertEqual(format_card_timestamp("2026-09-21T10:41:00+08:00", now), "10:41")
+        self.assertEqual(format_card_timestamp("2026-09-21T02:41:00+00:00", now), "10:41")
         self.assertEqual(format_card_timestamp("2026-09-20T10:41:00+08:00", now), "09/20")
         self.assertEqual(format_card_timestamp("2025-12-31T23:59:00+08:00", now), "2025/12/31")
 
@@ -34,6 +35,7 @@ class PaperCardTests(unittest.TestCase):
         now = dt.datetime(2026, 9, 21, 18, 0, tzinfo=timezone)
 
         self.assertEqual(format_list_timestamp("2026-09-21T10:41:00+08:00", now), "10:41")
+        self.assertEqual(format_list_timestamp("2026-09-21T02:41:00+00:00", now), "10:41")
         self.assertEqual(format_list_timestamp("2026-09-20T10:41:00+08:00", now), "09/20 10:41")
         self.assertEqual(format_list_timestamp("2025-12-31T23:59:00+08:00", now), "2025/12/31")
 

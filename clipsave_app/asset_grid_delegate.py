@@ -27,10 +27,12 @@ def format_card_timestamp(value, now: dt.datetime | None = None) -> str:
         parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return text[:16].replace("T", " ")
+    reference = now or dt.datetime.now().astimezone()
+    if reference.tzinfo is None:
+        reference = reference.astimezone()
     if parsed.tzinfo is None:
         parsed = parsed.astimezone()
-    parsed = parsed.astimezone()
-    reference = (now or dt.datetime.now().astimezone()).astimezone()
+    parsed = parsed.astimezone(reference.tzinfo)
     if parsed.date() == reference.date():
         return parsed.strftime("%H:%M")
     if parsed.year == reference.year:
