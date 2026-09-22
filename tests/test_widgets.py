@@ -1666,11 +1666,16 @@ class ThumbnailPixmapTests(unittest.TestCase):
         start_rects = {card.row: card.expanded_rect for card in overlay.cards}
         end_rects = {card.row: card.collapsed_rect for card in overlay.cards}
 
-        with patch.object(
-            grid.delegate,
-            "paint_transition_card",
-            wraps=grid.delegate.paint_transition_card,
-        ) as repaint_card:
+        paint_count = 0
+        paint_transition_card = grid.delegate.paint_transition_card
+
+        def count_transition_card(*args, **kwargs):
+            nonlocal paint_count
+            paint_count += 1
+            return paint_transition_card(*args, **kwargs)
+
+        grid.delegate.paint_transition_card = count_transition_card
+        try:
             grid.set_layout_updates_suspended(True)
             grid.resize(grid.width() + 170, grid.height())
             self.app.processEvents()
@@ -1680,7 +1685,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
             fifth_middle = overlay.card_rect(4)
             self.assertGreater(fifth_middle.left(), fifth_start.left())
             self.assertGreater(fifth_middle.top(), first_start.top())
-            self.assertGreaterEqual(repaint_card.call_count, len(overlay.cards))
+            self.assertGreaterEqual(paint_count, len(overlay.cards))
 
             for row in start_rects:
                 actual = overlay.card_rect(row)
@@ -1702,6 +1707,8 @@ class ThumbnailPixmapTests(unittest.TestCase):
             grid.set_layout_updates_suspended(False)
             grid.finish_sidebar_transition()
             self.app.processEvents()
+        finally:
+            grid.delegate.paint_transition_card = paint_transition_card
 
         self.assertFalse(grid._sidebar_transition_active)
         self.assertIsNone(grid._sidebar_transition_overlay)
