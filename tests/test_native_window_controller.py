@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 from clipsave_app.native_window_controller import (
     NativeWindowController,
+    WM_SIZING,
     windows_resize_hit_test,
 )
 from clipsave_app.windows_frame import WM_GETMINMAXINFO, WM_NCACTIVATE
@@ -41,6 +42,7 @@ class NativeWindowControllerTests(unittest.TestCase):
             "schedule_maximized_bounds_sync": Mock(),
             "sync_backdrop_from_windowpos": Mock(),
             "sync_backdrop_geometry_now": Mock(),
+            "sync_backdrop_proposed_rect": Mock(),
             "sync_backdrop_window": Mock(),
             "schedule_soon": Mock(side_effect=lambda callback: callback()),
             "set_layout_updates_suspended": Mock(),
@@ -111,3 +113,24 @@ class NativeWindowControllerTests(unittest.TestCase):
         callbacks["enable_resize_frame"].assert_called_once_with(123)
         callbacks["clear_resize_handles"].assert_called_once_with()
         callbacks["install_resize_handles"].assert_not_called()
+
+    def test_sizing_prepositions_backdrop_before_host_bounds_commit(self):
+        controller, callbacks = self.make_controller()
+        controller.begin_interactive_resize()
+        proposed = wintypes.RECT(20, 30, 1220, 830)
+        message = wintypes.MSG()
+        message.hWnd = 123
+        message.message = WM_SIZING
+        message.lParam = ctypes.addressof(proposed)
+
+        controller.handle_native_event(
+            b"windows_generic_MSG",
+            ctypes.addressof(message),
+        )
+
+        callbacks["sync_backdrop_proposed_rect"].assert_called_once_with(
+            20,
+            30,
+            1220,
+            830,
+        )

@@ -64,7 +64,7 @@ class AssetGridTransitionRenderer:
         preview = self.delegate.preview_rect(
             QRect(0, 0, cell_size.width(), cell_size.height())
         )
-        content_rect = preview.adjusted(10, 9, -10, -9)
+        content_rect = preview
         kind = str(record["kind"])
         if kind == "image":
             return (
@@ -167,7 +167,7 @@ class AssetGridTransitionRenderer:
             source = self.view.thumbnail_for_index(index, path, content_hash)
             if source is None or source.isNull():
                 return None
-            logical_size = preview.size() - QSize(12, 12)
+            logical_size = preview.size()
             physical_size = QSize(
                 max(1, round(logical_size.width() * device_pixel_ratio)),
                 max(1, round(logical_size.height() * device_pixel_ratio)),
@@ -219,8 +219,8 @@ class AssetGridTransitionRenderer:
     @staticmethod
     def image_target(preview: QRect, pixmap: QPixmap) -> QRectF:
         available = QSizeF(
-            max(1, preview.width() - 12),
-            max(1, preview.height() - 12),
+            max(1, preview.width()),
+            max(1, preview.height()),
         )
         source_size = pixmap.deviceIndependentSize()
         if source_size.isEmpty():
@@ -238,6 +238,4 @@ class AssetGridTransitionRenderer:
 
     @staticmethod
     def preview_clip(preview: QRect, kind: str) -> QRect:
-        if kind == "image":
-            return preview
-        return preview.adjusted(10, 9, -10, -9)
+        return preview

@@ -254,17 +254,17 @@ class ThumbnailPixmapTests(unittest.TestCase):
         )
         self.assertGreater(light_pixels, 40)
 
-    def test_grid_preview_uses_equal_left_right_and_bottom_insets(self):
+    def test_grid_preview_uses_unified_paper_content_insets(self):
         grid = AssetGrid()
         try:
-            item_rect = QRect(0, 0, 260, grid.delegate.card_height + 12)
+            item_rect = QRect(0, 0, 260, 210)
             card = grid.delegate.card_rect(item_rect)
             preview = grid.delegate.preview_rect(item_rect)
 
-            self.assertEqual(preview.left() - card.left(), 10)
-            self.assertEqual(card.right() - preview.right(), 10)
-            self.assertEqual(card.bottom() - preview.bottom(), 10)
-            self.assertEqual(preview.top() - card.top(), 42)
+            self.assertEqual(preview.left() - card.left(), 12)
+            self.assertEqual(card.right() - preview.right(), 12)
+            self.assertEqual(card.bottom() - preview.bottom(), 12)
+            self.assertEqual(preview.top() - card.top(), 54)
         finally:
             grid.close()
 
@@ -322,7 +322,8 @@ class ThumbnailPixmapTests(unittest.TestCase):
                 for x in range(image.width())
                 for y in range(image.height())
             }
-            self.assertEqual(colors, {"#202020", "#777777"})
+            self.assertIn("#202020", colors)
+            self.assertIn("#777777", colors)
             handle = scroll_bar._handle_rect()
             self.assertEqual(handle.width(), 10)
             self.assertGreaterEqual(handle.height(), 32)
@@ -674,7 +675,8 @@ class ThumbnailPixmapTests(unittest.TestCase):
         with patch.object(table, "resizeRowsToContents") as resize_rows:
             table.set_items([record], selected_id=1)
         resize_rows.assert_not_called()
-        self.assertEqual(table.verticalHeader().defaultSectionSize(), 44)
+        self.assertEqual(table.verticalHeader().defaultSectionSize(), 40)
+        self.assertTrue(table.horizontalHeader().isHidden())
         self.assertEqual(table.selected_id, 1)
         table.close()
 
@@ -698,7 +700,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertLessEqual(widget_counts[1][0], widget_counts[0][0] + 2)
         self.assertLessEqual(widget_counts[1][1], widget_counts[0][1] + 2)
         self.assertTrue(hasattr(grid, "favorite_requested"))
-        self.assertTrue(hasattr(table, "favorite_requested"))
+        self.assertFalse(hasattr(table, "favorite_requested"))
         grid.close()
         table.close()
 
@@ -740,7 +742,24 @@ class ThumbnailPixmapTests(unittest.TestCase):
         record["tag_names"] = "First\x1fSecond"
         table.set_items([record])
 
-        self.assertEqual(table.model().index(0, 2).data(), "First, Second")
+        self.assertEqual(table.model().index(0, 1).data(), "First, Second")
+        table.close()
+
+    def test_table_first_column_loads_image_thumbnail_through_shared_provider(self):
+        path = Path(self.temp.name) / "table-preview.png"
+        image = QImage(64, 40, QImage.Format.Format_RGB32)
+        image.fill(QColor("#21a8fb"))
+        self.assertTrue(image.save(str(path)))
+        grid = AssetGrid()
+        table = AssetTable()
+        table.set_thumbnail_provider(grid)
+        table.resize(720, 240)
+        table.set_items(asset_records(1, kind="image", path=str(path)))
+        table.show()
+        self.app.processEvents()
+
+        self.assertTrue(wait_for(lambda: not thumbnail_pixmap(path).isNull()))
+        grid.close()
         table.close()
 
     def test_5000_item_model_build_is_significantly_faster_than_cell_materialization(self):
@@ -814,6 +833,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
         favorite_point = grid.delegate.favorite_rect(grid.visualRect(index)).center()
         QTest.mouseClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=favorite_point)
+        QTest.qWait(420)
         favorite.assert_called_once_with(1, True)
         selected.assert_called_once_with(1)
 
@@ -836,6 +856,31 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.app.processEvents()
         cleared.assert_called_once_with()
         self.assertIsNone(grid.selected_id)
+        grid.close()
+
+    def test_favorite_page_keeps_completed_peel_until_filtered_refresh(self):
+        grid = AssetGrid()
+        grid.resize(520, 400)
+        grid.show()
+        records = asset_records(1)
+        records[0]["favorite"] = True
+        grid.set_items(records)
+        grid.set_favorite_page_mode(True)
+        self.app.processEvents()
+        index = grid.model().index(0, 0)
+        favorite_point = grid.delegate.favorite_rect(grid.visualRect(index)).center()
+
+        QTest.mouseClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=favorite_point)
+        QTest.qWait(420)
+        state = grid._paper_peel
+        self.assertIsNotNone(state)
+        self.assertTrue(state.waiting_for_result)
+
+        grid.preview_favorite_change(1, False)
+
+        self.assertIs(grid._paper_peel, state)
+        self.assertTrue(state.waiting_for_result)
+        self.assertFalse(grid._paper_animation.isActive())
         grid.close()
 
     def test_image_mouse_gestures_are_consistent_in_grid_and_table(self):
@@ -943,34 +988,23 @@ class ThumbnailPixmapTests(unittest.TestCase):
         finally:
             dialog.close()
 
-    def test_table_favorite_control_emits_requested_change(self):
+    def test_table_has_no_inline_favorite_control(self):
         table = AssetTable()
-        table.resize(720, 300)
-        table.show()
-        table.set_items(asset_records(2))
-        self.app.processEvents()
-        index = table.model().index(0, 0)
-        selected = Mock()
-        favorite = Mock()
-        table.item_selected.connect(selected)
-        table.favorite_requested.connect(favorite)
-
-        point = table._favorite_delegate.favorite_rect(table.visualRect(index)).center()
-        QTest.mouseClick(table.viewport(), Qt.MouseButton.LeftButton, pos=point)
-
-        favorite.assert_called_once_with(1, True)
-        selected.assert_called_with(1)
+        self.assertFalse(hasattr(table, "favorite_requested"))
+        self.assertFalse(hasattr(table, "_favorite_delegate"))
         table.close()
 
-    def test_table_favorite_delegate_keeps_title_out_of_style_paint(self):
+    def test_table_content_delegate_keeps_title_out_of_style_paint(self):
         class RecordingStyle(QProxyStyle):
             def __init__(self):
                 super().__init__()
                 self.item_texts = []
+                self.item_states = []
 
             def drawControl(self, element, option, painter, widget=None):
                 if element == QStyle.ControlElement.CE_ItemViewItem:
                     self.item_texts.append(option.text)
+                    self.item_states.append(option.state)
                 super().drawControl(element, option, painter, widget)
 
         table = AssetTable()
@@ -982,12 +1016,22 @@ class ThumbnailPixmapTests(unittest.TestCase):
         option = QStyleOptionViewItem()
         option.rect = QRect(0, 0, 400, 44)
         option.widget = table
+        option.state |= (
+            QStyle.StateFlag.State_Selected
+            | QStyle.StateFlag.State_MouseOver
+            | QStyle.StateFlag.State_HasFocus
+        )
         painter = QPainter(canvas)
 
-        table._favorite_delegate.paint(painter, option, table.model().index(0, 0))
+        table._content_delegate.paint(painter, option, table.model().index(0, 0))
+        table._content_delegate.paint(painter, option, table.model().index(0, 2))
 
         painter.end()
-        self.assertEqual(style.item_texts, [""])
+        self.assertEqual(style.item_texts[0], "")
+        for state in style.item_states:
+            self.assertFalse(state & QStyle.StateFlag.State_Selected)
+            self.assertFalse(state & QStyle.StateFlag.State_MouseOver)
+            self.assertFalse(state & QStyle.StateFlag.State_HasFocus)
         table.close()
 
     def test_detail_clears_preview_and_updates_image_only_buttons(self):
@@ -2013,7 +2057,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
         ) as paint_content:
             preview = grid.delegate.render_transition_preview(
                 index,
-                QSize(245, widgets_module.AssetGridDelegate.card_height + 12),
+                QSize(245, 190),
             )
 
         self.assertIsNotNone(preview)
@@ -2022,21 +2066,21 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
         grid.close()
 
-    def test_transition_text_cache_is_clipped_to_the_text_content_insets(self):
+    def test_transition_preview_cache_uses_the_unified_preview_rect(self):
         preview = QRect(20, 30, 240, 180)
         self.assertEqual(
             widgets_module.AssetGridDelegate.transition_preview_clip(
                 preview,
                 "text",
             ),
-            preview.adjusted(10, 9, -10, -9),
+            preview,
         )
         self.assertEqual(
             widgets_module.AssetGridDelegate.transition_preview_clip(
                 preview,
                 "markdown",
             ),
-            preview.adjusted(10, 9, -10, -9),
+            preview,
         )
         self.assertEqual(
             widgets_module.AssetGridDelegate.transition_preview_clip(
@@ -2137,6 +2181,30 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertEqual(overlay.index_at(QPoint(100, 100)).row(), 1)
         grid.close()
 
+    def test_grid_transition_clears_stale_transparent_viewport_pixels(self):
+        grid = AssetGrid()
+        grid.resize(420, 260)
+        grid.show()
+        self.app.processEvents()
+        previous_theme = self.app.property("darkTheme")
+        self.app.setProperty("darkTheme", True)
+        try:
+            overlay = widgets_module._AssetGridTransitionOverlay(
+                grid,
+                [],
+                expanded_columns=1,
+                collapsed_columns=1,
+            )
+            canvas = QImage(180, 120, QImage.Format.Format_ARGB32_Premultiplied)
+            canvas.fill(QColor("#e8edf4"))
+            painter = QPainter(canvas)
+            overlay.paint(painter, canvas.rect())
+            painter.end()
+            self.assertEqual(canvas.pixelColor(90, 60).name(), "#202020")
+        finally:
+            self.app.setProperty("darkTheme", previous_theme)
+            grid.close()
+
     def test_grid_transition_elevates_every_added_column_card_both_directions(self):
         expected = [4, 9, 14, 19]
         self.assertEqual(
@@ -2196,36 +2264,25 @@ class ThumbnailPixmapTests(unittest.TestCase):
             grid.set_sidebar_transition_progress(progress)
             cell = overlay.card_rect(4).toRect()
             card = grid.delegate.card_rect(cell)
-            kind = grid.delegate.kind_rect(cell)
             time_rect = grid.delegate.time_rect(cell)
             favorite = grid.delegate.favorite_rect(cell)
-            header_samples.append((card, kind, time_rect, favorite))
+            header_samples.append((card, time_rect, favorite))
 
         self.assertEqual(
-            {(kind.width(), kind.height()) for _card, kind, _time, _favorite in header_samples},
-            {(90, 24)},
+            {time_rect.height() for _card, time_rect, _favorite in header_samples},
+            {24},
         )
         self.assertEqual(
-            {(time_rect.width(), time_rect.height()) for _card, _kind, time_rect, _favorite in header_samples},
-            {(54, 24)},
+            {(favorite.width(), favorite.height()) for _card, _time, favorite in header_samples},
+            {(40, 40)},
         )
-        self.assertEqual(
-            {(favorite.width(), favorite.height()) for _card, _kind, _time, favorite in header_samples},
-            {(24, 24)},
-        )
-        self.assertEqual(
-            {kind.left() - card.left() for card, kind, _time, _favorite in header_samples},
-            {10},
-        )
-        self.assertEqual(
-            {card.right() - time_rect.right() for card, _kind, time_rect, _favorite in header_samples},
-            {49},
-        )
-        self.assertEqual(
-            {card.right() - favorite.right() for card, _kind, _time, favorite in header_samples},
-            {8},
-        )
-        for element_index in (1, 2, 3):
+        for card, time_rect, _favorite in header_samples:
+            self.assertEqual(
+                time_rect.left() - card.left(),
+                max(12, round(card.width() * 0.08)),
+            )
+            self.assertEqual(card.right() - time_rect.right(), 36)
+        for element_index in (1, 2):
             x_positions = [sample[element_index].x() for sample in header_samples]
             self.assertTrue(
                 all(left <= right for left, right in zip(x_positions, x_positions[1:]))

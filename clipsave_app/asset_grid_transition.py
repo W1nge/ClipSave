@@ -195,6 +195,10 @@ class _AssetGridTransitionOverlay:
         return QModelIndex()
 
     def paint(self, painter: QPainter, rect: QRect) -> None:
+        # The home surface is deliberately opaque.  Clear every transition
+        # frame before compositing moving cards so the transparent item view
+        # cannot retain cards from an earlier column layout in Qt's backing
+        # store (the stale cells appeared as an empty first row).
         painter.fillRect(
             rect,
             QColor("#202020" if dark_theme_active() else "#f6f6f6"),
@@ -231,7 +235,16 @@ class _AssetGridTransitionOverlay:
         else:
             option.state &= ~QStyle.StateFlag.State_Selected
         painter.save()
-        painter.translate(target.x(), target.y())
+        # Header text is painted live while preview content comes from cached
+        # pixmaps.  Translating the live text through fractional device pixels
+        # changes its antialiasing on every animation frame and makes the time
+        # appear to flash.  Keep the interpolated size, but snap the card's
+        # paint origin to whole pixels so glyph rasterization stays stable.
+        dpr = max(1.0, float(self.view.devicePixelRatioF()))
+        painter.translate(
+            round(target.x() * dpr) / dpr,
+            round(target.y() * dpr) / dpr,
+        )
         self.view.delegate.paint_transition_card(
             painter,
             option,
@@ -244,4 +257,3 @@ class _AssetGridTransitionOverlay:
 GridTransitionCard = _GridTransitionCard
 AssetGridTransitionOverlay = _AssetGridTransitionOverlay
 grid_transition_card_elevated = _grid_transition_card_elevated
-

@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QCoreApplication, QEvent, QRect, Qt
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
 import clipsave_app.widgets as widgets_module
 from clipsave_app.app import create_app_icon
@@ -136,13 +136,7 @@ class MainWindowTests(unittest.TestCase):
         self.window.sidebar.set_collapsed(False, animate=False)
         self.assertEqual(self.window.sidebar.collapse_button.text().strip(), "收起侧栏")
 
-        self.window.open_sort_menu()
-        self.app.processEvents()
-        self.assertIsNotNone(self.window.sort_menu)
-        self.assertTrue(self.window.sort_menu.isVisible())
-        self.window.open_sort_menu()
-        self.app.processEvents()
-        self.assertIsNone(self.window.sort_menu)
+        self.assertFalse(hasattr(self.window, "sort_button"))
         self.window.open_day(self.database.days()[0][0])
         self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
         self.assertEqual(len(self.window.current_items), 1)
@@ -182,7 +176,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(date_dialog.layout().contentsMargins().left(), 1)
         date_dialog.close()
         self.assertFalse(self.window.table.showGrid())
-        self.assertTrue(self.window.table.alternatingRowColors())
+        self.assertFalse(self.window.table.alternatingRowColors())
 
     def test_new_image_schedules_enabled_automatic_ai_tasks(self):
         image_path = Path(self.temp.name) / "automatic.png"
@@ -745,20 +739,25 @@ class MainWindowTests(unittest.TestCase):
             "QMainWindow, QWidget#AppRoot { background: transparent; }",
             self.window.styleSheet(),
         )
+        self.assertIn("rgba(255,255,255,70)", self.window.styleSheet())
         self.assertIn(
-            "rgba(255, 255, 255, 76)",
+            "QWidget#LibrarySurface { background: #f6f6f6; }",
             self.window.styleSheet(),
         )
 
         self.window._sync_surface_style(result=system_acrylic, dark=False)
-        self.assertIn(
-            "rgba(255, 255, 255, 76)",
-            self.window.styleSheet(),
-        )
+        self.assertIn("rgba(255,255,255,70)", self.window.styleSheet())
 
         self.window._sync_surface_style(result=legacy, dark=False)
+        self.assertIn("rgba(255,255,255,70)", self.window.styleSheet())
+
+        self.window._sync_surface_style(result=solid, dark=True)
         self.assertIn(
-            "rgba(255, 255, 255, 204)",
+            "QMainWindow, QWidget#AppRoot, QWidget#WindowBody, QWidget#ContentSurface { background: #181818; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "QFrame#WindowTitleBar, QWidget#Sidebar, QFrame#TopBar { background: #202020; }",
             self.window.styleSheet(),
         )
 
@@ -1448,9 +1447,17 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(self.window.dark_theme)
         self.assertTrue(self.app.property("darkTheme"))
         self.assertIn("#202020", self.window.styleSheet())
-        self.assertIn("rgba(32,32,32,76)", self.window.styleSheet())
+        self.assertIn("rgba(0,0,0,128)", self.window.styleSheet())
         self.assertIn(
             "QWidget#ContentSurface { background: transparent; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "QWidget#LibrarySurface { background: #202020; }",
+            self.window.styleSheet(),
+        )
+        self.assertIn(
+            "QListView#AssetGrid { background: #202020;",
             self.window.styleSheet(),
         )
         self.assertNotIn(
@@ -1466,7 +1473,6 @@ class MainWindowTests(unittest.TestCase):
             "QFrame#CopyToast { background: rgba(40,40,40,230);",
             self.window.styleSheet(),
         )
-        self.assertNotIn("rgba(0,0,0,204)", self.window.styleSheet())
         backdrop.assert_called_with(self.window, True, composition_window=None)
 
         self.settings.data["follow_system_theme"] = False
@@ -1503,18 +1509,9 @@ class MainWindowTests(unittest.TestCase):
         self.settings.data["theme_mode"] = "light"
         self.window.apply_theme(force=True)
 
-    def test_saved_sort_mode_initializes_sort_button_label(self):
-        self.window.close()
-        self.database.close()
-        root = Path(self.temp.name)
-        self.database = LibraryDatabase(root / "sorted.db")
-        self.database.add_text("sorted")
-        self.settings.set("sort", "name")
-        self.window = MainWindow(
-            self.database, self.settings, create_app_icon(), scan_on_start=False
-        )
-
-        self.assertIn("名称", self.window.sort_button.text())
+    def test_library_has_no_sort_control(self):
+        self.assertFalse(hasattr(self.window, "sort_button"))
+        self.assertEqual(self.window._current_item_query_spec().sort, "newest")
 
     def test_compact_toolbar_controls_do_not_overlap(self):
         self.window.sidebar.set_collapsed(False, animate=False)
@@ -1523,7 +1520,6 @@ class MainWindowTests(unittest.TestCase):
         controls = [
             self.window.search,
             self.window.expanded_search_button,
-            self.window.sort_button,
             self.window.grid_button,
             self.window.list_button,
             self.window.detail_button,
@@ -1537,13 +1533,12 @@ class MainWindowTests(unittest.TestCase):
         for index in range(4):
             self.database.add_text(f"paged item {index}")
         self.window.ITEM_PAGE_SIZE = 2
-        self.window.current_sort = "oldest"
         self.window.refresh_items()
 
         self.assertEqual(len(self.window.current_items), 2)
         self.assertTrue(self.window._items_has_more)
         self.assertEqual(self.window._items_offset, 2)
-        self.assertEqual(self.window.result_count.text(), "2+ 项")
+        self.assertEqual(self.window.result_count.text(), "5 项")
         selected_id = self.window.current_items[0]["id"]
         self.window.select_item(selected_id)
 
@@ -1580,7 +1575,6 @@ class MainWindowTests(unittest.TestCase):
         for index in range(4):
             self.database.add_text(f"async page item {index}")
         self.window.ITEM_PAGE_SIZE = 2
-        self.window.current_sort = "oldest"
         self.window.refresh_items()
         started = threading.Event()
         release = threading.Event()
@@ -1696,13 +1690,21 @@ class MainWindowTests(unittest.TestCase):
 
         notify.assert_called_once_with(True)
 
-        with patch("clipsave_app.main_window.QToolTip.showText") as show_tooltip:
+        with patch("clipsave_app.main_window.QToolTip.showText") as show_tooltip, patch.object(
+            self.window.tray, "isVisible", return_value=True
+        ), patch.object(self.window.tray, "showMessage") as tray_message:
             self.window._show_monitor_notification(False)
 
         show_tooltip.assert_called_once()
         self.assertEqual(show_tooltip.call_args.args[1], "本地自动捕获已暂停")
         self.assertIs(show_tooltip.call_args.args[2], self.window.capture_status)
         self.assertTrue(show_tooltip.call_args.args[3].isNull())
+        tray_message.assert_called_once_with(
+            "ClipSave",
+            "本地自动捕获已暂停",
+            QSystemTrayIcon.MessageIcon.Information,
+            2800,
+        )
 
     def test_monitor_toggle_does_not_change_runtime_when_setting_save_fails(self):
         with patch.object(
@@ -1729,7 +1731,7 @@ class MainWindowTests(unittest.TestCase):
             "先输入要扩大查找范围的搜索词。",
         )
 
-    def test_expanded_search_uses_or_terms_and_preserves_current_sort(self):
+    def test_expanded_search_uses_or_terms_with_fixed_newest_sort(self):
         second_id = self.database.add_text("Cloudflare error dialog")
         self.window.search.setText("找不到的蓝色报错窗口")
         self.window.search_timer.stop()
@@ -1764,8 +1766,44 @@ class MainWindowTests(unittest.TestCase):
 
         self.window.set_favorite(item_id, True)
 
+        deadline = time.monotonic() + 2.0
+        while item_id in self.window._favorite_requests and time.monotonic() < deadline:
+            time.sleep(0.01)
+            self.app.processEvents()
+        self.assertNotIn(item_id, self.window._favorite_requests)
         self.assertTrue(self.window._expanded_search_active())
         self.assertEqual([item["id"] for item in self.window.current_items], [item_id])
+
+    def test_favorite_write_does_not_block_the_gui_or_final_paper_frame(self):
+        item_id = self.window.current_items[0]["id"]
+        started = threading.Event()
+        release = threading.Event()
+        real_set_favorite = self.window.library_metadata_controller.set_favorite
+
+        def delayed_set_favorite(*args):
+            started.set()
+            release.wait(1.0)
+            return real_set_favorite(*args)
+
+        with patch.object(
+            self.window.library_metadata_controller,
+            "set_favorite",
+            side_effect=delayed_set_favorite,
+        ):
+            before = time.monotonic()
+            self.window.set_favorite(item_id, True)
+            elapsed = time.monotonic() - before
+
+            self.assertLess(elapsed, 0.1)
+            self.assertTrue(started.wait(0.5))
+            row = self.window.grid._asset_model.row_for_id(item_id)
+            self.assertTrue(self.window.grid._asset_model.item(row)["favorite"])
+            release.set()
+            deadline = time.monotonic() + 2.0
+            while item_id in self.window._favorite_requests and time.monotonic() < deadline:
+                time.sleep(0.01)
+                self.app.processEvents()
+            self.assertNotIn(item_id, self.window._favorite_requests)
 
     def test_filter_clears_hidden_selection_and_only_refreshes_visible_view(self):
         first_id = self.window.current_items[0]["id"]
@@ -2070,6 +2108,7 @@ class MainWindowTests(unittest.TestCase):
     def test_navigation_active_state_survives_metadata_refresh(self):
         self.window.navigate("favorite", None)
         self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
+        self.assertTrue(self.window.grid.favorite_page_mode)
         self.assertTrue(bool(self.window.sidebar.nav_buttons["favorite"].property("active")))
         self.window._refresh_navigation_metadata()
         self.assertTrue(bool(self.window.sidebar.nav_buttons["favorite"].property("active")))
@@ -2080,6 +2119,7 @@ class MainWindowTests(unittest.TestCase):
         self.window._refresh_navigation_metadata()
         self.window.navigate("collection", collection_id)
         self.assertTrue(wait_for(lambda: self.window.library_controller.search_request is None))
+        self.assertFalse(self.window.grid.favorite_page_mode)
         collection_button = next(
             button
             for button in self.window.sidebar.collection_buttons

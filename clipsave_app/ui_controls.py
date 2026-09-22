@@ -8,6 +8,7 @@ from PySide6.QtCore import (
     QEasingCurve,
     QPoint,
     QRect,
+    QRectF,
     QSize,
     Qt,
     QPropertyAnimation,
@@ -326,13 +327,17 @@ class BrandLabel(QWidget):
         font.setWeight(QFont.Weight.DemiBold)
         font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 90)
         source_painter.setFont(font)
-        source_painter.setPen(self.color)
         text_rect = source.rect().adjusted(16, 0, 0, 0)
-        source_painter.drawText(
-            text_rect,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            self.text,
-        )
+        baseline_rect = QRect(text_rect)
+        clip_text = "Clip" if self.text == "ClipSave" else self.text
+        save_text = "Save" if self.text == "ClipSave" else ""
+        source_painter.setPen(QColor("#ffffff" if dark_theme_active() else "#333b47"))
+        source_painter.drawText(baseline_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, clip_text)
+        clip_width = source_painter.fontMetrics().horizontalAdvance(clip_text)
+        if save_text:
+            baseline_rect.setLeft(baseline_rect.left() + clip_width)
+            source_painter.setPen(self.color)
+            source_painter.drawText(baseline_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, save_text)
         source_painter.end()
 
         target_height = max(1, round(self.height() * self.vertical_scale))
@@ -476,12 +481,16 @@ class AutoHideScrollBar(QScrollBar):
         *,
         track_width: int | None = None,
         light_background: str = "#f6f6f6",
+        dark_background: str = "#202020",
         align_to_edge: bool = False,
+        always_visible: bool = False,
     ):
         super().__init__(orientation, parent)
         self.setObjectName("AutoHideScrollBar")
         self._light_background = light_background
+        self._dark_background = dark_background
         self._align_to_edge = align_to_edge
+        self._always_visible = always_visible
         if track_width is not None:
             thickness = max(1, int(track_width))
             if orientation == Qt.Orientation.Vertical:
@@ -508,16 +517,20 @@ class AutoHideScrollBar(QScrollBar):
         painter = QPainter(self)
         dark = dark_theme_active()
         painter.fillRect(
-            self.rect(), QColor("#202020" if dark else self._light_background)
+            self.rect(), QColor(self._dark_background if dark else self._light_background)
         )
-        if self.active and self.maximum() > self.minimum():
+        if (self.active or self._always_visible) and self.maximum() > self.minimum():
             handle = self._handle_rect()
             if handle.isValid():
                 if self.isSliderDown() or self.underMouse():
                     color = QColor("#969696" if dark else "#768191")
                 else:
                     color = QColor("#777777" if dark else "#9ca5b2")
-                painter.fillRect(handle, color)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                radius = min(handle.width(), handle.height()) / 2.0
+                painter.drawRoundedRect(QRectF(handle), radius, radius)
         painter.end()
 
     def _handle_rect(self) -> QRect:
@@ -703,4 +716,3 @@ class NavButton(QPushButton):
         if changed:
             self.style().unpolish(self)
             self.style().polish(self)
-

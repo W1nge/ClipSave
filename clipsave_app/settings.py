@@ -14,7 +14,6 @@ DEFAULTS = {
     "sidebar_collapsed": False,
     "monitoring": False,
     "view_mode": "grid",
-    "sort": "newest",
     "close_to_tray": True,
     "start_with_windows": False,
     "follow_system_theme": True,
@@ -48,7 +47,6 @@ _STRING_KEYS = {
 }
 _CHOICES = {
     "view_mode": {"grid", "list"},
-    "sort": {"newest", "oldest", "name", "size", "type"},
     "theme_mode": {"light", "dark"},
 }
 

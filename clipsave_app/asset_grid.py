@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+import math
+import time
 
 from PySide6.QtCore import (
     QItemSelectionModel,
     QModelIndex,
     QPoint,
+    QPointF,
     QRect,
     QSize,
     Qt,
@@ -23,6 +27,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
     QListView,
+    QStyle,
+    QStyleOptionViewItem,
 )
 
 from .asset_grid_delegate import AssetGridDelegate
@@ -32,6 +38,7 @@ from .asset_grid_transition import (
 from .asset_grid_transition_controller import AssetGridTransitionController
 from .item_gestures import ItemRightClickGesture, ItemTripleClickGesture
 from .item_models import AssetItemModel
+from .middle_autoscroll import MiddleAutoScrollController
 from .sidebar import Sidebar
 from .thumbnail_service import (
     ThumbnailDecodeQueue,
@@ -47,11 +54,26 @@ from .ui_primitives import (
     dark_theme_active,
 )
 
+@dataclass(slots=True)
+class PaperPeelState:
+    row: int
+    current: QPointF
+    press: QPointF
+    animation_start: QPointF | None = None
+    animation_end: QPointF | None = None
+    animation_started: float = 0.0
+    animation_duration: float = 0.0
+    animation_curved: bool = False
+    commit: bool = False
+    waiting_for_result: bool = False
+
+
 class AssetGrid(QListView):
     item_selected = Signal(int)
     selection_cleared = Signal()
     item_activated = Signal(int)
     detail_requested = Signal(int)
+    thumbnail_available = Signal(str)
 
     def _make_thumbnail_queue(self, parent) -> ThumbnailDecodeQueue:
         return ThumbnailDecodeQueue(parent)
@@ -89,7 +111,13 @@ class AssetGrid(QListView):
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBar(AutoHideScrollBar())
+        self.setVerticalScrollBar(
+            AutoHideScrollBar(
+                track_width=10,
+                dark_background="#202020",
+                always_visible=True,
+            )
+        )
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.setViewportMargins(14, 48, 14, 18)
         self.setSpacing(0)
@@ -119,6 +147,11 @@ class AssetGrid(QListView):
         self._thumbnail_refresh_timer.setInterval(50)
         self._thumbnail_refresh_timer.timeout.connect(self._refresh_thumbnail_generation)
         self._favorite_press_row = -1
+        self._paper_peel: PaperPeelState | None = None
+        self._favorite_page_mode = False
+        self._paper_animation = QTimer(self)
+        self._paper_animation.setInterval(16)
+        self._paper_animation.timeout.connect(self._advance_paper_animation)
         self._suppress_selection_signal = False
         self._wheel_remainder = WheelRemainder()
         self._right_click = ItemRightClickGesture(self)
@@ -127,7 +160,22 @@ class AssetGrid(QListView):
         self.selectionModel().selectionChanged.connect(self._selection_changed)
         self.doubleClicked.connect(self._index_activated)
         self.verticalScrollBar().valueChanged.connect(self._thumbnail_viewport_changed)
+        self.verticalScrollBar().valueChanged.connect(lambda _value: self.cancel_paper_peel())
+        self._middle_autoscroll = MiddleAutoScrollController(self)
         self._update_grid_size()
+
+    @property
+    def favorite_page_mode(self) -> bool:
+        """Whether cards are single sheets that leave the filtered page when peeled."""
+        return self._favorite_page_mode
+
+    def set_favorite_page_mode(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._favorite_page_mode:
+            return
+        self.cancel_paper_peel()
+        self._favorite_page_mode = enabled
+        self.viewport().update()
 
     def set_items(self, items, selected_id: int | None = None) -> None:
         if self._sidebar_transition_active:
@@ -136,6 +184,14 @@ class AssetGrid(QListView):
         self._apply_items_now(items, selected_id)
 
     def _apply_items_now(self, items, selected_id: int | None = None) -> None:
+        settle_item_id = None
+        state = self._paper_peel
+        if state is not None and state.waiting_for_result:
+            old_index = self.model().index(state.row, 0)
+            old_record = old_index.data(AssetItemModel.ItemRole) if old_index.isValid() else None
+            if old_record is not None:
+                settle_item_id = int(old_record["id"])
+        self.cancel_paper_peel()
         self._clear_sidebar_transition(repaint=False)
         self._right_click.cancel()
         self._left_click.cancel()
@@ -146,6 +202,8 @@ class AssetGrid(QListView):
         self.items = self._asset_model.items
         self.rebuild_pending = not self.isVisible()
         self._restore_selection()
+        if settle_item_id is not None:
+            self._settle_new_paper_corner(settle_item_id)
         self.viewport().update()
 
     def resizeEvent(self, event) -> None:
@@ -205,6 +263,7 @@ class AssetGrid(QListView):
         expanded_sidebar_width: int = Sidebar.EXPANDED_WIDTH,
         collapsed_sidebar_width: int = Sidebar.COLLAPSED_WIDTH,
     ) -> bool:
+        self.cancel_paper_peel()
         return self._transition_controller.begin_sidebar(
             current_sidebar_width,
             progress,
@@ -218,6 +277,7 @@ class AssetGrid(QListView):
         end_viewport_width: int,
         progress: float = 0.0,
     ) -> bool:
+        self.cancel_paper_peel()
         return self._transition_controller.begin_viewport(
             start_viewport_width,
             end_viewport_width,
@@ -249,6 +309,8 @@ class AssetGrid(QListView):
             self.viewport().update()
 
     def hideEvent(self, event) -> None:
+        self.cancel_paper_peel()
+        self._middle_autoscroll.cancel()
         self._clear_sidebar_transition(repaint=False)
         self.delegate.clear_transition_caches()
         self._apply_pending_items_update()
@@ -270,6 +332,8 @@ class AssetGrid(QListView):
             self.viewport().update()
 
     def closeEvent(self, event) -> None:
+        self.cancel_paper_peel()
+        self._middle_autoscroll.cancel()
         self._clear_sidebar_transition(repaint=False)
         self._apply_pending_items_update()
         self._right_click.cancel()
@@ -312,16 +376,25 @@ class AssetGrid(QListView):
         self._thumbnail_session.request(key)
         return None
 
+    def thumbnail_for_external_view(
+        self, path: Path | str, content_hash: str | None = None
+    ) -> QPixmap | None:
+        key, pixmap, cached = self._thumbnail_lookup(path, content_hash)
+        if cached:
+            return pixmap
+        if key is not None:
+            self._thumbnail_session.request(key)
+        return None
+
     @Slot(object, object, int)
     def _thumbnail_decoded(self, key: ThumbnailCacheKey, image: QImage, generation: int) -> None:
         if not self._thumbnail_session.is_current(generation):
             return
-        model_generation = self._asset_model.generation
-        if not self._asset_model.has_thumbnail_path(key.path, model_generation):
-            return
         if self._store_decoded_thumbnail(key, image) is None:
             return
+        model_generation = self._asset_model.generation
         self._asset_model.notify_thumbnail_changed(key.path, model_generation)
+        self.thumbnail_available.emit(key.path)
 
     def _thumbnail_viewport_changed(self, _value: int) -> None:
         if self._layout_updates_suspended:
@@ -347,7 +420,30 @@ class AssetGrid(QListView):
         elif self._asset_model.rowCount() == 0:
             painter.setPen(QColor("#a7adb7" if dark_theme_active() else "#7a8699"))
             painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, "没有找到符合条件的内容")
+        else:
+            self._paint_active_paper(painter)
         painter.end()
+
+    def _paint_active_paper(self, painter: QPainter) -> None:
+        state = self._paper_peel
+        if state is None:
+            return
+        index = self.model().index(state.row, 0)
+        if not index.isValid():
+            return
+        rect = self.visualRect(index)
+        if rect.isEmpty():
+            return
+        option = QStyleOptionViewItem()
+        self.initViewItemOption(option)
+        option.rect = rect
+        option.widget = self
+        option.state |= QStyle.StateFlag.State_Active | QStyle.StateFlag.State_Enabled
+        if self.selectionModel().isSelected(index):
+            option.state |= QStyle.StateFlag.State_Selected
+        else:
+            option.state &= ~QStyle.StateFlag.State_Selected
+        self.delegate.paint_transition_card(painter, option, index)
 
     def clear_selection(self) -> None:
         self.selected_id = None
@@ -423,6 +519,149 @@ class AssetGrid(QListView):
     def _favorite_rect_for_index(self, index: QModelIndex) -> QRect:
         return self.delegate.favorite_rect(self._visual_rect_for_index(index))
 
+    def paper_peel_state(self, row: int) -> PaperPeelState | None:
+        state = self._paper_peel
+        return state if state is not None and state.row == row else None
+
+    def cancel_paper_peel(self) -> None:
+        state = self._paper_peel
+        self._paper_animation.stop()
+        self._paper_peel = None
+        self._favorite_press_row = -1
+        if state is not None:
+            self.viewport().update()
+
+    def _start_paper_peel(self, index: QModelIndex, point: QPoint) -> None:
+        cell = self._visual_rect_for_index(index)
+        local = QPointF(point - cell.topLeft())
+        record = index.data(AssetItemModel.ItemRole)
+        if record is not None:
+            self.select_item(int(record["id"]))
+        self._paper_animation.stop()
+        self._paper_peel = PaperPeelState(index.row(), local, local)
+        self._favorite_press_row = index.row()
+        self.viewport().update()
+
+    def _bounded_paper_point(self, index: QModelIndex, point: QPoint) -> QPointF:
+        cell = self._visual_rect_for_index(index)
+        local = QPointF(point - cell.topLeft())
+        card = self.delegate.card_rect(QRect(0, 0, cell.width(), cell.height()))
+        corner = self.delegate.paper_corner(card)
+        vector = local - corner
+        distance = math.hypot(vector.x(), vector.y())
+        maximum = max(1.0, math.hypot(card.width(), card.height()) * 1.65)
+        if distance > maximum:
+            vector *= maximum / distance
+            local = corner + vector
+        return local
+
+    def _animate_paper_peel(
+        self,
+        end: QPointF,
+        duration_ms: int,
+        commit: bool,
+        *,
+        curved: bool = False,
+    ) -> None:
+        state = self._paper_peel
+        if state is None:
+            return
+        state.animation_start = QPointF(state.current)
+        state.animation_end = QPointF(end)
+        state.animation_started = time.monotonic()
+        state.animation_duration = max(0.001, duration_ms / 1000.0)
+        state.animation_curved = curved
+        state.commit = commit
+        self._paper_animation.start()
+
+    def _settle_new_paper_corner(self, item_id: int) -> None:
+        row = self._asset_model.row_for_id(item_id)
+        if row < 0:
+            return
+        index = self.model().index(row, 0)
+        cell = self.visualRect(index)
+        if cell.isEmpty():
+            return
+        card = self.delegate.card_rect(QRect(0, 0, cell.width(), cell.height()))
+        corner = self.delegate.paper_corner(card)
+        flat = corner + QPointF(-1.0, 1.0)
+        idle = corner + QPointF(-self.delegate.CORNER_SIZE, self.delegate.CORNER_SIZE)
+        self._paper_peel = PaperPeelState(row, flat, flat)
+        self._animate_paper_peel(idle, 120, False)
+
+    def _advance_paper_animation(self) -> None:
+        state = self._paper_peel
+        if state is None or state.animation_start is None or state.animation_end is None:
+            self._paper_animation.stop()
+            return
+        progress = min(1.0, (time.monotonic() - state.animation_started) / state.animation_duration)
+        eased = (
+            progress * progress * (3.0 - 2.0 * progress)
+            if state.animation_curved
+            else 1.0 - (1.0 - progress) ** 3
+        )
+        if state.animation_curved:
+            start, end = state.animation_start, state.animation_end
+            span = end - start
+            control1 = start + QPointF(span.x() * 0.18, span.y() * 0.04)
+            control2 = start + QPointF(span.x() * 0.72, span.y() * 0.62)
+            inverse = 1.0 - eased
+            state.current = (
+                start * (inverse ** 3)
+                + control1 * (3.0 * inverse * inverse * eased)
+                + control2 * (3.0 * inverse * eased * eased)
+                + end * (eased ** 3)
+            )
+        else:
+            state.current = state.animation_start + (state.animation_end - state.animation_start) * eased
+        index = self.model().index(state.row, 0)
+        if index.isValid():
+            self.viewport().update()
+        if progress < 1.0:
+            return
+        self._paper_animation.stop()
+        if not state.commit:
+            self.cancel_paper_peel()
+            return
+        record = index.data(AssetItemModel.ItemRole) if index.isValid() else None
+        if record is None:
+            self.cancel_paper_peel()
+            return
+        state.waiting_for_result = True
+        self.favorite_requested.emit(int(record["id"]), not bool(record["favorite"]))
+
+    def preview_favorite_change(self, item_id: int, value: bool) -> None:
+        if not self._asset_model.set_favorite(item_id, value):
+            return
+        state = self._paper_peel
+        row = self._asset_model.row_for_id(item_id)
+        if state is None or row < 0 or state.row != row:
+            self.viewport().update()
+            return
+        if self._favorite_page_mode and not value:
+            # On the Favorites page the peeled card is the only sheet.  Keep
+            # it at its completed (off-card) position until the successful
+            # filtered refresh removes the row.  A failed mutation restores
+            # it through rollback_favorite_preview().
+            state.waiting_for_result = True
+            self.viewport().update()
+            return
+        index = self.model().index(row, 0)
+        cell = self.visualRect(index)
+        card = self.delegate.card_rect(QRect(0, 0, cell.width(), cell.height()))
+        corner = self.delegate.paper_corner(card)
+        flat = corner + QPointF(-1.0, 1.0)
+        idle = corner + QPointF(-self.delegate.CORNER_SIZE, self.delegate.CORNER_SIZE)
+        state.current = flat
+        state.press = flat
+        state.waiting_for_result = False
+        self._animate_paper_peel(idle, 120, False)
+
+    def rollback_favorite_preview(self, item_id: int, value: bool) -> None:
+        if self._asset_model.set_favorite(item_id, value):
+            self._settle_new_paper_corner(item_id)
+            self.viewport().update()
+
     def mousePressEvent(self, event) -> None:
         point = event.position().toPoint()
         if event.button() == Qt.MouseButton.LeftButton:
@@ -443,7 +682,7 @@ class AssetGrid(QListView):
         if event.button() == Qt.MouseButton.LeftButton:
             index = self._visual_index_at(point)
             if index.isValid() and self._favorite_rect_for_index(index).contains(point):
-                self._favorite_press_row = index.row()
+                self._start_paper_peel(index, point)
                 event.accept()
                 return
             if self._sidebar_transition_active and index.isValid():
@@ -457,6 +696,16 @@ class AssetGrid(QListView):
         self._favorite_press_row = -1
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event) -> None:
+        state = self._paper_peel
+        if state is not None and self._favorite_press_row == state.row and not state.waiting_for_result:
+            index = self.model().index(state.row, 0)
+            state.current = self._bounded_paper_point(index, event.position().toPoint())
+            self.viewport().update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._left_click.release():
             event.accept()
@@ -468,19 +717,33 @@ class AssetGrid(QListView):
                 event.accept()
                 return
         if self._favorite_press_row >= 0 and event.button() == Qt.MouseButton.LeftButton:
-            index = self._visual_index_at(event.position().toPoint())
             pressed_row = self._favorite_press_row
             self._favorite_press_row = -1
-            if (
-                index.isValid()
-                and index.row() == pressed_row
-                and self._favorite_rect_for_index(index).contains(
-                    event.position().toPoint()
-                )
-            ):
-                record = index.data(AssetItemModel.ItemRole)
-                self.select_item(int(record["id"]))
-                self.favorite_requested.emit(int(record["id"]), not bool(record["favorite"]))
+            state = self._paper_peel
+            index = self.model().index(pressed_row, 0)
+            if state is not None and index.isValid():
+                cell = self._visual_rect_for_index(index)
+                card = self.delegate.card_rect(QRect(0, 0, cell.width(), cell.height()))
+                corner = self.delegate.paper_corner(card)
+                diagonal = max(1.0, math.hypot(card.width(), card.height()))
+                travelled = math.hypot(state.current.x() - corner.x(),
+                                       state.current.y() - corner.y()) / diagonal
+                click = math.hypot(state.current.x() - state.press.x(),
+                                   state.current.y() - state.press.y()) < 5.0
+                if click or travelled >= 0.42:
+                    destination = corner + (QPointF(card.left(), card.bottom()) - corner) * 2.15
+                    self._animate_paper_peel(
+                        destination,
+                        360 if click else 220,
+                        True,
+                        curved=click,
+                    )
+                else:
+                    idle = self.delegate.paper_corner(card) + QPointF(
+                        -self.delegate.CORNER_SIZE,
+                        self.delegate.CORNER_SIZE,
+                    )
+                    self._animate_paper_peel(idle, 160, False)
             event.accept()
             return
         if (
@@ -539,4 +802,3 @@ class AssetGrid(QListView):
         if record is None or record["kind"] not in {"image", "text"}:
             return None
         return int(record["id"])
-

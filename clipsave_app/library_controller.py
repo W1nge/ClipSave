@@ -29,6 +29,13 @@ class LibraryNavigationSnapshot:
 class LibrarySnapshot:
     navigation: LibraryNavigationSnapshot
     items: object
+    total: int
+
+
+@dataclass(frozen=True, slots=True)
+class LibrarySearchResult:
+    items: object
+    total: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,10 +85,16 @@ class LibraryController(QObject):
             days=self.database.days(),
         )
 
+    def count_items(self, query: LibraryQuery) -> int:
+        parameters = query.as_database_kwargs()
+        parameters.pop("sort", None)
+        return self.database.count_query_items(**parameters)
+
     def snapshot(self, query: LibraryQuery, page_size: int) -> LibrarySnapshot:
         return LibrarySnapshot(
             navigation=self.navigation_snapshot(),
             items=self.query_items(query, page_size, 0),
+            total=self.count_items(query),
         )
 
     def refresh(self, query: LibraryQuery, page_size: int) -> None:
@@ -212,10 +225,16 @@ class LibraryController(QObject):
             if cancel_event.is_set() or not self._is_current(work):
                 return
             if work.kind == "search":
+                payload = LibrarySearchResult(
+                    items=items,
+                    total=self.count_items(work.request.query),
+                )
+                if cancel_event.is_set() or not self._is_current(work):
+                    return
                 self.search_succeeded.emit(
                     work.request.token,
                     work.request.query,
-                    items,
+                    payload,
                 )
             else:
                 self.page_succeeded.emit(

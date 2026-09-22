@@ -12,7 +12,7 @@ class AssetGridTransitionRendererTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_preview_clip_insets_text_but_not_images(self):
+    def test_preview_clip_uses_the_unified_card_body(self):
         preview = QRect(0, 0, 100, 80)
         self.assertEqual(
             AssetGridTransitionRenderer.preview_clip(preview, "image"),
@@ -20,7 +20,7 @@ class AssetGridTransitionRendererTests(unittest.TestCase):
         )
         self.assertEqual(
             AssetGridTransitionRenderer.preview_clip(preview, "text"),
-            preview.adjusted(10, 9, -10, -9),
+            preview,
         )
 
     def test_image_target_preserves_aspect_ratio(self):

@@ -169,11 +169,24 @@ def _geometry_lock_samples(
         y = top
         w = width + (phase if resize else 0)
         h = height
+        precommit_delta = 0
+        if resize:
+            proposed = (x, y, x + w, y + h)
+            _send_sizing(host_hwnd, proposed)
+            precommit_delta = _rect_delta(
+                proposed,
+                _window_rect(backdrop_hwnd),
+            )
         if not user32.SetWindowPos(host_hwnd, 0, x, y, w, h, flags):
             raise ctypes.WinError(ctypes.get_last_error())
         deltas.append(
-            _rect_delta(_window_rect(host_hwnd), _window_rect(backdrop_hwnd))
+            max(
+                precommit_delta,
+                _rect_delta(_window_rect(host_hwnd), _window_rect(backdrop_hwnd)),
+            )
         )
+    if resize:
+        _send_sizing(host_hwnd, (left, top, right, bottom))
     user32.SetWindowPos(host_hwnd, 0, left, top, width, height, flags)
     return deltas
 
@@ -268,6 +281,8 @@ def _geometry_samples(
         w = width + (phase if resize else 0)
         h = height
         started = time.perf_counter()
+        if resize:
+            _send_sizing(hwnd, (x, y, x + w, y + h))
         if not user32.SetWindowPos(hwnd, 0, x, y, w, h, flags):
             raise ctypes.WinError(ctypes.get_last_error())
         hr = int(dwmapi.DwmFlush())
@@ -275,6 +290,8 @@ def _geometry_samples(
             raise OSError(f"DwmFlush failed: 0x{hr & 0xFFFFFFFF:08X}")
         values.append((time.perf_counter() - started) * 1000.0)
 
+    if resize:
+        _send_sizing(hwnd, (left, top, right, bottom))
     user32.SetWindowPos(hwnd, 0, left, top, width, height, flags)
     dwmapi.DwmFlush()
     return values
@@ -290,6 +307,24 @@ def _send(hwnd: int, message: int) -> None:
     ]
     user32.SendMessageW.restype = ctypes.c_ssize_t
     user32.SendMessageW(hwnd, message, 0, 0)
+
+
+def _send_sizing(hwnd: int, bounds: tuple[int, int, int, int]) -> None:
+    user32 = ctypes.WinDLL("user32")
+    user32.SendMessageW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    rect = wintypes.RECT(*bounds)
+    user32.SendMessageW(
+        hwnd,
+        0x0214,  # WM_SIZING
+        8,  # WMSZ_BOTTOMRIGHT
+        ctypes.addressof(rect),
+    )
 
 
 def verify(command: list[str], *, count: int, timeout: float) -> int:
@@ -368,6 +403,7 @@ def verify(command: list[str], *, count: int, timeout: float) -> int:
                 )
                 return 3
 
+            failures: list[str] = []
             for label, resize in (("move", False), ("resize", True)):
                 _send(hwnd, WM_ENTERSIZEMOVE)
                 time.sleep(0.1)
@@ -388,15 +424,18 @@ def verify(command: list[str], *, count: int, timeout: float) -> int:
                 )
                 performance_failure = _performance_failure_reason(label, values)
                 if performance_failure is not None:
-                    print(f"interactive_backdrop=FAIL reason={performance_failure}")
-                    return 3
+                    failures.append(performance_failure)
                 if any(deltas):
-                    print(
-                        "interactive_backdrop=FAIL "
-                        f"reason={label}-geometry-lag "
-                        f"max_delta={max(deltas)}px"
+                    failures.append(
+                        f"{label}-geometry-lag max_delta={max(deltas)}px"
                     )
-                    return 3
+
+            if failures:
+                print(
+                    "interactive_backdrop=FAIL reason="
+                    + "; ".join(failures)
+                )
+                return 3
 
             # ENTER/EXIT messages exercise the real live move/resize loop, but
             # the Win10 material itself stays attached continuously. This gate

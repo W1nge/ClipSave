@@ -690,6 +690,28 @@ class LibraryDatabase:
     def count_items(self, *, kind: str | None = None) -> int:
         return self._queries.count_items(kind=kind)
 
+    def count_query_items(
+        self,
+        query: str = "",
+        kind: str | None = None,
+        favorite: bool = False,
+        day: str | None = None,
+        recent_days: int | None = None,
+        collection_id: int | None = None,
+        tag_id: int | None = None,
+        query_terms: Iterable[str] | None = None,
+    ) -> int:
+        return self._queries.count_query_items(
+            query=query,
+            kind=kind,
+            favorite=favorite,
+            day=day,
+            recent_days=recent_days,
+            collection_id=collection_id,
+            tag_id=tag_id,
+            query_terms=query_terms,
+        )
+
     def item_ids(self, *, kind: str | None = None, sort: str = "newest") -> list[int]:
         return self._queries.item_ids(kind=kind, sort=sort)
 

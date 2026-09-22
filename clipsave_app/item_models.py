@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+from dataclasses import is_dataclass, replace
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 
@@ -25,6 +26,23 @@ def format_local_timestamp(value) -> str:
     return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def format_list_timestamp(value, now: dt.datetime | None = None) -> str:
+    text = str(value or "")
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text[:16].replace("T", " ")
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    parsed = parsed.astimezone()
+    reference = (now or dt.datetime.now().astimezone()).astimezone()
+    if parsed.date() == reference.date():
+        return parsed.strftime("%H:%M")
+    if parsed.year == reference.year:
+        return parsed.strftime("%m/%d %H:%M")
+    return parsed.strftime("%Y/%m/%d")
+
+
 def human_size(value: int) -> str:
     amount = float(value or 0)
     for suffix in ("B", "KB", "MB", "GB"):
@@ -41,7 +59,7 @@ class AssetItemModel(QAbstractTableModel):
     ThumbnailPathRole = ItemRole + 3
     GenerationRole = ItemRole + 4
 
-    HEADERS = ("名称", "类型", "标签", "捕获时间", "大小")
+    HEADERS = ("内容", "标签", "捕获时间", "大小")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -66,6 +84,28 @@ class AssetItemModel(QAbstractTableModel):
         self._rows_by_thumbnail_path = rows_by_thumbnail_path
         self.endResetModel()
 
+    def set_favorite(self, item_id: int, value: bool) -> bool:
+        row = self._rows_by_id.get(int(item_id), -1)
+        if row < 0:
+            return False
+        record = self.items[row]
+        if isinstance(record, dict):
+            updated = dict(record)
+            updated["favorite"] = int(value)
+        elif is_dataclass(record):
+            updated = replace(record, favorite=int(value))
+        else:
+            return False
+        self.items[row] = updated
+        first = self.index(row, 0)
+        last = self.index(row, max(0, self.columnCount() - 1))
+        self.dataChanged.emit(
+            first,
+            last,
+            [self.ItemRole, self.FavoriteRole, Qt.ItemDataRole.DisplayRole],
+        )
+        return True
+
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.items)
 
@@ -86,18 +126,19 @@ class AssetItemModel(QAbstractTableModel):
             return normalized_thumbnail_path(record["path"]) if record["kind"] == "image" else None
         if role == self.GenerationRole:
             return self._generation
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if index.column() == 3:
+                return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if index.column() == 0:
             return str(record["title"])
         if index.column() == 1:
-            kind = record["kind"]
-            return TYPE_LABELS.get(kind, kind)
-        if index.column() == 2:
             return (record["tag_names"] or "").replace("\x1f", ", ")
+        if index.column() == 2:
+            return format_list_timestamp(record["created_at"])
         if index.column() == 3:
-            return format_local_timestamp(record["created_at"])
-        if index.column() == 4:
             return human_size(record["file_size"])
         return None
 

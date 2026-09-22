@@ -45,7 +45,7 @@ class SettingsTests(unittest.TestCase):
 
         self.assertFalse(settings.get("monitoring"))
         self.assertFalse(settings.get("sidebar_collapsed"))
-        self.assertEqual(settings.get("sort"), "newest")
+        self.assertIsNone(settings.get("sort"))
         self.assertIsNone(settings.get("theme"))
         self.assertIsNone(settings.get("hotkey"))
         self.assertIsNone(settings.get("unknown"))
@@ -57,7 +57,7 @@ class SettingsTests(unittest.TestCase):
 
         settings = Settings(self.path)
 
-        self.assertEqual(settings.get("sort"), "oldest")
+        self.assertIsNone(settings.get("sort"))
         self.assertFalse(settings.get("monitoring"))
         self.assertTrue(backup.exists())
 
@@ -115,13 +115,10 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             settings.set("auto_ocr", 1)
 
-    def test_current_sort_options_pass_validation(self):
+    def test_legacy_sort_setting_is_no_longer_writable(self):
         settings = Settings(self.path)
-
-        for sort in ("newest", "oldest", "name", "size", "type"):
-            with self.subTest(sort=sort):
-                settings.set("sort", sort)
-                self.assertEqual(settings.get("sort"), sort)
+        with self.assertRaises(KeyError):
+            settings.set("sort", "oldest")
 
     def test_manual_theme_options_pass_validation(self):
         settings = Settings(self.path)

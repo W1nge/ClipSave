@@ -56,6 +56,69 @@ class DatabaseQueryStore:
             raise ValueError("limit must be a non-negative integer or None")
         if not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be a non-negative integer")
+        joins, clauses, parameters = self._query_filter(
+            query=query,
+            kind=kind,
+            favorite=favorite,
+            day=day,
+            recent_days=recent_days,
+            collection_id=collection_id,
+            tag_id=tag_id,
+            query_terms=query_terms,
+        )
+        projection = "i.*"
+        if summary_only:
+            projection = f"""
+                i.id, i.kind, i.title, substr(i.content,1,{self.summary_content_limit}) AS content,
+                i.path, i.resolved_path, i.mime, i.content_hash, i.created_at, i.updated_at,
+                i.file_size, i.width, i.height, i.source, i.favorite, '' AS notes,
+                '' AS ocr_text, '' AS ai_description, NULL AS embedding,
+                i.embedding_provider, i.embedding_model, i.embedding_dimensions,
+                i.embedding_revision, i.collection_id,
+                i.external, i.missing
+            """
+        pagination = ""
+        if limit is not None:
+            pagination = "LIMIT ? OFFSET ?"
+            parameters.extend((limit, offset))
+        elif offset:
+            pagination = "LIMIT -1 OFFSET ?"
+            parameters.append(offset)
+        sql = f"""
+            SELECT {projection}, c.name AS collection_name,
+                   (SELECT GROUP_CONCAT(name, char(31)) FROM (
+                       SELECT tag.name AS name
+                       FROM item_tags link JOIN tags tag ON tag.id=link.tag_id
+                       WHERE link.item_id=i.id ORDER BY tag.id
+                   )) AS tag_names,
+                   (SELECT GROUP_CONCAT(color, char(31)) FROM (
+                       SELECT tag.color AS color
+                       FROM item_tags link JOIN tags tag ON tag.id=link.tag_id
+                       WHERE link.item_id=i.id ORDER BY tag.id
+                   )) AS tag_colors
+            FROM items i
+            LEFT JOIN collections c ON c.id = i.collection_id
+            {joins}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY {self.item_order(sort)}
+            {pagination}
+        """
+        with self._lock:
+            rows = self._connection().execute(sql, parameters).fetchall()
+        return [LibraryItem.from_mapping(row) for row in rows]
+
+    def _query_filter(
+        self,
+        *,
+        query: str = "",
+        kind: str | None = None,
+        favorite: bool = False,
+        day: str | None = None,
+        recent_days: int | None = None,
+        collection_id: int | None = None,
+        tag_id: int | None = None,
+        query_terms: Iterable[str] | None = None,
+    ) -> tuple[str, list[str], list[object]]:
         clauses = ["i.missing = 0"]
         parameters: list[object] = []
         joins = ""
@@ -128,46 +191,43 @@ class DatabaseQueryStore:
             joins += " JOIN item_tags filter_tags ON filter_tags.item_id = i.id "
             clauses.append("filter_tags.tag_id = ?")
             parameters.append(tag_id)
-        projection = "i.*"
-        if summary_only:
-            projection = f"""
-                i.id, i.kind, i.title, substr(i.content,1,{self.summary_content_limit}) AS content,
-                i.path, i.resolved_path, i.mime, i.content_hash, i.created_at, i.updated_at,
-                i.file_size, i.width, i.height, i.source, i.favorite, '' AS notes,
-                '' AS ocr_text, '' AS ai_description, NULL AS embedding,
-                i.embedding_provider, i.embedding_model, i.embedding_dimensions,
-                i.embedding_revision, i.collection_id,
-                i.external, i.missing
-            """
-        pagination = ""
-        if limit is not None:
-            pagination = "LIMIT ? OFFSET ?"
-            parameters.extend((limit, offset))
-        elif offset:
-            pagination = "LIMIT -1 OFFSET ?"
-            parameters.append(offset)
-        sql = f"""
-            SELECT {projection}, c.name AS collection_name,
-                   (SELECT GROUP_CONCAT(name, char(31)) FROM (
-                       SELECT tag.name AS name
-                       FROM item_tags link JOIN tags tag ON tag.id=link.tag_id
-                       WHERE link.item_id=i.id ORDER BY tag.id
-                   )) AS tag_names,
-                   (SELECT GROUP_CONCAT(color, char(31)) FROM (
-                       SELECT tag.color AS color
-                       FROM item_tags link JOIN tags tag ON tag.id=link.tag_id
-                       WHERE link.item_id=i.id ORDER BY tag.id
-                   )) AS tag_colors
-            FROM items i
-            LEFT JOIN collections c ON c.id = i.collection_id
-            {joins}
-            WHERE {' AND '.join(clauses)}
-            ORDER BY {self.item_order(sort)}
-            {pagination}
-        """
+        return joins, clauses, parameters
+
+    def count_query_items(
+        self,
+        query: str = "",
+        kind: str | None = None,
+        favorite: bool = False,
+        day: str | None = None,
+        recent_days: int | None = None,
+        collection_id: int | None = None,
+        tag_id: int | None = None,
+        query_terms: Iterable[str] | None = None,
+    ) -> int:
+        joins, clauses, parameters = self._query_filter(
+            query=query,
+            kind=kind,
+            favorite=favorite,
+            day=day,
+            recent_days=recent_days,
+            collection_id=collection_id,
+            tag_id=tag_id,
+            query_terms=query_terms,
+        )
         with self._lock:
-            rows = self._connection().execute(sql, parameters).fetchall()
-        return [LibraryItem.from_mapping(row) for row in rows]
+            return int(
+                self._connection()
+                .execute(
+                    f"""
+                    SELECT COUNT(DISTINCT i.id)
+                    FROM items i
+                    {joins}
+                    WHERE {' AND '.join(clauses)}
+                    """,
+                    parameters,
+                )
+                .fetchone()[0]
+            )
 
     def count_items(self, *, kind: str | None = None) -> int:
         clauses = ["missing = 0"]

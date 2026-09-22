@@ -26,9 +26,10 @@ class AssetGridTransitionController:
         gap = 12
         layout_width = max(210, available - 1)
         card_width = max(210, (layout_width - columns * gap) // columns)
+        card_height = max(170, round(card_width / AssetGridDelegate.CARD_ASPECT))
         return columns, QSize(
             card_width + gap,
-            AssetGridDelegate.card_height + gap,
+            card_height + gap,
         )
 
     @staticmethod

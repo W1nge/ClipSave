@@ -40,7 +40,7 @@ from .image_task_controller import ImageOperationPreparationState
 from .library_metadata_controller import (
     MetadataMutationResult,
 )
-from .library_controller import LibrarySnapshot
+from .library_controller import LibrarySearchResult, LibrarySnapshot
 from .library_models import LibraryQuery, LibraryViewState
 from .main_window_backend import MainWindowBackend, ShutdownFailure
 from .native_window_controller import NativeWindowController, windows_resize_hit_test
@@ -95,15 +95,6 @@ from .widgets import (
 )
 
 
-SORT_BUTTON_LABELS = {
-    "newest": "排序：最新",
-    "oldest": "排序：最早",
-    "name": "排序：名称",
-    "size": "排序：大小",
-    "type": "排序：类型",
-}
-
-
 def system_uses_dark_theme() -> bool:
     scheme = QApplication.styleHints().colorScheme()
     if scheme == Qt.ColorScheme.Dark:
@@ -129,6 +120,11 @@ class AsyncSignals(QObject):
     failed = Signal(str)
 
 
+class FavoriteMutationSignals(QObject):
+    succeeded = Signal(object, int, bool)
+    failed = Signal(object, int, bool, str)
+
+
 class MainWindow(QMainWindow):
     RESIZE_EDGE_WIDTH = 8
     RESIZE_CORNER_SIZE = 14
@@ -141,6 +137,14 @@ class MainWindow(QMainWindow):
     @current_items.setter
     def current_items(self, value) -> None:
         self.library_state.items = value
+
+    @property
+    def _items_total(self) -> int:
+        return self.library_state.total
+
+    @_items_total.setter
+    def _items_total(self, value: int) -> None:
+        self.library_state.total = max(0, int(value))
 
     @property
     def _items_offset(self) -> int:
@@ -189,6 +193,9 @@ class MainWindow(QMainWindow):
     @current_favorite.setter
     def current_favorite(self, value: bool) -> None:
         self.library_state.favorite = value
+        grid = getattr(self, "grid", None)
+        if grid is not None:
+            grid.set_favorite_page_mode(value)
 
     @property
     def current_day(self) -> str | None:
@@ -222,14 +229,6 @@ class MainWindow(QMainWindow):
     def current_tag(self, value: int | None) -> None:
         self.library_state.tag_id = value
 
-    @property
-    def current_sort(self) -> str:
-        return self.library_state.sort
-
-    @current_sort.setter
-    def current_sort(self, value: str) -> None:
-        self.library_state.sort = value
-
     def __init__(
         self,
         database: LibraryDatabase,
@@ -248,9 +247,8 @@ class MainWindow(QMainWindow):
         self.paths = paths
         self.runtime = runtime
         self.app_icon = app_icon
-        self.library_state = LibraryViewState(sort=settings.get("sort", "newest"))
-        self.sort_menu = None
-        self.sort_menu_closed_at = 0.0
+        self.library_state = LibraryViewState()
+        self._favorite_requests: dict[int, tuple[object, FavoriteMutationSignals]] = {}
         self.force_quit = False
         self._grid_dirty = True
         self._table_dirty = True
@@ -339,6 +337,12 @@ class MainWindow(QMainWindow):
                 lparam
             ),
             sync_backdrop_geometry_now=lambda: self._sync_windows_backdrop_geometry_now(),
+            sync_backdrop_proposed_rect=lambda left, top, right, bottom: self.window_effects_controller.sync_proposed_rect(
+                left,
+                top,
+                right,
+                bottom,
+            ),
             sync_backdrop_window=lambda: self._sync_windows_backdrop_window(),
             schedule_soon=lambda callback: QTimer.singleShot(0, callback),
             set_layout_updates_suspended=lambda value: self.grid.set_layout_updates_suspended(
@@ -531,6 +535,7 @@ class MainWindow(QMainWindow):
         top_layout.setSpacing(8)
         top_layout.addStretch(1)
         self.search = ThemedLineEdit()
+        self.search.setObjectName("SearchField")
         self.search.setPlaceholderText("搜索剪贴板内容、文件名、标签、OCR 或 AI 描述  (Ctrl+K)")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(560)
@@ -543,11 +548,6 @@ class MainWindow(QMainWindow):
         self.expanded_search_button.clicked.connect(self.expand_search)
         top_layout.addWidget(self.expanded_search_button)
         top_layout.addStretch(1)
-        self.sort_button = QPushButton(
-            SORT_BUTTON_LABELS.get(self.current_sort, SORT_BUTTON_LABELS["newest"]) + "  ▾"
-        )
-        self.sort_button.clicked.connect(self.open_sort_menu)
-        top_layout.addWidget(self.sort_button)
         self.grid_button = IconButton("grid", "网格视图")
         self.grid_button.clicked.connect(lambda: self.set_view_mode("grid"))
         top_layout.addWidget(self.grid_button)
@@ -598,7 +598,7 @@ class MainWindow(QMainWindow):
         self.table.item_activated.connect(self.activate_item)
         self.table.detail_requested.connect(self.show_item_detail)
         self.table.open_requested.connect(self.open_item)
-        self.table.favorite_requested.connect(self.set_favorite)
+        self.table.set_thumbnail_provider(self.grid)
         self.table_page = QWidget()
         table_page_layout = QVBoxLayout(self.table_page)
         table_page_layout.setContentsMargins(0, 44, 0, 0)
@@ -608,6 +608,8 @@ class MainWindow(QMainWindow):
         self.view_stack.addWidget(self.table_page)
 
         self.library_surface = QWidget()
+        self.library_surface.setObjectName("LibrarySurface")
+        self.library_surface.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         library_layers = QStackedLayout(self.library_surface)
         library_layers.setContentsMargins(0, 0, 0, 0)
         library_layers.setStackingMode(QStackedLayout.StackingMode.StackAll)
@@ -976,7 +978,7 @@ class MainWindow(QMainWindow):
             navigation.tags,
             navigation.days,
         )
-        self._apply_first_page(snapshot.items)
+        self._apply_first_page(snapshot.items, snapshot.total)
 
     def _apply_navigation_metadata(self, counts, collections, tags, days=None) -> None:
         collections = list(collections)
@@ -1052,7 +1054,7 @@ class MainWindow(QMainWindow):
             return
         self._items_offset = 0
         self._items_loading = False
-        self._apply_first_page(items)
+        self._apply_first_page(items, payload.total)
 
     def _library_refresh_failed(
         self,
@@ -1073,16 +1075,18 @@ class MainWindow(QMainWindow):
         self._cancel_item_page_request()
         self._items_offset = 0
         self._items_loading = False
-        items = self._query_current_items(self.ITEM_PAGE_SIZE, 0)
-        self._apply_first_page(items)
+        spec = self._current_item_query_spec()
+        items = self._query_items_for_spec(spec, self.ITEM_PAGE_SIZE, 0)
+        self._apply_first_page(items, self.library_controller.count_items(spec))
 
-    def _apply_first_page(self, items) -> None:
+    def _apply_first_page(self, items, total: int) -> None:
+        self._items_total = total
         self._items_offset = len(items)
-        self._items_has_more = len(items) == self.ITEM_PAGE_SIZE
+        self._items_has_more = self._items_offset < self._items_total
         self._apply_items(items)
         expanded_suffix = " · 已扩大搜索" if self._expanded_search_active() else ""
         self.result_count.setText(
-            f"{len(self.current_items):,}{'+' if self._items_has_more else ''} 项{expanded_suffix}"
+            f"{self._items_total:,} 项{expanded_suffix}"
         )
         filters = []
         if self.current_day:
@@ -1107,7 +1111,7 @@ class MainWindow(QMainWindow):
             recent_days=7 if self.current_recent else None,
             collection_id=self.current_collection,
             tag_id=self.current_tag,
-            sort=self.current_sort,
+            sort="newest",
         )
 
     def _query_items_for_spec(
@@ -1137,7 +1141,7 @@ class MainWindow(QMainWindow):
         self,
         token: object,
         spec: LibraryQuery,
-        items: object,
+        payload: object,
     ) -> None:
         if not self.library_controller.finish_search(token):
             return
@@ -1145,12 +1149,12 @@ class MainWindow(QMainWindow):
             return
         if spec != self._current_item_query_spec():
             return
-        if not isinstance(items, list):
+        if not isinstance(payload, LibrarySearchResult) or not isinstance(payload.items, list):
             self.show_error_status("搜索失败：返回结果无效")
             return
         self._items_offset = 0
         self._items_loading = False
-        self._apply_first_page(items)
+        self._apply_first_page(payload.items, payload.total)
 
     def _item_search_failed(
         self,
@@ -1208,7 +1212,7 @@ class MainWindow(QMainWindow):
         ):
             return
         self._items_offset += len(items)
-        self._items_has_more = len(items) == self.ITEM_PAGE_SIZE
+        self._items_has_more = self._items_offset < self._items_total
         if items:
             existing_ids = {item["id"] for item in self.current_items}
             self._apply_items(
@@ -1217,7 +1221,7 @@ class MainWindow(QMainWindow):
             )
         expanded_suffix = " · 已扩大搜索" if self._expanded_search_active() else ""
         self.result_count.setText(
-            f"{len(self.current_items):,}{'+' if self._items_has_more else ''} 项{expanded_suffix}"
+            f"{self._items_total:,} 项{expanded_suffix}"
         )
 
     def _item_page_failed(
@@ -1393,34 +1397,6 @@ class MainWindow(QMainWindow):
             button.style().unpolish(button)
             button.style().polish(button)
 
-    def open_sort_menu(self) -> None:
-        if self.sort_menu is not None and self.sort_menu.isVisible():
-            self.sort_menu.close()
-            return
-        if time.monotonic() - self.sort_menu_closed_at < 0.2:
-            return
-        menu = QMenu(self)
-        self.sort_menu = menu
-        menu.aboutToHide.connect(self._sort_menu_hidden)
-        entries = [("newest", "捕获时间：最新优先"), ("oldest", "捕获时间：最早优先"), ("name", "名称"), ("size", "文件大小"), ("type", "类型")]
-        for key, label in entries:
-            action = menu.addAction(("✓  " if key == self.current_sort else "    ") + label)
-            action.triggered.connect(lambda _checked=False, value=key, text=label: self.set_sort(value, text))
-        menu.popup(self.sort_button.mapToGlobal(self.sort_button.rect().bottomLeft()))
-
-    def _sort_menu_hidden(self) -> None:
-        self.sort_menu_closed_at = time.monotonic()
-        menu = self.sort_menu
-        self.sort_menu = None
-        if menu is not None:
-            menu.deleteLater()
-
-    def set_sort(self, key: str, label: str) -> None:
-        self.current_sort = key
-        self._save_setting("sort", key)
-        self.sort_button.setText(SORT_BUTTON_LABELS.get(key, label) + "  ▾")
-        self._refresh_search_items_async()
-
     def toggle_monitor(self) -> None:
         result = self.monitoring_controller.toggle()
         if not result.succeeded:
@@ -1431,6 +1407,13 @@ class MainWindow(QMainWindow):
     def _show_monitor_notification(self, active: bool) -> None:
         message = "本地自动捕获已开启" if active else "本地自动捕获已暂停"
         self.show_status(message)
+        if hasattr(self, "tray") and self.tray.isVisible():
+            self.tray.showMessage(
+                "ClipSave",
+                message,
+                QSystemTrayIcon.MessageIcon.Information,
+                2800,
+            )
         button = self.capture_status
         QToolTip.showText(
             button.mapToGlobal(button.rect().bottomLeft()),
@@ -1697,15 +1680,62 @@ class MainWindow(QMainWindow):
         self.show_status("删除失败：内容未能删除")
 
     def set_favorite(self, item_id: int, value: bool) -> None:
-        if not self._handle_metadata_result(
-            self.library_metadata_controller.set_favorite(item_id, value),
-            "收藏更新失败",
-            "收藏状态未保存",
-        ):
+        item_id = int(item_id)
+        value = bool(value)
+        if item_id in self._favorite_requests:
+            self.grid.rollback_favorite_preview(item_id, not value)
+            self.show_status("收藏状态正在保存，请稍候")
+            return
+        self.grid.preview_favorite_change(item_id, value)
+        token = object()
+        signals = FavoriteMutationSignals(self)
+        signals.succeeded.connect(self._favorite_mutation_succeeded)
+        signals.failed.connect(self._favorite_mutation_failed)
+        self._favorite_requests[item_id] = (token, signals)
+
+        def worker(cancel_event: threading.Event) -> None:
+            result = self.library_metadata_controller.set_favorite(item_id, value)
+            if cancel_event.is_set():
+                return
+            if result.succeeded:
+                signals.succeeded.emit(token, item_id, value)
+            else:
+                signals.failed.emit(token, item_id, value, str(result.error))
+
+        try:
+            self._start_async_task(token, worker)
+        except Exception as exc:
+            self._favorite_requests.pop(item_id, None)
+            self.grid.rollback_favorite_preview(item_id, not value)
+            QMessageBox.warning(self, "收藏更新失败", str(exc))
+            self.show_status("收藏状态未保存")
+
+    def _finish_favorite_request(self, token: object, item_id: int) -> bool:
+        request = self._favorite_requests.get(item_id)
+        if request is None or request[0] is not token:
+            return False
+        self._favorite_requests.pop(item_id, None)
+        return True
+
+    def _favorite_mutation_succeeded(self, token: object, item_id: int, value: bool) -> None:
+        if not self._finish_favorite_request(token, item_id) or self._closing:
             return
         self._refresh_after_mutation()
         if self.detail.isVisible() and self.current_item_id == item_id:
             self.update_detail(item_id)
+
+    def _favorite_mutation_failed(
+        self,
+        token: object,
+        item_id: int,
+        value: bool,
+        message: str,
+    ) -> None:
+        if not self._finish_favorite_request(token, item_id) or self._closing:
+            return
+        self.grid.rollback_favorite_preview(item_id, not value)
+        QMessageBox.warning(self, "收藏更新失败", message)
+        self.show_status("收藏状态未保存")
 
     def save_notes(self, item_id: int, notes: str) -> bool:
         if not self._handle_metadata_result(
@@ -2883,5 +2913,3 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
             self.hide()
-            message = "ClipSave 仍在后台保存剪贴板内容。" if self.clipboard_service.timer.isActive() else "ClipSave 已隐藏到托盘，自动捕获当前暂停。"
-            self.tray.showMessage("ClipSave", message, QSystemTrayIcon.MessageIcon.Information, 1800)

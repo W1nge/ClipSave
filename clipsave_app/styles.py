@@ -16,14 +16,15 @@ QListWidget#DateList::item { padding: 0 12px; border-radius: 4px; background: #f
 QListWidget#DateList::item:hover { background: rgba(39,75,125,16); }
 QListWidget#DateList::item:selected { background: rgba(47,125,246,28); color: #135fc7; }
 QWidget#WindowBody { background: transparent; }
-QFrame#WindowTitleBar { background: rgba(255, 255, 255, 204); border: 0; }
-QWidget#Sidebar { background: rgba(255, 255, 255, 204); border: 0; }
+QFrame#WindowTitleBar { background: rgba(255,255,255,70); border: 0; }
+QWidget#Sidebar { background: rgba(255,255,255,70); border: 0; }
 QScrollArea#SidebarClassificationScroll, QScrollArea#SidebarClassificationScroll > QWidget > QWidget { background: transparent; border: 0; }
 QWidget#ContentSurface { background: transparent; }
-QWidget#DetailPanel { background: #f6f6f6; border: 0; }
-QFrame#TopBar { background: rgba(255, 255, 255, 204); border-bottom: 1px solid rgba(115,129,150,38); }
-QFrame#LibraryHeader { background: #f6f6f6; }
-QStackedWidget#ViewStack { background: #f6f6f6; }
+QWidget#LibrarySurface { background: #f6f6f6; }
+QWidget#DetailPanel, QWidget#DetailPanelContent { background: #f6f6f6; border: 0; }
+QFrame#TopBar { background: rgba(255,255,255,70); border-bottom: 1px solid rgba(115,129,150,38); }
+QFrame#LibraryHeader { background: transparent; }
+QStackedWidget#ViewStack { background: transparent; }
 QFrame#Card { background: #ffffff; border: 1px solid rgba(105,121,145,40); border-radius: 7px; }
 QFrame#Card:hover { background: #ffffff; border-color: rgba(47,125,246,100); }
 QFrame#Card[selected="true"] { background: rgba(234,243,255,245); border: 2px solid #2f7df6; }
@@ -46,6 +47,7 @@ QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     padding: 7px 34px 7px 10px;
     selection-background-color: #2f7df6;
 }
+QLineEdit#SearchField { background: rgba(255,255,255,166); }
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
@@ -87,9 +89,11 @@ QScrollArea { border: 0; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QLabel#DetailPreview { background: rgba(235,239,245,160); border-radius: 6px; }
 QListView#AssetGrid { background: #f6f6f6; border: 0; outline: 0; }
-QTableView#AssetTable { background: #f6f6f6; alternate-background-color: #ffffff; border: 0; gridline-color: transparent; outline: 0; selection-color: #172033; selection-background-color: rgba(47,125,246,30); }
-QTableView#AssetTable::item { padding: 8px 10px; border-bottom: 1px solid rgba(115,129,150,24); }
-QTableView#AssetTable::item:selected { color: #172033; background: rgba(47,125,246,30); }
+QTableView#AssetTable { background: transparent; alternate-background-color: transparent; border: 0; gridline-color: transparent; outline: 0; selection-color: #172033; selection-background-color: transparent; }
+QTableView#AssetTable::item { padding: 5px 8px; border: 0; border-bottom: 1px solid rgba(115,129,150,22); }
+QTableView#AssetTable::item:hover, QTableView#AssetTable::item:selected { color: #172033; background: transparent; }
+QHeaderView#AssetTableHeader, QWidget#AssetTableHeaderViewport { background: rgba(255,255,255,72); border: 0; }
+QHeaderView#AssetTableHeader::section { background: transparent; border: 0; border-bottom: 1px solid rgba(115,129,150,32); padding: 5px 8px; font-weight: 600; }
 QTableWidget { background: #f6f6f6; alternate-background-color: #ffffff; border: 0; gridline-color: transparent; selection-background-color: rgba(47,125,246,30); }
 QTableWidget::item { padding: 8px 10px; border-bottom: 1px solid rgba(115,129,150,24); }
 QTableWidget::item:selected { color: #172033; background: rgba(47,125,246,30); }
@@ -120,37 +124,13 @@ QFrame#WindowTitleBar, QWidget#Sidebar, QFrame#TopBar { background: #f6f6f6; }
 
 
 _DARK_SOLID_OVERRIDES = """
-QMainWindow, QWidget#AppRoot, QWidget#WindowBody, QWidget#ContentSurface { background: #202020; }
+QMainWindow, QWidget#AppRoot, QWidget#WindowBody, QWidget#ContentSurface { background: #181818; }
 QFrame#WindowTitleBar, QWidget#Sidebar, QFrame#TopBar { background: #202020; }
 """
 
 
-_ACRYLIC_TINT_ALPHA = 76  # ~30%; native Acrylic provides the material.
-_LEGACY_BLUR_TINT_ALPHA = 204  # 80%; Qt supplies most of the fallback material tint.
-
-
-def _surface_tint_alpha(backend: str | None) -> int:
-    if backend in {
-        "desktop_acrylic",
-        "win10_effect_acrylic",
-    }:
-        return _ACRYLIC_TINT_ALPHA
-    return _LEGACY_BLUR_TINT_ALPHA
-
-
 def stylesheet_for_theme(dark: bool, *, backend: str | None = None) -> str:
     base = DARK_STYLESHEET if dark else LIGHT_STYLESHEET
-    alpha = _surface_tint_alpha(backend)
-    if dark:
-        base = base.replace(
-            "rgba(32,32,32,204)",
-            f"rgba(32,32,32,{alpha})",
-        )
-    else:
-        base = base.replace(
-            "rgba(255, 255, 255, 204)",
-            f"rgba(255, 255, 255, {alpha})",
-        )
     if backend != "solid":
         return base
     return base + (_DARK_SOLID_OVERRIDES if dark else _LIGHT_SOLID_OVERRIDES)
@@ -174,15 +154,15 @@ QListWidget#DateList::item { padding: 0 12px; border-radius: 4px; background: #2
 QListWidget#DateList::item:hover { background: #343434; }
 QListWidget#DateList::item:selected { background: #26384d; color: #79c4ff; }
 QWidget#WindowBody { background: transparent; }
-QFrame#WindowTitleBar { background: rgba(32,32,32,204); border: 0; }
-QWidget#Sidebar { background: rgba(32,32,32,204); border: 0; }
+QFrame#WindowTitleBar { background: rgba(0,0,0,128); border: 0; }
+QWidget#Sidebar { background: rgba(0,0,0,128); border: 0; }
 QScrollArea#SidebarClassificationScroll, QScrollArea#SidebarClassificationScroll > QWidget > QWidget { background: transparent; border: 0; }
 QWidget#ContentSurface { background: transparent; }
-QWidget#DetailPanel { background: #202020; border: 0; }
-QWidget#DetailPanelContent { background: #202020; }
-QFrame#TopBar { background: rgba(32,32,32,204); border-bottom: 1px solid #3c3c3c; }
-QFrame#LibraryHeader { background: #202020; }
-QStackedWidget#ViewStack { background: #202020; }
+QWidget#LibrarySurface { background: #202020; }
+QWidget#DetailPanel, QWidget#DetailPanelContent { background: #181818; border: 0; }
+QFrame#TopBar { background: rgba(0,0,0,128); border-bottom: 1px solid #3c3c3c; }
+QFrame#LibraryHeader { background: transparent; }
+QStackedWidget#ViewStack { background: transparent; }
 QFrame#Card { background: #292929; border: 1px solid #464646; border-radius: 7px; }
 QFrame#Card:hover { background: #303030; border-color: #477eb5; }
 QFrame#Card[selected="true"] { background: #26384d; border: 2px solid #4da3ff; }
@@ -207,6 +187,7 @@ QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     color: #f2f2f2;
     selection-background-color: #2f7df6;
 }
+QLineEdit#SearchField { background: rgba(0,0,0,166); }
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
@@ -240,12 +221,14 @@ QPushButton#CaptureStatus:hover { background: rgba(255,255,255,18); }
 QFrame#CopyToast { background: rgba(40,40,40,230); border: 1px solid rgba(255,255,255,48); border-radius: 6px; }
 QLabel#CopyToastIcon { background: #2f7df6; border-radius: 17px; }
 QLabel#CopyToastText { color: #f7f7f7; font-size: 15px; font-weight: 600; }
-QScrollArea { border: 0; background: #202020; }
-QScrollArea > QWidget > QWidget { background: #202020; }
+QScrollArea { border: 0; background: transparent; }
+QScrollArea > QWidget > QWidget { background: transparent; }
 QListView#AssetGrid { background: #202020; border: 0; outline: 0; }
-QTableView#AssetTable { background: #202020; alternate-background-color: #252525; border: 0; gridline-color: transparent; outline: 0; selection-color: #f2f2f2; selection-background-color: #26384d; }
-QTableView#AssetTable::item { padding: 8px 10px; border-bottom: 1px solid #343434; }
-QTableView#AssetTable::item:selected { color: #f2f2f2; background: #26384d; }
+QTableView#AssetTable { background: transparent; alternate-background-color: transparent; border: 0; gridline-color: transparent; outline: 0; selection-color: #f2f2f2; selection-background-color: transparent; }
+QTableView#AssetTable::item { padding: 5px 8px; border: 0; border-bottom: 1px solid rgba(255,255,255,15); }
+QTableView#AssetTable::item:hover, QTableView#AssetTable::item:selected { color: #f2f2f2; background: transparent; }
+QHeaderView#AssetTableHeader, QWidget#AssetTableHeaderViewport { background: rgba(0,0,0,72); border: 0; }
+QHeaderView#AssetTableHeader::section { background: transparent; border: 0; border-bottom: 1px solid rgba(255,255,255,22); padding: 5px 8px; font-weight: 600; }
 QHeaderView::section { background: #282828; border: 0; border-bottom: 1px solid #404040; padding: 8px 10px; font-weight: 600; }
 QMenu { background: #292929; border: 1px solid #4a4a4a; border-radius: 6px; padding: 5px; }
 QMenu::item { padding: 7px 26px 7px 12px; border-radius: 4px; }

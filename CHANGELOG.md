@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.1.3 - 2026-09-22
+
+- Rebuilt grid cards as layered paper with a draggable, click-to-tear favorite corner, non-blocking persistence, contextual time/date labels and simplified content presentation.
+- Redesigned list view with image thumbnails, compact metadata, accurate total counts and incremental loading for large libraries.
+- Refined the dark visual hierarchy with acrylic top and side bars, solid high-density content surfaces, a two-color ClipSave wordmark and rounded library scrollbars.
+- Removed user-facing sorting, added browser-style middle-click auto-scroll, stabilized detail-panel card transitions and moved capture-state notifications to the monitoring toggle.
 
 ## 1.1.2 - 2026-09-19
 

@@ -17,6 +17,9 @@ class FakeDatabase:
     def query_items(self, **kwargs):
         return [(kwargs["query"], kwargs["offset"])]
 
+    def count_query_items(self, **kwargs):
+        return 1
+
     def counts(self):
         return {"all": 1}
 
@@ -56,9 +59,10 @@ class LibraryControllerTests(unittest.TestCase):
 
         self.assertIsNotNone(controller.search_request)
         self.assertTrue(self.wait_for(lambda: bool(results)))
-        token, returned_query, items = results[0]
+        token, returned_query, payload = results[0]
         self.assertEqual(returned_query, query)
-        self.assertEqual(items, [("needle", 0)])
+        self.assertEqual(payload.items, [("needle", 0)])
+        self.assertEqual(payload.total, 1)
         self.assertTrue(controller.finish_search(token))
         self.assertIsNone(controller.search_request)
 
@@ -125,7 +129,8 @@ class LibraryControllerTests(unittest.TestCase):
 
         self.assertEqual(database.calls, ["q0", "q4"])
         self.assertEqual(results[0][1].query, "q4")
-        self.assertEqual(results[0][2], [("q4", 0)])
+        self.assertEqual(results[0][2].items, [("q4", 0)])
+        self.assertEqual(results[0][2].total, 1)
         self.assertTrue(controller.finish_search(results[0][0]))
         deadline = time.monotonic() + 1.0
         while supervisor.regular_tasks and time.monotonic() < deadline:
@@ -141,6 +146,7 @@ class LibraryControllerTests(unittest.TestCase):
         self.assertEqual(snapshot.navigation.counts, {"all": 1})
         self.assertEqual(snapshot.navigation.days, [("2026-09-20", 1)])
         self.assertEqual(snapshot.items, [("needle", 0)])
+        self.assertEqual(snapshot.total, 1)
 
     def test_search_start_failure_reports_error_and_returns_to_idle(self):
         supervisor = TaskSupervisor()

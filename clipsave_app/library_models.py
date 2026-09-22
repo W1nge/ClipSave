@@ -102,6 +102,7 @@ TagSummary._init_field_names()
 @dataclass(slots=True)
 class LibraryViewState:
     items: list[object] = field(default_factory=list)
+    total: int = 0
     offset: int = 0
     has_more: bool = False
     loading: bool = False

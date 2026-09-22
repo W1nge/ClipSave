@@ -141,6 +141,25 @@ class WindowEffectsController:
             sync_z_order=False,
         )
 
+    def sync_proposed_rect(self, left: int, top: int, right: int, bottom: int) -> None:
+        """Pre-size the helper from WM_SIZING before the host commits its bounds."""
+        if not self._acrylic_active() or self.window.isMinimized():
+            return
+        backdrop_hwnd = self.backdrop_window_hwnd
+        host_hwnd = int(self.window.winId())
+        if not backdrop_hwnd or not host_hwnd:
+            return
+        sync_backdrop_host_window(
+            backdrop_hwnd,
+            host_hwnd,
+            int(left),
+            int(top),
+            max(1, int(right) - int(left)),
+            max(1, int(bottom) - int(top)),
+            visible=self.window.isVisible(),
+            sync_z_order=False,
+        )
+
     def sync_from_windowpos(self, lparam: int) -> None:
         if (
             not lparam

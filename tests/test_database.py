@@ -48,6 +48,23 @@ class LibraryDatabaseTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual((result[0]["width"], result[0]["height"]), (640, 480))
 
+    def test_filtered_item_count_matches_query_without_loading_rows(self):
+        first_id = self.database.add_text("alpha project")
+        second_id = self.database.add_text("beta project")
+        self.database.set_favorite(first_id, True)
+        tag_id = self.database.add_tag(first_id, "priority")
+        self.database.add_tag(second_id, "archive")
+
+        self.assertEqual(self.database.count_query_items(query="project"), 2)
+        self.assertEqual(
+            self.database.count_query_items(
+                query="project",
+                favorite=True,
+                tag_id=tag_id,
+            ),
+            1,
+        )
+
     def test_ai_and_ocr_compare_and_set_reject_stale_content_hash(self):
         path = self.root / "versioned.png"
         Image.new("RGB", (16, 16), "blue").save(path)
