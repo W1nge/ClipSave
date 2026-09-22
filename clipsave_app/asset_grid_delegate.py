@@ -230,15 +230,20 @@ class AssetGridDelegate(QStyledItemDelegate):
 
     @staticmethod
     def _paint_card_outline(painter, paper_rect: QRectF, border: QColor) -> None:
-        outline = AssetGridDelegate._card_shape_path(paper_rect)
-        outline.setFillRule(Qt.FillRule.OddEvenFill)
-        radius = AssetGridDelegate.CARD_RADIUS
-        outline.addRoundedRect(
-            paper_rect.adjusted(1.0, 1.0, -1.0, -1.0),
-            radius - 1.0,
-            radius - 1.0,
+        # Center a one-pixel stroke on half-pixel inset geometry so all four
+        # edges rasterize inside the sheet.  This keeps the right/bottom edge
+        # intact without building an OddEven compound path; repeated compound
+        # rounded paths can corrupt Qt 6 native path storage on Python 3.11/12.
+        painter.save()
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        radius = max(0.0, AssetGridDelegate.CARD_RADIUS - 0.5)
+        painter.drawRoundedRect(
+            paper_rect.adjusted(0.5, 0.5, -0.5, -0.5),
+            radius,
+            radius,
         )
-        painter.fillPath(outline, border)
+        painter.restore()
 
     def _paint_sheet(
         self, painter, option, index, record, fill, border, preview_cache=None,
@@ -251,10 +256,8 @@ class AssetGridDelegate(QStyledItemDelegate):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(fill)
         painter.drawPath(self._card_shape_path(paper_rect))
-        # Paint the outline as a one-pixel inner ring instead of a stroked
-        # rectangle.  Qt rasterizes a 1 px stroke asymmetrically at fractional
-        # device coordinates, which made its right and bottom halves disappear
-        # once the paper layers were clipped for the folded corner.
+        # Keep the stroke inside the card so its right and bottom edges cannot
+        # be clipped by the item's half-open raster bounds.
         if paint_outline:
             self._paint_card_outline(painter, paper_rect, border)
         painter.setFont(option.font)
@@ -352,15 +355,6 @@ class AssetGridDelegate(QStyledItemDelegate):
         # path fill rule.
         retained_path = _polygon_path(retained)
         removed_path = _polygon_path(removed)
-        # The stationary/dragged flap must reflect the rounded source corner,
-        # not the coarse clipping triangle.  Only the retained full-card
-        # intersection triggers Qt's first-row OddEven bug; this small removed
-        # corner intersection is stable and keeps the flap radius synchronized
-        # with CARD_RADIUS.
-        rounded_flap_source = removed_path.intersected(card_shape)
-        if rounded_flap_source.isEmpty():
-            rounded_flap_source = removed_path
-
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if not single_sheet:
@@ -393,18 +387,33 @@ class AssetGridDelegate(QStyledItemDelegate):
             dx = midpoint.x() - (m11 * midpoint.x() + m21 * midpoint.y())
             dy = midpoint.y() - (m12 * midpoint.x() + m22 * midpoint.y())
             reflection = QTransform(m11, m12, 0, m21, m22, 0, dx, dy, 1)
-            reflected_path = reflection.map(rounded_flap_source)
+            # Avoid QPainterPath boolean operations and mapped rounded paths.
+            # Qt 6 can corrupt their native storage during repeated transition
+            # rendering on Python 3.11/3.12.  Reflect the painter instead: the
+            # original rounded card path and sheet pixmap then supply the exact
+            # source-corner radius without manufacturing a derived path.
+            reflected_path = _polygon_path(
+                QPolygonF([reflection.map(point) for point in removed])
+            )
             if state is None:
                 fold_face = QColor(front)
                 fold_face.setAlpha(min(190, fold_face.alpha() + 42))
                 painter.save()
                 painter.setClipPath(card_shape)
+                painter.setClipPath(reflected_path, Qt.ClipOperation.IntersectClip)
+                painter.setTransform(reflection, True)
                 painter.setPen(QPen(QColor(235, 242, 250, 54), 1.0))
                 painter.setBrush(fold_face)
-                # Reflect the already-rounded source corner, not its coarse
-                # triangular bounds, so the lifted flap carries exactly the
-                # same curve as the card corner it came from.
-                painter.drawPath(reflected_path)
+                painter.drawPath(card_shape)
+                painter.restore()
+                tangent = QPointF(-normal.y() / length, normal.x() / length)
+                painter.save()
+                painter.setClipPath(card_shape)
+                painter.setPen(QPen(QColor(235, 242, 250, 54), 1.0))
+                painter.drawLine(
+                    midpoint - tangent * 5000,
+                    midpoint + tangent * 5000,
+                )
                 painter.restore()
             else:
                 painter.save()
@@ -417,9 +426,18 @@ class AssetGridDelegate(QStyledItemDelegate):
                 gradient.setColorAt(0, QColor(255, 255, 255, 48))
                 gradient.setColorAt(0.45, QColor(255, 255, 255, 12))
                 gradient.setColorAt(1, QColor(0, 0, 0, 42))
+                painter.save()
+                painter.setClipPath(reflected_path)
+                painter.setTransform(reflection, True)
+                source_gradient = QLinearGradient(
+                    reflection.map(midpoint),
+                    reflection.map(cursor),
+                )
+                source_gradient.setStops(gradient.stops())
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(gradient)
-                painter.drawPath(reflected_path)
+                painter.setBrush(source_gradient)
+                painter.drawPath(card_shape)
+                painter.restore()
 
         # The two stationary paper layers are painted through complementary
         # clipping paths. Their shared outer boundary excludes the last device

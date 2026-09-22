@@ -16,6 +16,7 @@ from PySide6.QtCore import (
     QPoint,
     QPointF,
     QRect,
+    QRectF,
     QSize,
     QThread,
     Qt,
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
 
 import clipsave_app.widgets as widgets_module
 from clipsave_app.app import create_app_icon
+from clipsave_app.asset_grid import PaperPeelState
 from clipsave_app.styles import DARK_STYLESHEET
 from clipsave_app.widgets import (
     AssetGrid,
@@ -1790,6 +1792,71 @@ class ThumbnailPixmapTests(unittest.TestCase):
             self.assertEqual(render_preview.call_count, cache_render_count)
 
         grid.finish_sidebar_transition()
+        grid.close()
+
+    def test_favorite_transition_preview_keeps_dark_text_on_yellow_paper(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_preview_loading_enabled(False)
+        records = asset_records(1)
+        records[0]["favorite"] = 1
+        grid.set_items(records)
+        grid.show()
+        self.app.processEvents()
+
+        with patch.object(
+            grid.delegate,
+            "_paint_preview_content",
+            wraps=grid.delegate._paint_preview_content,
+        ) as paint_content:
+            self.assertTrue(
+                grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0)
+            )
+
+        self.assertTrue(paint_content.called)
+        self.assertTrue(
+            all(call.args[4] is False for call in paint_content.call_args_list)
+        )
+        grid.finish_sidebar_transition()
+        grid.close()
+
+    def test_favorite_page_removal_animates_remaining_cards_to_new_cells(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_preview_loading_enabled(False)
+        records = asset_records(8)
+        for record in records:
+            record["favorite"] = 1
+        grid.set_items(records)
+        grid.set_favorite_page_mode(True)
+        grid.show()
+        self.app.processEvents()
+
+        removed_row = 1
+        old_third_rect = QRectF(grid.visualRect(grid.model().index(2, 0)))
+        grid._paper_peel = PaperPeelState(
+            removed_row,
+            QPointF(),
+            QPointF(),
+            waiting_for_result=True,
+        )
+        remaining = [record for record in records if record["id"] != 2]
+        grid.set_items(remaining)
+
+        self.assertTrue(grid._sidebar_transition_active)
+        self.assertTrue(grid._favorite_reflow_animation.isActive())
+        overlay = grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+        moved_card = overlay._cards_by_row[1]
+        self.assertEqual(moved_card.expanded_rect, old_third_rect)
+        self.assertEqual(
+            moved_card.collapsed_rect.toRect(),
+            grid.visualRect(grid.model().index(1, 0)),
+        )
+        self.assertNotEqual(moved_card.expanded_rect, moved_card.collapsed_rect)
+
+        grid.finish_sidebar_transition()
+        self.assertFalse(grid._favorite_reflow_animation.isActive())
         grid.close()
 
     def test_grid_hiding_releases_transition_pixmap_caches(self):

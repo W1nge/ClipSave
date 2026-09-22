@@ -153,6 +153,22 @@ class AssetGridTransitionController:
         if not dirty.isEmpty():
             self.view.viewport().update(dirty)
 
+    def begin_reflow(self, cards: list[GridTransitionCard]) -> bool:
+        """Animate an already-updated model from captured cells to its new layout."""
+        self.clear(repaint=False)
+        if not cards or not self._can_begin():
+            return False
+        columns = max(1, int(self.view.columns))
+        self.overlay = AssetGridTransitionOverlay(
+            self.view,
+            cards,
+            columns,
+            columns,
+            0.0,
+        )
+        self.active = True
+        return True
+
     def clear(self, repaint: bool) -> None:
         if self.overlay is None and not self.active:
             return

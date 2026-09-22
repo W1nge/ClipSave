@@ -73,7 +73,7 @@ class AssetGridTransitionRenderer:
                 max(1, content_rect.height()),
             )
         content = str(record["content"] or "").strip() or str(record["title"])
-        dark = dark_theme_active()
+        dark = dark_theme_active() and not bool(record["favorite"])
         font = self.view.font()
         cache_key = (
             kind,
@@ -122,6 +122,7 @@ class AssetGridTransitionRenderer:
         return (
             int(record["id"]),
             str(record["kind"]),
+            bool(record["favorite"]),
             hash(str(record["title"])),
             hash(str(record["content"] or "")),
             str(record["path"] or ""),
@@ -142,7 +143,11 @@ class AssetGridTransitionRenderer:
         if preview.isEmpty():
             return None
         device_pixel_ratio = max(1.0, float(self.view.devicePixelRatioF()))
-        dark = dark_theme_active()
+        # Favorite cards use yellow paper with dark text.  Transition previews
+        # are cached independently from the live delegate, so carrying the
+        # application's dark theme through here briefly painted their body
+        # text white while the sidebar was moving.
+        dark = dark_theme_active() and not bool(record["favorite"])
         font = self.view.font()
         if layout_signature is None:
             layout_signature = self.layout_signature(index, cell_size)

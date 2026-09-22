@@ -1,5 +1,6 @@
 import datetime as dt
 import contextlib
+import gc
 import io
 import unittest
 from unittest.mock import MagicMock, patch
@@ -20,6 +21,14 @@ class PaperCardTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def tearDown(self):
+        # Release PySide painter/delegate wrappers while the owning widgets
+        # from this test are still in a known state.  Deferring them until a
+        # later suite-wide collection can double-release Qt native storage on
+        # Python 3.11/3.12 and falsely implicate an unrelated subsequent test.
+        gc.collect()
+        self.app.processEvents()
 
     def test_timestamp_uses_time_then_short_and_cross_year_dates(self):
         timezone = dt.timezone(dt.timedelta(hours=8))
@@ -182,7 +191,17 @@ class PaperCardTests(unittest.TestCase):
         view = QWidget()
         view.favorite_page_mode = True
         view.paper_peel_state = lambda _row: None
-        delegate = AssetGridDelegate(view)
+
+        class CountingDelegate(AssetGridDelegate):
+            def __init__(self, owner):
+                super().__init__(owner)
+                self.sheet_paint_count = 0
+
+            def _paint_sheet(self, *args, **kwargs):
+                self.sheet_paint_count += 1
+                return super()._paint_sheet(*args, **kwargs)
+
+        delegate = CountingDelegate(view)
         image = QImage(270, 211, QImage.Format.Format_ARGB32)
         image.fill(QColor("#202020"))
         option = QStyleOptionViewItem()
@@ -199,12 +218,11 @@ class PaperCardTests(unittest.TestCase):
         preview = QPixmap(1, 1)
         preview.fill(Qt.GlobalColor.transparent)
 
-        with patch.object(delegate, "_paint_sheet", wraps=delegate._paint_sheet) as paint_sheet:
-            painter = QPainter(image)
-            delegate.paint_transition_card(painter, option, index, preview)
-            painter.end()
+        painter = QPainter(image)
+        delegate.paint_transition_card(painter, option, index, preview)
+        painter.end()
 
-        self.assertEqual(paint_sheet.call_count, 1)
+        self.assertEqual(delegate.sheet_paint_count, 1)
         card = delegate.card_rect(option.rect)
         # The yellow flap remains visible, but only one sheet body is painted.
         self.assertNotEqual(

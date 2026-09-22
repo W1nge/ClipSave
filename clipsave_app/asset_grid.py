@@ -11,6 +11,7 @@ from PySide6.QtCore import (
     QPoint,
     QPointF,
     QRect,
+    QRectF,
     QSize,
     Qt,
     QTimer,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
 from .asset_grid_delegate import AssetGridDelegate
 from .asset_grid_transition import (
     AssetGridTransitionOverlay,
+    GridTransitionCard,
 )
 from .asset_grid_transition_controller import AssetGridTransitionController
 from .item_gestures import ItemRightClickGesture, ItemTripleClickGesture
@@ -152,6 +154,11 @@ class AssetGrid(QListView):
         self._paper_animation = QTimer(self)
         self._paper_animation.setInterval(16)
         self._paper_animation.timeout.connect(self._advance_paper_animation)
+        self._favorite_reflow_animation = QTimer(self)
+        self._favorite_reflow_animation.setInterval(16)
+        self._favorite_reflow_animation.timeout.connect(self._advance_favorite_reflow)
+        self._favorite_reflow_started = 0.0
+        self._favorite_reflow_duration = Sidebar.ANIMATION_DURATION_MS / 1000.0
         self._suppress_selection_signal = False
         self._wheel_remainder = WheelRemainder()
         self._right_click = ItemRightClickGesture(self)
@@ -184,6 +191,7 @@ class AssetGrid(QListView):
         self._apply_items_now(items, selected_id)
 
     def _apply_items_now(self, items, selected_id: int | None = None) -> None:
+        items = list(items)
         settle_item_id = None
         state = self._paper_peel
         if state is not None and state.waiting_for_result:
@@ -191,7 +199,22 @@ class AssetGrid(QListView):
             old_record = old_index.data(AssetItemModel.ItemRole) if old_index.isValid() else None
             if old_record is not None:
                 settle_item_id = int(old_record["id"])
+        incoming_ids = {int(record["id"]) for record in items}
+        animate_favorite_reflow = bool(
+            self._favorite_page_mode
+            and settle_item_id is not None
+            and settle_item_id not in incoming_ids
+            and self.isVisible()
+        )
+        old_rects_by_id: dict[int, QRectF] = {}
+        if animate_favorite_reflow:
+            for row in range(self._asset_model.rowCount()):
+                index = self._asset_model.index(row, 0)
+                record = index.data(AssetItemModel.ItemRole)
+                if record is not None:
+                    old_rects_by_id[int(record["id"])] = QRectF(self.visualRect(index))
         self.cancel_paper_peel()
+        self._favorite_reflow_animation.stop()
         self._clear_sidebar_transition(repaint=False)
         self._right_click.cancel()
         self._left_click.cancel()
@@ -200,11 +223,57 @@ class AssetGrid(QListView):
         self.selected_id = selected_id
         self._asset_model.set_items(items)
         self.items = self._asset_model.items
+        if animate_favorite_reflow:
+            self.doItemsLayout()
+            self._start_favorite_reflow(old_rects_by_id)
         self.rebuild_pending = not self.isVisible()
         self._restore_selection()
         if settle_item_id is not None:
             self._settle_new_paper_corner(settle_item_id)
         self.viewport().update()
+
+    def _start_favorite_reflow(self, old_rects_by_id: dict[int, QRectF]) -> None:
+        cards = []
+        viewport_rect = QRectF(self.viewport().rect()).adjusted(-32, -32, 32, 32)
+        moved = False
+        for row in range(self._asset_model.rowCount()):
+            index = self._asset_model.index(row, 0)
+            record = index.data(AssetItemModel.ItemRole)
+            if record is None:
+                continue
+            end = QRectF(self.visualRect(index))
+            start = old_rects_by_id.get(int(record["id"]), end)
+            if not start.intersects(viewport_rect) and not end.intersects(viewport_rect):
+                continue
+            changed = start != end
+            moved = moved or changed
+            cards.append(
+                GridTransitionCard(
+                    row=row,
+                    expanded_rect=start,
+                    collapsed_rect=end,
+                    elevated=changed,
+                )
+            )
+        if not moved or not self._transition_controller.begin_reflow(cards):
+            return
+        self._favorite_reflow_started = time.monotonic()
+        self._favorite_reflow_animation.start()
+        self.viewport().update()
+
+    def _advance_favorite_reflow(self) -> None:
+        if not self._sidebar_transition_active:
+            self._favorite_reflow_animation.stop()
+            return
+        elapsed = time.monotonic() - self._favorite_reflow_started
+        progress = min(1.0, elapsed / max(0.001, self._favorite_reflow_duration))
+        eased = 1.0 - (1.0 - progress) ** 3
+        self._transition_controller.set_progress(eased)
+        if progress < 1.0:
+            return
+        self._favorite_reflow_animation.stop()
+        self._clear_sidebar_transition(repaint=True)
+        self._apply_pending_items_update()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -264,6 +333,7 @@ class AssetGrid(QListView):
         collapsed_sidebar_width: int = Sidebar.COLLAPSED_WIDTH,
     ) -> bool:
         self.cancel_paper_peel()
+        self._favorite_reflow_animation.stop()
         return self._transition_controller.begin_sidebar(
             current_sidebar_width,
             progress,
@@ -278,6 +348,7 @@ class AssetGrid(QListView):
         progress: float = 0.0,
     ) -> bool:
         self.cancel_paper_peel()
+        self._favorite_reflow_animation.stop()
         return self._transition_controller.begin_viewport(
             start_viewport_width,
             end_viewport_width,
@@ -288,6 +359,7 @@ class AssetGrid(QListView):
         self._transition_controller.set_progress(progress)
 
     def finish_sidebar_transition(self) -> None:
+        self._favorite_reflow_animation.stop()
         self._clear_sidebar_transition(repaint=True)
         self._apply_pending_items_update()
 
@@ -310,6 +382,7 @@ class AssetGrid(QListView):
 
     def hideEvent(self, event) -> None:
         self.cancel_paper_peel()
+        self._favorite_reflow_animation.stop()
         self._middle_autoscroll.cancel()
         self._clear_sidebar_transition(repaint=False)
         self.delegate.clear_transition_caches()
@@ -333,6 +406,7 @@ class AssetGrid(QListView):
 
     def closeEvent(self, event) -> None:
         self.cancel_paper_peel()
+        self._favorite_reflow_animation.stop()
         self._middle_autoscroll.cancel()
         self._clear_sidebar_transition(repaint=False)
         self._apply_pending_items_update()
