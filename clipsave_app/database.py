@@ -73,6 +73,7 @@ class LibraryDatabase:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._mutation_generation = 0
+        self._usage_only_changes = 0
         self._recovery = DatabaseRecoveryManager(self)
         self._database_leaf_lock: SQLiteLeafLock | None = None
         self._sidecar_leaf_locks: list[SQLiteLeafLock] = []
@@ -444,7 +445,9 @@ class LibraryDatabase:
     def _transaction(self) -> Iterator[None]:
         with self._lock:
             self._assert_active_database_files()
-            changes_before = self.connection.total_changes
+            # Changes to the attached in-memory usage table do not affect the
+            # backed-up main database, so they must not mark backups dirty.
+            changes_before = self.connection.total_changes - self._usage_only_changes
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 # A same-user process can add a hard link between checks; making that
@@ -476,7 +479,7 @@ class LibraryDatabase:
                 except BaseException:
                     self.connection.rollback()
                     raise
-                if self.connection.total_changes != changes_before:
+                if self.connection.total_changes - self._usage_only_changes != changes_before:
                     self._mutation_generation += 1
 
     def create_schema(self) -> None:
@@ -639,10 +642,11 @@ class LibraryDatabase:
             ).fetchone()
             if row is None or not row["content_hash"]:
                 return False
-            self._record_item_usage(
-                item_id, row["created_at"], row["content_hash"], row["title"], moment
-            )
-            return True
+            self._remember_item_usage(item_id, moment)
+        self._write_usage_journal_line(
+            (row["created_at"], row["content_hash"], row["title"]), moment
+        )
+        return True
 
     def touch_text_by_hash(self, text: str, when: dt.datetime | None = None) -> int | None:
         moment = when or dt.datetime.now(dt.timezone.utc)
@@ -655,33 +659,30 @@ class LibraryDatabase:
             ).fetchone()
             if row is None:
                 return None
-            self._record_item_usage(
-                int(row["id"]), row["created_at"], digest, row["title"], moment
-            )
-            return int(row["id"])
+            self._remember_item_usage(int(row["id"]), moment)
+        self._write_usage_journal_line((row["created_at"], digest, row["title"]), moment)
+        return int(row["id"])
 
-    def _record_item_usage(
-        self,
-        item_id: int,
-        captured_at: str,
-        content_hash: str,
-        title: str,
-        moment: dt.datetime,
-    ) -> None:
-        used_at = self._utc_usage_timestamp(moment)
-        try:
-            append_usage(self._usage_dir, captured_at, content_hash, title, moment)
-        except OSError:
-            pass
-        self.connection.execute(
+    def _remember_item_usage(self, item_id: int, moment: dt.datetime) -> None:
+        cursor = self.connection.execute(
             """
             INSERT INTO usage.item_usage(item_id, last_used_at)
             VALUES(?, ?)
             ON CONFLICT(item_id) DO UPDATE
             SET last_used_at=MAX(excluded.last_used_at, item_usage.last_used_at)
             """,
-            (item_id, used_at),
+            (item_id, self._utc_usage_timestamp(moment)),
         )
+        self._usage_only_changes += max(0, int(cursor.rowcount))
+
+    def _write_usage_journal_line(
+        self, event: tuple[str, str, str], moment: dt.datetime
+    ) -> None:
+        captured_at, content_hash, title = event
+        try:
+            append_usage(self._usage_dir, captured_at, content_hash, title, moment)
+        except OSError:
+            pass
 
     def _load_usage_journal(self) -> None:
         entries = parse_usage(self._usage_dir)
@@ -890,9 +891,10 @@ class LibraryDatabase:
     def remove_item(self, item_id: int) -> None:
         with self._transaction():
             self.connection.execute("DELETE FROM items WHERE id=?", (item_id,))
-            self.connection.execute(
+            cursor = self.connection.execute(
                 "DELETE FROM usage.item_usage WHERE item_id=?", (item_id,)
             )
+            self._usage_only_changes += max(0, int(cursor.rowcount))
 
     def mark_item_missing(self, item_id: int) -> None:
         self._file_index.mark_item_missing(item_id)

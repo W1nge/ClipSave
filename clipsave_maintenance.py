@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -44,7 +45,11 @@ def main() -> int:
             parser.error(f"--downgrade-schema requires --confirm {DOWNGRADE_CONFIRMATION_PHRASE}")
         # Opened with raw sqlite3: constructing LibraryDatabase here would
         # immediately migrate the schema back up to the current version.
-        result = downgrade_schema_v6_to_v5(APP_PATHS.database_path, args.confirm)
+        try:
+            result = downgrade_schema_v6_to_v5(APP_PATHS.database_path, args.confirm)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 2
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("downgraded") or result.get("schema_version", 0) <= 5 else 2
 

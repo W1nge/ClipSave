@@ -284,6 +284,8 @@ def downgrade_schema_v6_to_v5(database_path: Path, confirmation: str) -> dict:
             f"Confirmation phrase does not match: {DOWNGRADE_CONFIRMATION_PHRASE}"
         )
     database_path = Path(database_path)
+    if not database_path.is_file():
+        raise FileNotFoundError(f"数据库文件不存在：{database_path}")
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
     try:
@@ -303,9 +305,9 @@ def downgrade_schema_v6_to_v5(database_path: Path, confirmation: str) -> dict:
         if check != "ok":
             raise RuntimeError(f"Source database failed quick_check: {check}")
 
-        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         backup_path = database_path.with_name(
-            f"{database_path.stem}.pre-downgrade-v5-{stamp}{database_path.suffix}"
+            f"{database_path.name}.pre-downgrade-v5-{stamp}.db"
         )
         destination = sqlite3.connect(backup_path)
         try:
