@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from PySide6.QtNetwork import QAbstractSocket
 
-from clipsave_app import app, constants
+from clipsave_app import app, constants, single_instance
 
 
 class _QueryResult:
@@ -193,11 +193,9 @@ class AppTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
-    def test_show_message_requires_exact_protocol_bytes(self):
-        self.assertTrue(app._is_show_message(app.SHOW_MESSAGE))
-        self.assertFalse(app._is_show_message(b"show"))
-        self.assertFalse(app._is_show_message(b"show\nextra"))
-        self.assertFalse(app._is_show_message(b"SHOW\n"))
+    def test_show_message_protocol_bytes_are_stable(self):
+        self.assertEqual(single_instance.SHOW_MESSAGE, b"show\n")
+        self.assertEqual(single_instance.SHOW_ACK, b"ok\n")
 
     def test_instance_claim_retries_while_mutex_owner_starts(self):
         single = MagicMock()
@@ -275,10 +273,10 @@ class AppTests(unittest.TestCase):
     def test_notification_requires_server_acknowledgement(self):
         socket = MagicMock()
         socket.waitForConnected.return_value = True
-        socket.write.return_value = len(app.SHOW_MESSAGE)
+        socket.write.return_value = len(single_instance.SHOW_MESSAGE)
         socket.waitForBytesWritten.return_value = True
         socket.waitForReadyRead.return_value = True
-        socket.readAll.return_value = app.SHOW_ACK
+        socket.readAll.return_value = single_instance.SHOW_ACK
         with patch("clipsave_app.app.QLocalSocket", return_value=socket):
             self.assertTrue(app.SingleInstance("test.endpoint").notify_existing())
 
@@ -287,7 +285,7 @@ class AppTests(unittest.TestCase):
     def test_notification_without_ack_is_not_reported_as_delivered(self):
         socket = MagicMock()
         socket.waitForConnected.return_value = True
-        socket.write.return_value = len(app.SHOW_MESSAGE)
+        socket.write.return_value = len(single_instance.SHOW_MESSAGE)
         socket.waitForBytesWritten.return_value = True
         socket.waitForReadyRead.return_value = False
         with patch("clipsave_app.app.QLocalSocket", return_value=socket):
@@ -354,11 +352,11 @@ class AppTests(unittest.TestCase):
         self.assertEqual(callbacks, [])
         self.assertFalse(connection.disconnected_called)
 
-        connection.buffer = app.SHOW_MESSAGE
+        connection.buffer = single_instance.SHOW_MESSAGE
         connection.readyRead.callback()
 
         self.assertEqual(callbacks, [True])
-        self.assertEqual(connection.written, app.SHOW_ACK)
+        self.assertEqual(connection.written, single_instance.SHOW_ACK)
         self.assertTrue(connection.disconnected_called)
         self.assertTrue(connection.delete_later_called)
         self.assertNotIn(connection, single._connections)

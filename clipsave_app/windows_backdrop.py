@@ -48,6 +48,7 @@ class WindowsCompositionBackdropBridge:
         self._owner_thread_id: int | None = None
         self._attached_hwnd: int | None = None
         self._last_error: int | None = None
+        self._load_failed = False
 
     @property
     def last_error(self) -> int | None:
@@ -72,8 +73,6 @@ class WindowsCompositionBackdropBridge:
         bridge.clipsave_acrylic_is_supported.restype = ctypes.c_int
         bridge.clipsave_acrylic_attach.argtypes = [ctypes.c_void_p, ctypes.c_int]
         bridge.clipsave_acrylic_attach.restype = ctypes.c_int
-        bridge.clipsave_acrylic_set_theme.argtypes = [ctypes.c_int]
-        bridge.clipsave_acrylic_set_theme.restype = ctypes.c_int
         bridge.clipsave_acrylic_detach.argtypes = []
         bridge.clipsave_acrylic_detach.restype = ctypes.c_int
         bridge.clipsave_acrylic_last_error.argtypes = []
@@ -82,6 +81,10 @@ class WindowsCompositionBackdropBridge:
     def _ensure_loaded(self) -> bool:
         if os.name != "nt":
             return False
+        if self._load_failed:
+            # A failed load stays failed for this process: retrying per show
+            # would leak DLL search-path cookies and repeat LoadLibrary work.
+            return False
         if self._bridge is not None:
             return self._same_thread()
 
@@ -89,6 +92,7 @@ class WindowsCompositionBackdropBridge:
         bridge_path = root / _BRIDGE_DLL
         if not bridge_path.is_file():
             self._last_error = self.ERROR_MOD_NOT_FOUND
+            self._load_failed = True
             return False
 
         try:
@@ -106,6 +110,7 @@ class WindowsCompositionBackdropBridge:
                 or getattr(exc, "errno", None)
                 or self.ERROR_MOD_NOT_FOUND
             )
+            self._load_failed = True
             return False
 
         self._bridge = bridge
@@ -145,20 +150,6 @@ class WindowsCompositionBackdropBridge:
         self._attached_hwnd = None
         self._last_error = self.last_error
         return False
-
-    def set_theme(self, dark: bool) -> bool:
-        if self._bridge is None or self._attached_hwnd is None:
-            return True
-        if not self._same_thread():
-            return False
-        try:
-            success = bool(self._bridge.clipsave_acrylic_set_theme(1 if dark else 0))
-        except (AttributeError, OSError, TypeError, ValueError) as exc:
-            self._last_error = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
-            return False
-        if not success:
-            self._last_error = self.last_error
-        return success
 
     def detach(self) -> bool:
         if self._bridge is None or self._attached_hwnd is None:

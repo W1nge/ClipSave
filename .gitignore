@@ -24,11 +24,6 @@ Picture/
 Markdown/
 clipsave.db*
 settings.json
-clipsave_history.json
-.env
-.env.*
-!.env.example
-!.env.sample
 *.secret
 *.secrets
 .secrets/
@@ -48,9 +43,6 @@ id_ed25519*
 pip.conf
 *.log
 
-# Local-only migration and test artifacts
-clipsave_legacy.py
-test_out.txt
 *.lnk
 
 # Editors / OS

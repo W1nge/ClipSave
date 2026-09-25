@@ -815,9 +815,17 @@ class MainWindowTests(unittest.TestCase):
         refresh.assert_called_once_with()
 
         self.window.window_effects_controller.material_refresh_pending = True
+        self.window.window_effects_controller._last_material_apply = time.monotonic()
         with patch.object(self.window, "_apply_native_backdrop") as backdrop:
             self.window._refresh_material_from_system()
         self.assertFalse(self.window.window_effects_controller.material_refresh_pending)
+        backdrop.assert_not_called()
+        self.assertTrue(self.window._material_rebuild_timer.isActive())
+
+        self.window._material_rebuild_timer.stop()
+        self.window.window_effects_controller._last_material_apply = 0.0
+        with patch.object(self.window, "_apply_native_backdrop") as backdrop:
+            self.window._refresh_material_from_system()
         backdrop.assert_called_once_with(force=True)
 
     def test_move_resize_and_detail_toggle_do_not_force_window_back_on_screen(self):
@@ -1465,11 +1473,6 @@ class MainWindowTests(unittest.TestCase):
             self.window.styleSheet(),
         )
         self.assertIn(
-            "QScrollBar#AutoHideScrollBar::add-page:vertical, "
-            "QScrollBar#AutoHideScrollBar::sub-page:vertical { background: #202020; }",
-            self.window.styleSheet(),
-        )
-        self.assertIn(
             "QFrame#CopyToast { background: rgba(40,40,40,230);",
             self.window.styleSheet(),
         )
@@ -1484,11 +1487,6 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.app.property("darkTheme"))
         self.assertNotIn(
             "QWidget#ContentSurface { background: #202020; }",
-            self.window.styleSheet(),
-        )
-        self.assertIn(
-            "QScrollBar#AutoHideScrollBar::add-page:vertical, "
-            "QScrollBar#AutoHideScrollBar::sub-page:vertical { background: #f6f6f6; }",
             self.window.styleSheet(),
         )
         self.assertIn(

@@ -200,11 +200,14 @@ class AssetGrid(QListView):
             if old_record is not None:
                 settle_item_id = int(old_record["id"])
         incoming_ids = {int(record["id"]) for record in items}
+        departing_item_ids = {
+            item_id for item_id in (settle_item_id, self.selected_id) if item_id is not None
+        }
         animate_favorite_reflow = bool(
             self._favorite_page_mode
-            and settle_item_id is not None
-            and settle_item_id not in incoming_ids
             and self.isVisible()
+            and departing_item_ids
+            and any(item_id not in incoming_ids for item_id in departing_item_ids)
         )
         old_rects_by_id: dict[int, QRectF] = {}
         if animate_favorite_reflow:
@@ -491,6 +494,9 @@ class AssetGrid(QListView):
         overlay = self._sidebar_transition_overlay
         if self._sidebar_transition_active and overlay is not None:
             overlay.paint(painter, self.viewport().rect())
+            self._paint_rows_outside_transition(
+                painter, set(overlay.paint_order_rows)
+            )
         elif self._asset_model.rowCount() == 0:
             painter.setPen(QColor("#a7adb7" if dark_theme_active() else "#7a8699"))
             painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, "没有找到符合条件的内容")
@@ -519,10 +525,50 @@ class AssetGrid(QListView):
             option.state &= ~QStyle.StateFlag.State_Selected
         self.delegate.paint_transition_card(painter, option, index)
 
+    def _paint_rows_outside_transition(
+        self, painter: QPainter, covered_rows: set[int]
+    ) -> None:
+        # The transition overlay only holds the captured row range; rows the
+        # user scrolls into view during the animation would otherwise paint
+        # as blank until the transition ends.
+        top_index = self.indexAt(self.viewport().rect().topLeft())
+        bottom_index = self.indexAt(self.viewport().rect().bottomLeft())
+        if not top_index.isValid() or not bottom_index.isValid():
+            return
+        for row in range(
+            max(0, top_index.row() - 1),
+            min(self._asset_model.rowCount(), bottom_index.row() + 2),
+        ):
+            if row in covered_rows:
+                continue
+            index = self.model().index(row, 0)
+            if not index.isValid():
+                continue
+            rect = self.visualRect(index)
+            if rect.isEmpty() or not self.viewport().rect().intersects(rect):
+                continue
+            option = QStyleOptionViewItem()
+            self.initViewItemOption(option)
+            option.rect = rect
+            option.widget = self
+            option.state |= QStyle.StateFlag.State_Active | QStyle.StateFlag.State_Enabled
+            if self.selectionModel().isSelected(index):
+                option.state |= QStyle.StateFlag.State_Selected
+            else:
+                option.state &= ~QStyle.StateFlag.State_Selected
+            self.delegate.paint_transition_card(painter, option, index)
+
     def clear_selection(self) -> None:
         self.selected_id = None
-        self.clearSelection()
-        self.setCurrentIndex(QModelIndex())
+        # Programmatic clears (filter changes, refreshes) must not emit
+        # selection_cleared and wipe the detail panel the user is reading;
+        # only real user-driven deselection does that.
+        self._suppress_selection_signal = True
+        try:
+            self.clearSelection()
+            self.setCurrentIndex(QModelIndex())
+        finally:
+            self._suppress_selection_signal = False
 
     def clear_selected_item(self) -> None:
         self.clear_selection()

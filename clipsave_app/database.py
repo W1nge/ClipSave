@@ -762,10 +762,6 @@ class LibraryDatabase:
             query_terms=query_terms,
         )
 
-    @staticmethod
-    def _item_order(sort: str) -> str:
-        return DatabaseQueryStore.item_order(sort)
-
     def count_items(self, *, kind: str | None = None) -> int:
         return self._queries.count_items(kind=kind)
 

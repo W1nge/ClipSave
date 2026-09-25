@@ -46,7 +46,7 @@ class MiddleAutoScrollController(QObject):
         self.anchor = QPoint()
         self.active = False
         self._scroll_remainder = 0.0
-        self.viewport.setMouseTracking(True)
+        self._original_mouse_tracking = self.viewport.hasMouseTracking()
         self.viewport.installEventFilter(self)
         view.installEventFilter(self)
         self.marker = _AutoScrollMarker(self.viewport)
@@ -62,12 +62,16 @@ class MiddleAutoScrollController(QObject):
         self._timer.stop()
         self.marker.hide()
         self.viewport.unsetCursor()
+        # Hover effects depend on move events; only request them while the
+        # auto-scroll marker is active and restore the view's own setting.
+        self.viewport.setMouseTracking(self._original_mouse_tracking)
 
     def _start(self, point: QPoint) -> None:
         self.cancel()
         self.active = True
         self.anchor = point
         self._scroll_remainder = 0.0
+        self.viewport.setMouseTracking(True)
         self.marker.move(point.x() - 16, point.y() - 16)
         self.marker.show()
         self.marker.raise_()

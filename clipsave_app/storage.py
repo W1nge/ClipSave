@@ -604,18 +604,6 @@ def _delete_source_if_identical(
         _close_handle(source_handle)
 
 
-def _copy_verify_delete_file(
-    source: Path, destination: Path, source_root: Path, destination_root: Path
-) -> bool:
-    return _run_copy_verify_delete_file(
-        source,
-        destination,
-        source_root,
-        destination_root,
-        _migration_ops(),
-    )
-
-
 def _copy_or_move_contents(source: Path, target: Path) -> int:
     return _run_copy_or_move_contents(source, target, _migration_ops())
 

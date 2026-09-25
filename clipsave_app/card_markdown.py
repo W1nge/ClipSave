@@ -84,15 +84,23 @@ def _inline(source: str, colors: dict[str, str]) -> str:
         text,
     )
     text = _LINK_RE.sub(
-        lambda m: keep(f'<a href="{m.group(2)}">{m.group(1)}</a>'), text
+        lambda m: keep(f'<a href="{m.group(2)}">{_emphasis_html(m.group(1))}</a>'), text
     )
 
     def autolink(match: re.Match) -> str:
         url = match.group(0)
         trail = ""
-        while url and url[-1] in ".,;:!?)]>":
-            trail = url[-1] + trail
-            url = url[:-1]
+        while url:
+            # Escaped angle brackets are trailing punctuation in disguise
+            # ("<https://x.com/a>" renders as https://x.com/a&gt; here).
+            if url.endswith(("&gt;", "&lt;")):
+                trail = url[-4:] + trail
+                url = url[:-4]
+            elif url[-1] in ".,;:!?)]>":
+                trail = url[-1] + trail
+                url = url[:-1]
+            else:
+                break
         if not url:
             return match.group(0)
         return keep(f'<a href="{url}">{url}</a>') + trail
@@ -106,6 +114,14 @@ def _inline(source: str, colors: dict[str, str]) -> str:
     return text
 
 
+def _emphasis_html(source: str) -> str:
+    text = html.escape(source)
+    text = _BOLD_RE.sub(r"<b>\1</b>", text)
+    text = _ITALIC_RE.sub(r"<i>\1</i>", text)
+    text = _STRIKE_RE.sub(r"<s>\1</s>", text)
+    return text
+
+
 def _render_item(text: str, colors: dict[str, str]) -> str:
     task = _TASK_RE.match(text)
     if task is None:
@@ -114,18 +130,23 @@ def _render_item(text: str, colors: dict[str, str]) -> str:
     return f"{box}&nbsp;" + _inline(task.group(2), colors)
 
 
-def _render_list_items(items: list[tuple[bool, int, str]], colors: dict[str, str]) -> str:
+def _render_list_items(
+    items: list[tuple[bool, int, str, int]], colors: dict[str, str]
+) -> str:
     if not items:
         return ""
     tag = "ol" if items[0][0] else "ul"
+    start_attribute = (
+        f' start="{items[0][3]}"' if items[0][0] and items[0][3] != 1 else ""
+    )
     base = items[0][1]
     parts: list[str] = []
     index = 0
     while index < len(items):
-        _, indent, text = items[index]
+        _, indent, text, _start = items[index]
         if indent <= base:
             index += 1
-            child: list[tuple[bool, int, str]] = []
+            child: list[tuple[bool, int, str, int]] = []
             while index < len(items) and items[index][1] > base:
                 child.append(items[index])
                 index += 1
@@ -136,7 +157,7 @@ def _render_list_items(items: list[tuple[bool, int, str]], colors: dict[str, str
         else:
             parts.append(f"<li>{_render_item(text, colors)}</li>")
             index += 1
-    return f"<{tag}>" + "".join(parts) + f"</{tag}>"
+    return f"<{tag}{start_attribute}>" + "".join(parts) + f"</{tag}>"
 
 
 def _render_html(content: str, colors: dict[str, str]) -> str:
@@ -156,8 +177,17 @@ def _render_html(content: str, colors: dict[str, str]) -> str:
             marker = fence.group(1)[:3]
             index += 1
             code: list[str] = []
-            while index < total and not lines[index].lstrip().startswith(marker):
-                code.append(lines[index])
+            while index < total:
+                candidate = lines[index]
+                without_indent = candidate.lstrip(" ")
+                # CommonMark allows a closing fence to be indented up to
+                # three spaces; anything deeper is fence content.
+                if (
+                    len(candidate) - len(without_indent) <= 3
+                    and without_indent.startswith(marker)
+                ):
+                    break
+                code.append(candidate)
                 index += 1
             index += 1
             blocks.append("<pre>" + html.escape("\n".join(code)) + "</pre>")
@@ -185,17 +215,19 @@ def _render_html(content: str, colors: dict[str, str]) -> str:
             continue
         listed = _LIST_RE.match(line)
         if listed:
-            items: list[tuple[bool, int, str]] = []
+            items: list[tuple[bool, int, str, int]] = []
             while index < total:
                 match = _LIST_RE.match(lines[index])
                 if match is None:
                     break
-                marker = match.group(0).lstrip()[:1]
+                marker = match.group(0).lstrip()
+                ordered_number_match = re.match(r"(\d{1,3})[.)]", marker)
                 items.append(
                     (
-                        marker.isdigit(),
+                        ordered_number_match is not None,
                         len(match.group(1).expandtabs(4)),
                         match.group(2),
+                        int(ordered_number_match.group(1)) if ordered_number_match else 1,
                     )
                 )
                 index += 1

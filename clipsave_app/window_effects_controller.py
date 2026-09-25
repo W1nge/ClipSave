@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
+
+from PySide6.QtCore import qWarning
 
 from .windows_frame import (
     SWP_HIDEWINDOW,
@@ -17,6 +20,8 @@ from .windows_frame import (
 
 class WindowEffectsController:
     """Own Win32 backdrop-helper and power-notification state for MainWindow."""
+
+    MATERIAL_REBUILD_MIN_INTERVAL_SECONDS = 3.0
 
     def __init__(
         self,
@@ -40,6 +45,21 @@ class WindowEffectsController:
         self.power_notification_hwnd: int | None = None
         self.power_notification_handle: int | None = None
         self.material_refresh_pending = False
+        self._last_material_apply = 0.0
+        self._sync_failure_warned = False
+
+    def material_rebuild_delay_ms(self) -> int:
+        """Milliseconds until another forced material rebuild is warranted.
+
+        System broadcasts arrive in bursts; coalescing them bounds the cost
+        of the full detach/re-attach while policy changes still apply within
+        a few seconds.
+        """
+        elapsed = time.monotonic() - self._last_material_apply
+        return max(0, int((self.MATERIAL_REBUILD_MIN_INTERVAL_SECONDS - elapsed) * 1000))
+
+    def _note_material_apply(self) -> None:
+        self._last_material_apply = time.monotonic()
 
     def ensure_backdrop_window(self) -> int | None:
         if not self.platform_check():
@@ -94,7 +114,7 @@ class WindowEffectsController:
         if not should_show:
             hide_backdrop_host_window(backdrop_hwnd)
             return
-        sync_backdrop_host_window(
+        if not sync_backdrop_host_window(
             backdrop_hwnd,
             int(self.window.winId()),
             int(x),
@@ -102,7 +122,8 @@ class WindowEffectsController:
             max(1, int(width)),
             max(1, int(height)),
             visible=True,
-        )
+        ):
+            self._warn_sync_failure("SetWindowPos on the backdrop helper window")
 
     def sync_window(self, *, visible: bool | None = None) -> None:
         if not self.platform_check() or not self._acrylic_active():
@@ -205,6 +226,15 @@ class WindowEffectsController:
             sync_z_order=False,
         )
 
+    def _warn_sync_failure(self, context: str) -> None:
+        if self._sync_failure_warned:
+            return
+        self._sync_failure_warned = True
+        qWarning(
+            "ClipSave backdrop helper sync failed "
+            f"({context}); geometry lock may be degraded until the next sync."
+        )
+
     def apply_native_backdrop(
         self,
         *,
@@ -223,6 +253,7 @@ class WindowEffectsController:
             composition_window=composition_window,
             allow_unowned_composition=False,
         )
+        self._note_material_apply()
         self.native_backdrop_result = result
         self.sync_surface_style(result=result, dark=dark)
         if result.success:

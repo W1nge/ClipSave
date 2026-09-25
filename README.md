@@ -83,6 +83,8 @@ Qt DLLs and plugins live under `_internal`. A failed build returns a non-zero ex
 | `Ctrl+B` | Expand or collapse the left navigation |
 | `Ctrl+I` | Expand or collapse the detail panel |
 | `Ctrl+Alt+V` | Wake ClipSave from anywhere |
+| `Ctrl+C` | Copy the focused item |
+| `Delete` | Delete the focused item |
 
 ## Tests
 

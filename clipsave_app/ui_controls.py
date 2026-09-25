@@ -148,7 +148,9 @@ class ThemedSelectableLabel(QLabel):
         copy_action.setObjectName("edit-copy")
         copy_action.setEnabled(self.hasSelectedText())
         copy_action.triggered.connect(
-            lambda: QApplication.clipboard().setText(self.selectedText())
+            lambda: QApplication.clipboard().setText(
+                self.selectedText().replace("\u2029", "\n")
+            )
         )
         select_all = menu.addAction(
             lucide_icon("list-checks", theme_icon_color(), 16),

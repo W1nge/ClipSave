@@ -77,6 +77,3 @@ class ItemTripleClickGesture:
         self._timer.stop()
 
 
-_ItemRightClickGesture = ItemRightClickGesture
-_ItemTripleClickGesture = ItemTripleClickGesture
-

@@ -61,7 +61,7 @@ class AssetItemModel(QAbstractTableModel):
     ThumbnailPathRole = ItemRole + 3
     GenerationRole = ItemRole + 4
 
-    HEADERS = ("内容", "标签", "捕获时间", "大小")
+    HEADERS = ("内容", "标签", "最近使用", "大小")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -166,10 +166,6 @@ class AssetItemModel(QAbstractTableModel):
     @property
     def generation(self) -> int:
         return self._generation
-
-    def has_thumbnail_path(self, path, generation: int) -> bool:
-        normalized = normalized_thumbnail_path(path)
-        return generation == self._generation and normalized in self._rows_by_thumbnail_path
 
     def notify_thumbnail_changed(self, path, generation: int) -> bool:
         normalized = normalized_thumbnail_path(path)

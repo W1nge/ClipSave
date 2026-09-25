@@ -25,9 +25,6 @@ QWidget#DetailPanel, QWidget#DetailPanelContent { background: #f6f6f6; border: 0
 QFrame#TopBar { background: rgba(255,255,255,70); border-bottom: 1px solid rgba(115,129,150,38); }
 QFrame#LibraryHeader { background: transparent; }
 QStackedWidget#ViewStack { background: transparent; }
-QFrame#Card { background: #ffffff; border: 1px solid rgba(105,121,145,40); border-radius: 7px; }
-QFrame#Card:hover { background: #ffffff; border-color: rgba(47,125,246,100); }
-QFrame#Card[selected="true"] { background: rgba(234,243,255,245); border: 2px solid #2f7df6; }
 QFrame#TagChip { background: rgba(236,240,246,210); border-radius: 6px; }
 QLabel#Muted { color: #6f7b8d; }
 QLabel#SectionTitle { font-size: 15px; font-weight: 600; color: #273247; }
@@ -109,12 +106,6 @@ QSplitter#ContentSplitter::handle:hover { background: #2f7df6; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: rgba(87,101,122,80); border-radius: 4px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar#AutoHideScrollBar:vertical { background: #f6f6f6; width: 14px; margin: 0; }
-QScrollBar#AutoHideScrollBar::groove:vertical { background: #f6f6f6; }
-QScrollBar#AutoHideScrollBar::add-page:vertical, QScrollBar#AutoHideScrollBar::sub-page:vertical { background: #f6f6f6; }
-QScrollBar#AutoHideScrollBar::handle:vertical { background: rgba(87,101,122,135); border-radius: 0; min-height: 32px; }
-QScrollBar#AutoHideScrollBar::handle:vertical:hover { background: rgba(71,84,103,180); }
-QScrollBar#AutoHideScrollBar::add-line:vertical, QScrollBar#AutoHideScrollBar::sub-line:vertical { height: 0; }
 """
 
 
@@ -164,9 +155,6 @@ QWidget#DetailPanel, QWidget#DetailPanelContent { background: #181818; border: 0
 QFrame#TopBar { background: rgba(0,0,0,128); border-bottom: 1px solid #3c3c3c; }
 QFrame#LibraryHeader { background: transparent; }
 QStackedWidget#ViewStack { background: transparent; }
-QFrame#Card { background: #292929; border: 1px solid #464646; border-radius: 7px; }
-QFrame#Card:hover { background: #303030; border-color: #477eb5; }
-QFrame#Card[selected="true"] { background: #26384d; border: 2px solid #4da3ff; }
 QFrame#TagChip { background: #353535; border-radius: 6px; }
 QLabel#Muted { color: #a7adb7; }
 QLabel#SectionTitle { font-size: 15px; font-weight: 600; color: #f2f2f2; }
@@ -242,10 +230,4 @@ QSplitter#ContentSplitter::handle:hover { background: #4da3ff; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #666666; border-radius: 4px; min-height: 28px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar#AutoHideScrollBar:vertical { background: #202020; width: 14px; margin: 0; }
-QScrollBar#AutoHideScrollBar::groove:vertical { background: #202020; }
-QScrollBar#AutoHideScrollBar::add-page:vertical, QScrollBar#AutoHideScrollBar::sub-page:vertical { background: #202020; }
-QScrollBar#AutoHideScrollBar::handle:vertical { background: #777777; border-radius: 0; min-height: 32px; }
-QScrollBar#AutoHideScrollBar::handle:vertical:hover { background: #969696; }
-QScrollBar#AutoHideScrollBar::add-line:vertical, QScrollBar#AutoHideScrollBar::sub-line:vertical { height: 0; }
 """

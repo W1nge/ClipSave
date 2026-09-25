@@ -79,6 +79,22 @@ class LibraryDatabaseTests(unittest.TestCase):
             [item.id for item in self.database.query_items()], [new_id, old_id]
         )
 
+    def test_touch_item_used_updates_recency_and_appends_journal(self):
+        old = dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc)
+        newer = dt.datetime(2026, 7, 20, tzinfo=dt.timezone.utc)
+        used = dt.datetime(2026, 7, 21, 12, 0, 0, 500000, tzinfo=dt.timezone.utc)
+        copied_id = self.database.add_text("copied item", old)
+        other_id = self.database.add_text("newer item", newer)
+
+        self.assertTrue(self.database.touch_item_used(copied_id, used))
+
+        self.assertEqual(
+            [item.id for item in self.database.query_items()], [copied_id, other_id]
+        )
+        journal = self.root / "Usage" / f"usage-{used.astimezone():%Y-%m}.md"
+        self.assertTrue(journal.is_file())
+        self.assertIn("copied item", journal.read_text(encoding="utf-8"))
+
     def test_image_metadata_import_and_search(self):
         path = self.root / "example.png"
         Image.new("RGB", (640, 480), "#2f7df6").save(path)
@@ -846,6 +862,25 @@ class LibraryDatabaseTests(unittest.TestCase):
         self.assertEqual(self.database.last_scan_report["scanned"], 2)
         self.assertEqual(self.database.last_scan_report["failed"], 1)
         self.assertEqual(len(self.database.last_scan_report["errors"]), 1)
+
+    def test_scan_skips_daily_text_exports(self):
+        pictures = self.root / "pictures"
+        markdown = self.root / "markdown"
+        pictures.mkdir()
+        markdown.mkdir()
+        export = markdown / "clipboard_2026-07-12.md"
+        export.write_text("# ClipSave 2026-07-12\n\nday text\n", encoding="utf-8")
+        note = markdown / "note.md"
+        note.write_text("note\n", encoding="utf-8")
+
+        with (
+            patch("clipsave_app.database.PICTURE_DIR", pictures),
+            patch("clipsave_app.database.MARKDOWN_DIR", markdown),
+            patch.object(self.database, "import_file", return_value=True),
+        ):
+            self.assertEqual(self.database.scan_legacy_files(), 1)
+        # Only note.md was scanned: the daily export never reaches the importer.
+        self.assertEqual(self.database.last_scan_report["scanned"], 1)
 
     def test_schema_version_and_busy_timeout_are_initialized(self):
         version = self.database.connection.execute("PRAGMA user_version").fetchone()[0]

@@ -71,6 +71,8 @@ python -m venv .venv
 | `Ctrl+B` | 展开或收起左侧栏 |
 | `Ctrl+I` | 展开或收起详情栏 |
 | `Ctrl+Alt+V` | 从任意位置唤醒 ClipSave |
+| `Ctrl+C` | 复制当前选中条目 |
+| `Delete` | 删除当前选中条目 |
 
 ## 测试
 

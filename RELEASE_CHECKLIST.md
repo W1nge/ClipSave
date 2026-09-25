@@ -4,7 +4,8 @@ Use this checklist before publishing a tagged Windows release.
 
 ## Automated checks
 
-The normal test and packaging workflow must pass:
+The normal test and packaging workflow must pass (CI runs the first two on
+every push; the whitespace check is a local pre-tag step):
 
 ```text
 python -m unittest discover -s tests -v

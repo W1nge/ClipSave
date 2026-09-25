@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import ssl
 import threading
 import time
 import urllib.error
@@ -190,7 +191,34 @@ class AIService:
             remaining_timeout = deadline - time.monotonic()
             if remaining_timeout <= 0:
                 raise TimeoutError("AI service request timed out")
-            with self._open_request(request, timeout=remaining_timeout) as response:
+            # The connect/TLS phase of urllib cannot be interrupted from this
+            # thread, so open on a bounded helper thread and poll cancellation:
+            # a cancel unblocks the caller immediately while the daemon thread
+            # finishes (or times out on) its discarded attempt.
+            open_result: dict[str, object] = {}
+
+            def _open_in_background() -> None:
+                try:
+                    open_result["response"] = self._open_request(
+                        request, timeout=remaining_timeout
+                    )
+                except BaseException as exc:  # re-raised on the caller thread
+                    open_result["error"] = exc
+
+            opener_thread = threading.Thread(
+                target=_open_in_background,
+                name="ClipSaveAIRequestConnect",
+                daemon=True,
+            )
+            opener_thread.start()
+            while opener_thread.is_alive():
+                if cancel_event is not None and cancel_event.is_set():
+                    raise OperationCancelled("Operation cancelled")
+                opener_thread.join(0.05)
+            if "error" in open_result:
+                raise open_result["error"]
+            response = open_result["response"]
+            with response:
                 def close_response() -> None:
                     close = getattr(response, "close", None)
                     if callable(close):
@@ -253,13 +281,27 @@ class AIService:
             raise _AIServiceRequestError(exc.code, detail) from exc
         except OperationCancelled:
             raise
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        except urllib.error.URLError as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise OperationCancelled("Operation cancelled") from exc
+            if isinstance(getattr(exc, "reason", None), ssl.SSLError):
+                raise RuntimeError(
+                    "AI 服务 TLS/证书校验失败，请检查系统时间、证书与代理设置。"
+                ) from exc
+            raise RuntimeError("AI 服务连接超时或不可用。") from exc
+        except ssl.SSLError as exc:
+            if cancel_event is not None and cancel_event.is_set():
+                raise OperationCancelled("Operation cancelled") from exc
+            raise RuntimeError(
+                "AI 服务 TLS/证书校验失败，请检查系统时间、证书与代理设置。"
+            ) from exc
+        except (TimeoutError, OSError, ValueError) as exc:
             if cancel_event is not None and cancel_event.is_set():
                 raise OperationCancelled("Operation cancelled") from exc
             raise RuntimeError("AI 服务连接超时或不可用。") from exc
         try:
             result = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise RuntimeError("AI 服务返回了无效的 JSON。") from exc
         if not isinstance(result, dict):
             raise RuntimeError("AI 服务响应结构无效。")

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
-import hmac
 import os
 import sqlite3
 import sys
@@ -12,7 +11,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QByteArray
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
-from PySide6.QtNetwork import QAbstractSocket as _QAbstractSocket, QLocalServer, QLocalSocket
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from .smoke_runtime import SmokeLifecycle
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -27,10 +26,7 @@ from .storage import ensure_storage_directories, migrate_legacy_layout
 from .startup import set_start_with_windows
 
 
-SHOW_MESSAGE = b"show\n"
-SHOW_ACK = b"ok\n"
 GLOBAL_HOTKEY_ID = 0x051A
-QAbstractSocket = _QAbstractSocket
 
 
 def _configure_windows_dpi_awareness() -> bool:
@@ -85,10 +81,6 @@ def _windows_user_sid() -> str:
 def _instance_server_name() -> str:
     user_hash = hashlib.sha256(_current_user_identity().encode("utf-8", errors="surrogatepass")).hexdigest()[:24]
     return f"{INSTANCE_SERVER}.{user_hash}"
-
-
-def _is_show_message(message: bytes) -> bool:
-    return hmac.compare_digest(message, SHOW_MESSAGE)
 
 
 def _claim_or_notify_instance(
@@ -272,6 +264,13 @@ def main() -> int:
     if ownership is False:
         return 0
     if ownership is None:
+        # The handshake timed out: the owner may be alive but unresponsive.
+        # Tell the user instead of exiting silently.
+        QMessageBox.information(
+            None,
+            "ClipSave",
+            "ClipSave 正在启动或暂时无响应，未能唤醒已运行的窗口。\n请稍后重试，或从任务管理器结束后重试。",
+        )
         return 1
     app.aboutToQuit.connect(single.close)
 
@@ -280,11 +279,13 @@ def main() -> int:
         migration_result = migrate_legacy_layout(APP_PATHS)
         ensure_storage_directories(APP_PATHS)
     except (OSError, RuntimeError) as exc:
+        single.close()
         QMessageBox.critical(None, "ClipSave 无法启动", str(exc))
         return 1
     try:
         runtime = ApplicationRuntime.create(APP_PATHS)
     except (OSError, RuntimeError, sqlite3.Error) as exc:
+        single.close()
         QMessageBox.critical(None, "ClipSave 无法启动", str(exc))
         return 1
     database = runtime.database

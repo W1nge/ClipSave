@@ -17,6 +17,15 @@ from PySide6.QtWidgets import (
 )
 
 from .item_models import TYPE_LABELS, format_local_timestamp, human_size, normalized_thumbnail_path
+
+
+def _item_file_present(path: str) -> bool:
+    # Statting a dead network path can block the GUI thread for seconds; UNC
+    # paths are treated as present and a missing file surfaces when the user
+    # actually opens it.
+    if path.startswith("\\\\"):
+        return True
+    return Path(path).exists()
 from .detail_tag_grid import DetailTagGrid
 from .detail_notes_state import DetailNotesState
 from .markdown_view import SafeMarkdownBrowser, set_markdown_content
@@ -373,7 +382,7 @@ class DetailPanel(QScrollArea):
         self.type_badge.setText(TYPE_LABELS.get(item["kind"], item["kind"]))
         self.title.setText(_wrap_detail_text(item["title"]))
         self.title.setToolTip(item["title"])
-        if item["kind"] == "image" and item["path"] and Path(item["path"]).exists():
+        if item["kind"] == "image" and item["path"] and _item_file_present(item["path"]):
             self.preview_stack.setCurrentWidget(self.image_preview)
             try:
                 content_hash = item["content_hash"]
@@ -416,7 +425,7 @@ class DetailPanel(QScrollArea):
         self.ocr_text.setText(
             _wrap_detail_text(item["ocr_text"]) if item["ocr_text"] else "尚未识别"
         )
-        is_image = item["kind"] == "image" and bool(item["path"]) and Path(item["path"]).exists()
+        is_image = item["kind"] == "image" and bool(item["path"]) and _item_file_present(item["path"])
         self.ai_button.setEnabled(is_image)
         self.ai_button.setText("重新生成" if item["ai_description"] else "生成描述")
         self.ocr_button.setEnabled(is_image)
@@ -511,7 +520,7 @@ class DetailPanel(QScrollArea):
             self.current_item
             and self.current_item["kind"] == "image"
             and self.current_item["path"]
-            and Path(self.current_item["path"]).exists()
+            and _item_file_present(self.current_item["path"])
         )
         self.ai_button.setEnabled(is_image and not busy)
         self.ai_button.setText("生成中…" if busy else "重试" if failed else "生成描述")
@@ -521,7 +530,7 @@ class DetailPanel(QScrollArea):
             self.current_item
             and self.current_item["kind"] == "image"
             and self.current_item["path"]
-            and Path(self.current_item["path"]).exists()
+            and _item_file_present(self.current_item["path"])
         )
         self.ocr_button.setEnabled(is_image and not busy)
         self.ocr_button.setText("识别中…" if busy else "重试" if failed else "识别文字")

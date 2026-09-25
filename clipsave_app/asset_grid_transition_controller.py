@@ -26,6 +26,10 @@ class AssetGridTransitionController:
         gap = 12
         layout_width = max(210, available - 1)
         card_width = max(210, (layout_width - columns * gap) // columns)
+        # At the narrowest widths a 210px card plus the gap would exceed the
+        # viewport (whose scrollbars are hidden); clamp the card so the cell
+        # always fits instead of clipping the card's right edge.
+        card_width = min(card_width, max(120, layout_width - gap))
         card_height = max(170, round(card_width / AssetGridDelegate.CARD_ASPECT))
         return columns, QSize(
             card_width + gap,

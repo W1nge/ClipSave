@@ -4,7 +4,7 @@ import datetime as dt
 import math
 from collections import OrderedDict
 
-from PySide6.QtCore import QModelIndex, QPointF, QRect, QRectF, QSize, Qt
+from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout, QColor, QFont, QLinearGradient, QPainter,
     QPainterPath, QPalette, QPen, QPixmap, QPolygonF, QTextDocument,
@@ -90,6 +90,10 @@ class AssetGridDelegate(QStyledItemDelegate):
 
     def clear_transition_caches(self) -> None:
         self._transition_renderer.clear()
+        self._markdown_documents.clear()
+
+    def clear_markdown_documents(self) -> None:
+        self._markdown_documents.clear()
 
     def sizeHint(self, option, index) -> QSize:
         return self.view.gridSize()
@@ -281,7 +285,12 @@ class AssetGridDelegate(QStyledItemDelegate):
                 painter.drawPixmap(self.transition_image_target(preview, preview_cache),
                                    preview_cache, QRectF(preview_cache.rect()))
             else:
-                painter.drawPixmap(preview.topLeft(), preview_cache)
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                painter.drawPixmap(
+                    QRectF(preview),
+                    preview_cache,
+                    QRectF(preview_cache.rect()),
+                )
             painter.restore()
         else:
             self._paint_preview_content(

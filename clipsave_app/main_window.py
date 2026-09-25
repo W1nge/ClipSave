@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 import threading
 import time
@@ -314,6 +315,7 @@ class MainWindow(QMainWindow):
         self.bulk_image_controller.finished.connect(self._bulk_image_finished)
         self._closing = False
         self._quit_in_progress = False
+        self._auto_task_retries: dict[tuple[int, str], int] = {}
         self.window_effects_controller = WindowEffectsController(
             self,
             platform_check=lambda: is_windows_qt_platform(),
@@ -473,6 +475,7 @@ class MainWindow(QMainWindow):
         self.expanded_search_button.setIcon(lucide_icon("sparkles"))
         self.detail.ai_button.setIcon(lucide_icon("sparkles"))
         self.detail.ocr_button.setIcon(lucide_icon("scan-text"))
+        self.grid.delegate.clear_markdown_documents()
         self.grid.viewport().update()
         self.table.viewport().update()
         QTimer.singleShot(
@@ -768,8 +771,26 @@ class MainWindow(QMainWindow):
         self.window_effects_controller.material_refresh_pending = False
         if self._closing or self._quit_in_progress:
             return
-        if self.settings.get("follow_system_theme", True):
+        if self.settings.get("follow_system_theme", True) and (
+            self._desired_dark_theme() != self.dark_theme
+        ):
             self.apply_theme(force=True)
+            return
+        # System broadcasts arrive in bursts; the full detach/re-attach is
+        # coalesced so unrelated Explorer broadcasts do not rebuild the
+        # composition graph. Policy changes still apply within a few seconds.
+        delay_ms = self.window_effects_controller.material_rebuild_delay_ms()
+        if delay_ms <= 0:
+            self._apply_native_backdrop(force=True)
+            return
+        if getattr(self, "_material_rebuild_timer", None) is None:
+            self._material_rebuild_timer = QTimer(self)
+            self._material_rebuild_timer.setSingleShot(True)
+            self._material_rebuild_timer.timeout.connect(self._material_rebuild_timeout)
+        self._material_rebuild_timer.start(delay_ms)
+
+    def _material_rebuild_timeout(self) -> None:
+        if self._closing or self._quit_in_progress:
             return
         self._apply_native_backdrop(force=True)
 
@@ -932,7 +953,9 @@ class MainWindow(QMainWindow):
                 focused.copy()
                 return
         if isinstance(focused, QLabel) and focused.hasSelectedText():
-            QApplication.clipboard().setText(focused.selectedText())
+            QApplication.clipboard().setText(
+                focused.selectedText().replace("\u2029", "\n")
+            )
             return
         if self.current_item_id:
             self.copy_item(self.current_item_id)
@@ -2105,12 +2128,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "批量处理已停止",
-                (
-                    f"服务请求失败，批量任务已停止。\n\n{error}\n\n"
-                    f"已完成 {int(details.get('completed', 0)):,} 张，"
-                    f"跳过 {int(details.get('skipped', 0)):,} 张，"
-                    f"本地文件失败 {int(details.get('failed', 0)):,} 张。\n\n"
-                    "修复服务问题后，可在设置中从断点继续。"
+                html.escape(
+                    (
+                        f"服务请求失败，批量任务已停止。\n\n{error}\n\n"
+                        f"已完成 {int(details.get('completed', 0)):,} 张，"
+                        f"跳过 {int(details.get('skipped', 0)):,} 张，"
+                        f"本地文件失败 {int(details.get('failed', 0)):,} 张。\n\n"
+                        "修复服务问题后，可在设置中从断点继续。"
+                    )
                 ),
             )
             return
@@ -2389,11 +2414,37 @@ class MainWindow(QMainWindow):
                 else:
                     self.detail.set_ocr_busy(False, failed=True)
             if automatic:
-                self.show_error_status(f"{automatic_capacity_prefix}：{exc}")
+                if isinstance(exc, TaskCapacityExceeded):
+                    self._schedule_auto_task_retry(item_id, operation)
+                else:
+                    self.show_error_status(f"{automatic_capacity_prefix}：{exc}")
             else:
                 QMessageBox.warning(self, capacity_title, str(exc))
             return False
+        self._auto_task_retries.pop((item_id, operation), None)
         return True
+
+    AUTO_TASK_RETRY_LIMIT = 3
+    AUTO_TASK_RETRY_DELAY_MS = 60_000
+
+    def _schedule_auto_task_retry(self, item_id: int, operation: str) -> None:
+        key = (item_id, operation)
+        attempts = self._auto_task_retries.get(key, 0) + 1
+        self._auto_task_retries[key] = attempts
+        if attempts > self.AUTO_TASK_RETRY_LIMIT:
+            self._auto_task_retries.pop(key, None)
+            self.show_error_status("自动任务多次排队失败，本次已放弃自动重试。")
+            return
+        QTimer.singleShot(
+            self.AUTO_TASK_RETRY_DELAY_MS,
+            lambda: self._retry_auto_image_task(item_id, operation),
+        )
+
+    def _retry_auto_image_task(self, item_id: int, operation: str) -> None:
+        if self._closing or self._quit_in_progress:
+            return
+        self._auto_task_retries.pop((item_id, operation), None)
+        self._schedule_auto_image_tasks(item_id)
 
     def _ocr_succeeded(
         self,
@@ -2611,7 +2662,9 @@ class MainWindow(QMainWindow):
             self.show_error_status(f"{prefix}：{message}")
         else:
             title = "AI 服务失败" if is_ai else "OCR 识别失败"
-            QMessageBox.warning(self, title, message)
+            # Provider error text is untrusted: escape it so Qt's rich-text
+            # auto-detection cannot turn a hostile response body into markup.
+            QMessageBox.warning(self, title, html.escape(message))
 
     def focus_search(self) -> None:
         self.bring_to_front()
@@ -2695,6 +2748,8 @@ class MainWindow(QMainWindow):
 
     def _restore_capture_tooltip(self, generation: int) -> None:
         if generation != getattr(self, "_status_generation", 0):
+            return
+        if self._closing or self._quit_in_progress:
             return
         self.capture_status.setToolTip(
             "本地自动捕获已开启" if self.clipboard_service.timer.isActive() else "本地自动捕获已暂停"
