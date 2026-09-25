@@ -22,6 +22,7 @@ from .storage import delete_managed_file, validate_managed_write_path
 class CaptureStoreResult:
     item_id: int | None = None
     warning: str = ""
+    created: bool = True
 
 
 def validate_clipboard_image(image: QImage) -> None:
@@ -138,6 +139,7 @@ class ClipboardCaptureStore:
                     owner is not None
                     and owner["resolved_path"] == self.database.path_key(path)
                 ):
+                    self.database.touch_item_used(int(owner["id"]), now)
                     return CaptureStoreResult(item_id=int(owner["id"]))
         except BaseException as exc:
             self._remove_new_image(
@@ -154,7 +156,8 @@ class ClipboardCaptureStore:
             expected_size=len(payload),
         )
         if owner is not None:
-            return CaptureStoreResult(item_id=int(owner["id"]))
+            self.database.touch_item_used(int(owner["id"]), now)
+            return CaptureStoreResult(item_id=int(owner["id"]), created=False)
         raise RuntimeError("图片文件已写入，但数据库未能保存该记录。")
 
     def save_text(self, text: str) -> CaptureStoreResult:
@@ -166,7 +169,8 @@ class ClipboardCaptureStore:
         now = dt.datetime.now().astimezone()
         item_id = self.database.add_text(text, now)
         if not item_id:
-            return CaptureStoreResult()
+            existing_id = self.database.touch_text_by_hash(text, now)
+            return CaptureStoreResult(item_id=existing_id, created=False)
         daily = self.markdown_dir / f"clipboard_{now:%Y-%m-%d}.md"
         warning = ""
         try:

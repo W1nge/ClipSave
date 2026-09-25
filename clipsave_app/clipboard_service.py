@@ -44,6 +44,7 @@ class ClipboardService(QObject):
     DRAG_QUERY_FILE_COUNT = NativeClipboardReader.DRAG_QUERY_FILE_COUNT
 
     captured = Signal(int)
+    reused = Signal(int)
     failed = Signal(str)
     state_changed = Signal(bool)
     _persistence_succeeded = Signal(object, object)
@@ -511,13 +512,13 @@ class ClipboardService(QObject):
     def save_image(self, image: QImage) -> bool:
         result = self._capture_store.save_image(image)
         if result.item_id is not None and not self._suppress_worker_signals:
-            self.captured.emit(result.item_id)
+            (self.captured if result.created else self.reused).emit(result.item_id)
         return True
 
     def save_text(self, text: str) -> bool:
         result = self._capture_store.save_text(text)
         if result.item_id is not None and not self._suppress_worker_signals:
-            self.captured.emit(result.item_id)
+            (self.captured if result.created else self.reused).emit(result.item_id)
         if result.warning and not self._suppress_worker_signals:
             self.failed.emit(result.warning)
         return True

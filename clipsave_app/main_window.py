@@ -431,6 +431,7 @@ class MainWindow(QMainWindow):
             runtime=runtime,
         )
         self.clipboard_service.captured.connect(self.on_captured)
+        self.clipboard_service.reused.connect(self.on_reused)
         self.clipboard_service.failed.connect(self.show_error_status)
         self.clipboard_service.state_changed.connect(self.update_monitor_button)
         if settings.get("monitoring", False):
@@ -715,8 +716,8 @@ class MainWindow(QMainWindow):
             visible=visible,
         )
 
-    def _sync_windows_backdrop_window(self) -> None:
-        self.window_effects_controller.sync_window()
+    def _sync_windows_backdrop_window(self, *, visible: bool | None = None) -> None:
+        self.window_effects_controller.sync_window(visible=visible)
 
     def _sync_windows_backdrop_geometry_now(self) -> None:
         self.window_effects_controller.sync_geometry_now()
@@ -1448,6 +1449,11 @@ class MainWindow(QMainWindow):
         self._refresh_library_async()
         self._schedule_auto_image_tasks(_item_id)
 
+    def on_reused(self, _item_id: int) -> None:
+        if self._closing or self._quit_in_progress:
+            return
+        self._refresh_library_async()
+
     def activate_item(self, item_id: int) -> None:
         item = self.database.get_item(item_id)
         if not item:
@@ -1514,6 +1520,8 @@ class MainWindow(QMainWindow):
             text = item["content"]
             self.clipboard_service.suppress_text(text)
             clipboard.setText(text)
+        self.database.touch_item_used(item_id)
+        self._refresh_library_async()
         self._show_copy_confirmation()
 
     def _copy_image_succeeded(self, token: object, signals: AsyncSignals, item_id: int, image: QImage) -> None:
@@ -1523,6 +1531,8 @@ class MainWindow(QMainWindow):
             return
         self.clipboard_service.suppress_image(image)
         QApplication.clipboard().setImage(image)
+        self.database.touch_item_used(item_id)
+        self._refresh_library_async()
         self._show_copy_confirmation()
 
     def _show_copy_confirmation(self) -> None:
@@ -2606,19 +2616,27 @@ class MainWindow(QMainWindow):
         self.search.selectAll()
 
     def bring_to_front(self) -> None:
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
         self.show()
-        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowActive)
+        if is_windows_qt_platform():
+            if self.window_effects_controller.native_backdrop_hwnd == int(self.winId()):
+                self._sync_windows_backdrop_window(visible=True)
+            else:
+                QTimer.singleShot(0, self._activate_windows_backdrop_after_show)
         self.raise_()
         self.activateWindow()
-        if is_windows_qt_platform():
-            QTimer.singleShot(0, self._sync_windows_backdrop_window)
 
     def showEvent(self, event) -> None:
         self._ensure_native_resize_frame()
         self._ensure_power_saving_notification()
         super().showEvent(event)
         if is_windows_qt_platform():
-            QTimer.singleShot(0, self._activate_windows_backdrop_after_show)
+            if self.window_effects_controller.native_backdrop_hwnd == int(self.winId()):
+                self._sync_windows_backdrop_window(visible=True)
+            else:
+                QTimer.singleShot(0, self._activate_windows_backdrop_after_show)
         self.grid.set_preview_loading_enabled(self.view_stack.currentWidget() is self.grid)
         if not self._initial_position_constrained:
             self._initial_position_constrained = True

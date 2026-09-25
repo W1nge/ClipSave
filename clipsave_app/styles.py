@@ -47,7 +47,7 @@ QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     padding: 7px 34px 7px 10px;
     selection-background-color: #2f7df6;
 }
-QLineEdit#SearchField { background: rgba(255,255,255,166); }
+QLineEdit#SearchField { background: rgba(255,255,255,88); border: 1px solid rgba(115,129,150,66); }
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
@@ -57,6 +57,7 @@ QComboBox::drop-down {
 }
 QComboBox::down-arrow { image: none; }
 QLineEdit:focus, QTextEdit:focus, QComboBox:focus { border: 1px solid #2f7df6; }
+QLineEdit#SearchField:focus { border: 1px solid #2f7df6; }
 QPushButton {
     background: transparent;
     border: 1px solid transparent;
@@ -187,7 +188,7 @@ QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     color: #f2f2f2;
     selection-background-color: #2f7df6;
 }
-QLineEdit#SearchField { background: rgba(0,0,0,166); }
+QLineEdit#SearchField { background: rgba(0,0,0,65); border: 1px solid rgba(220,228,238,72); }
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
@@ -197,6 +198,7 @@ QComboBox::drop-down {
 }
 QComboBox::down-arrow { image: none; }
 QLineEdit:focus, QTextEdit:focus, QComboBox:focus { border: 1px solid #4da3ff; }
+QLineEdit#SearchField:focus { border: 1px solid #4da3ff; }
 QComboBox QAbstractItemView { background: #292929; color: #f2f2f2; selection-background-color: #365a80; }
 QPushButton { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 7px 10px; }
 QPushButton:hover { background: rgba(255,255,255,18); }

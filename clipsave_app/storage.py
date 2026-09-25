@@ -41,7 +41,7 @@ from .constants import (
     MAINTENANCE_DIR,
     MARKDOWN_DIR,
     PICTURE_DIR,
-    THUMB_DIR,
+    USAGE_DIR,
 )
 
 
@@ -683,7 +683,7 @@ def validate_storage_layout(paths: AppPaths | None = None) -> None:
             LIBRARY_DIR,
             PICTURE_DIR,
             MARKDOWN_DIR,
-            THUMB_DIR,
+            USAGE_DIR,
             MAINTENANCE_DIR,
         )
     else:
@@ -694,7 +694,7 @@ def validate_storage_layout(paths: AppPaths | None = None) -> None:
             paths.library_dir,
             paths.picture_dir,
             paths.markdown_dir,
-            paths.thumb_dir,
+            paths.usage_dir,
             paths.maintenance_dir,
         )
     if _is_remote_or_unc_path(local_root):
@@ -719,14 +719,14 @@ def validate_storage_layout(paths: AppPaths | None = None) -> None:
 def ensure_storage_directories(paths: AppPaths | None = None) -> None:
     validate_storage_layout(paths)
     directories = (
-        (DATA_DIR, LIBRARY_DIR, PICTURE_DIR, MARKDOWN_DIR, THUMB_DIR, MAINTENANCE_DIR)
+        (DATA_DIR, LIBRARY_DIR, PICTURE_DIR, MARKDOWN_DIR, USAGE_DIR, MAINTENANCE_DIR)
         if paths is None
         else (
             paths.data_dir,
             paths.library_dir,
             paths.picture_dir,
             paths.markdown_dir,
-            paths.thumb_dir,
+            paths.usage_dir,
             paths.maintenance_dir,
         )
     )

@@ -139,7 +139,7 @@ class AssetItemModel(QAbstractTableModel):
         if index.column() == 1:
             return (record["tag_names"] or "").replace("\x1f", ", ")
         if index.column() == 2:
-            return format_list_timestamp(record["created_at"])
+            return format_list_timestamp(record["last_used_at"])
         if index.column() == 3:
             return human_size(record["file_size"])
         return None

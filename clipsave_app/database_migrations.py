@@ -130,3 +130,8 @@ def migrate_v4_to_v5(
                 (*values, row[0]),
             )
 
+
+def downgrade_v6_to_v5(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP INDEX IF EXISTS idx_items_last_used")
+    connection.execute("ALTER TABLE items DROP COLUMN last_used_at")
+    connection.execute("PRAGMA user_version = 5")

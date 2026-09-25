@@ -104,7 +104,7 @@ class WindowEffectsController:
             visible=True,
         )
 
-    def sync_window(self) -> None:
+    def sync_window(self, *, visible: bool | None = None) -> None:
         if not self.platform_check() or not self._acrylic_active():
             return
         hwnd = int(self.window.winId())
@@ -117,6 +117,7 @@ class WindowEffectsController:
             top,
             max(1, right - left),
             max(1, bottom - top),
+            visible=visible,
         )
 
     def sync_geometry_now(self) -> None:

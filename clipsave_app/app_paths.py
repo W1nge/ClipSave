@@ -15,7 +15,7 @@ class AppPaths:
     legacy_data_dir: Path
     legacy_picture_dir: Path
     legacy_markdown_dir: Path
-    thumb_dir: Path
+    usage_dir: Path
     database_path: Path
     settings_path: Path
     maintenance_dir: Path
@@ -36,7 +36,7 @@ class AppPaths:
             legacy_data_dir=base_dir / "data",
             legacy_picture_dir=base_dir / "Picture",
             legacy_markdown_dir=base_dir / "Markdown",
-            thumb_dir=data_dir / "thumbnails",
+            usage_dir=data_dir / "Usage",
             database_path=data_dir / "clipsave.db",
             settings_path=data_dir / "settings.json",
             maintenance_dir=data_dir / "maintenance",

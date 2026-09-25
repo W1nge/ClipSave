@@ -395,7 +395,13 @@ class DetailPanel(QScrollArea):
             self.preview_stack.setCurrentWidget(self.text_preview)
         dimensions = f"{item['width']} × {item['height']}\n" if item["width"] else ""
         path_text = f"\n路径  {_wrap_detail_text(item['path'])}" if item["path"] else ""
-        self.meta.setText(f"类型  {TYPE_LABELS.get(item['kind'], item['kind'])}\n{dimensions}大小  {human_size(item['file_size'])}\n时间  {format_local_timestamp(item['created_at'])}\n来源  {item['source']}{path_text}")
+        first_seen = format_local_timestamp(item["created_at"])
+        last_used = format_local_timestamp(item["last_used_at"])
+        time_text = (
+            f"时间  {first_seen}" if first_seen == last_used
+            else f"首次保存  {first_seen}\n最近使用  {last_used}"
+        )
+        self.meta.setText(f"类型  {TYPE_LABELS.get(item['kind'], item['kind'])}\n{dimensions}大小  {human_size(item['file_size'])}\n{time_text}\n来源  {item['source']}{path_text}")
         self.meta.setToolTip(item["path"] or "")
         self.collection_combo.blockSignals(True)
         index = self.collection_combo.findData(item["collection_id"])
@@ -569,4 +575,3 @@ class DetailPanel(QScrollArea):
     @property
     def loaded_notes(self) -> str:
         return self._notes_state.loaded_notes
-

@@ -17,6 +17,7 @@ from .asset_text_layout import (
     plain_text_layout, plain_text_layout_signature, plain_text_layout_source,
     plain_text_wrap_mode,
 )
+from .card_markdown import build_card_markdown_document
 from .item_models import AssetItemModel
 from .ui_primitives import dark_theme_active
 
@@ -129,10 +130,7 @@ class AssetGridDelegate(QStyledItemDelegate):
         if cached is not None:
             self._markdown_documents[key] = cached
             return cached
-        document = QTextDocument()
-        document.setDocumentMargin(0)
-        document.setDefaultFont(font)
-        document.setMarkdown(preview_content)
+        document = build_card_markdown_document(preview_content, dark, font)
         document.setTextWidth(max(1, width))
         self._markdown_documents[key] = document
         while len(self._markdown_documents) > 64:
@@ -216,7 +214,7 @@ class AssetGridDelegate(QStyledItemDelegate):
 
     @staticmethod
     def _paper_colors(favorite: bool, dark: bool):
-        navy = QColor("#181818") if dark else QColor("#ffffff")
+        navy = QColor("#292929") if dark else QColor("#ffffff")
         yellow = QColor(247, 195, 63, 210) if dark else QColor(248, 196, 63, 210)
         border = QColor(232, 236, 242, 62) if dark else QColor(55, 63, 74, 46)
         return (yellow, navy, border) if favorite else (navy, yellow, border)
@@ -264,7 +262,7 @@ class AssetGridDelegate(QStyledItemDelegate):
         painter.setPen(QColor("#34404e" if yellow_paper else "#d9e1eb" if dark else "#45576a"))
         painter.drawText(self.time_rect(option.rect),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         format_card_timestamp(record["created_at"]))
+                         format_card_timestamp(record["last_used_at"]))
         divider_y = card.top() + 41
         divider = (
             QColor(53, 62, 73, 48)

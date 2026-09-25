@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.4 - 2026-09-25
+
+- Re-capturing existing text or images now reuses the stored item and moves it to the top of the newest ordering instead of being silently ignored. Usage is recorded as plain-text lines in a human-readable journal under `Data\Usage`, so the database schema stays at v5 and remains openable by every earlier release.
+- Copying items from within ClipSave also updates their last-used time, and cards, list rows and the detail panel show recency alongside the original capture date.
+- Daily text exports (`clipboard_YYYY-MM-DD.md`) are no longer re-imported as full-day markdown items during startup scans.
+- Removed the never-used `Data\thumbnails` directory and the runtime-dead embedding code paths left over from the removed vector search; the columns themselves are kept for older-version compatibility.
+- Added a "where your data lives" map to the README describing every stored file, what is authoritative and what happens when it is deleted.
+- Rebuilt card Markdown previews with a dedicated escaped-HTML renderer featuring compact heading hierarchy, shaded code, muted quotes, task checkboxes and colored links, with no resource loading.
+- Darkened dark-mode card paper to rgb(41,41,41) against the rgb(32,32,32) home surface and restored translucent acrylic search-field styling with focus borders.
+- Removed the one-frame acrylic flash when reopening the window from the tray by synchronizing the backdrop window during show instead of deferring it a loop iteration.
+- Added `clipsave_maintenance.py --downgrade-schema` so users can explicitly move the database back to schema v5 (with a validated automatic backup) and keep using earlier releases, keeping data ownership with the user.
+
 ## 1.1.3 - 2026-09-22
 
 - Rebuilt grid cards as layered paper with a draggable, click-to-tear favorite corner, non-blocking persistence, contextual time/date labels and simplified content presentation.

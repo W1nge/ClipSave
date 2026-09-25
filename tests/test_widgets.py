@@ -76,6 +76,7 @@ def asset_records(count: int, *, kind: str = "text", path: str | None = None) ->
             "content": "preview text",
             "favorite": index % 2,
             "created_at": "2026-07-12T10:00:00",
+            "last_used_at": "2026-07-12T10:00:00",
             "width": 64 if kind == "image" else 0,
             "height": 40 if kind == "image" else 0,
             "file_size": 128,
@@ -224,7 +225,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
             )
 
             plain = document.toPlainText()
-            self.assertIn("ClipSave", plain)
+            self.assertNotIn("ClipSave", plain)
             self.assertIn("00:01:43", plain)
             self.assertNotIn("#", plain)
             self.assertNotIn("**", plain)
@@ -414,7 +415,8 @@ class ThumbnailPixmapTests(unittest.TestCase):
         row = connection.execute(
             """SELECT 1 AS id, 'image' AS kind, 'row image' AS title,
                       'missing.png' AS path, '' AS content, 0 AS favorite,
-                      '2026-07-12T10:00:00' AS created_at, 64 AS width,
+                      '2026-07-12T10:00:00' AS created_at,
+                      '2026-07-12T10:00:00' AS last_used_at, 64 AS width,
                       40 AS height, 128 AS file_size, '' AS tag_names,
                       'hash' AS content_hash"""
         ).fetchone()
@@ -439,7 +441,8 @@ class ThumbnailPixmapTests(unittest.TestCase):
         row = connection.execute(
             """SELECT 1 AS id, 'image' AS kind, 'row image' AS title,
                       'missing.png' AS path, '' AS content, 0 AS favorite,
-                      '2026-07-12T10:00:00' AS created_at, 64 AS width,
+                      '2026-07-12T10:00:00' AS created_at,
+                      '2026-07-12T10:00:00' AS last_used_at, 64 AS width,
                       40 AS height, 128 AS file_size, '' AS tag_names"""
         ).fetchone()
         previous_interval = QApplication.doubleClickInterval()
@@ -672,6 +675,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
             "kind": "text",
             "tag_names": "",
             "created_at": "2026-07-12T10:00:00",
+            "last_used_at": "2026-07-12T10:00:00",
             "file_size": 3,
         }
         with patch.object(table, "resizeRowsToContents") as resize_rows:
@@ -1049,6 +1053,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
             "height": 40,
             "file_size": image_path.stat().st_size,
             "created_at": "2026-07-12T10:00:00",
+            "last_used_at": "2026-07-12T10:00:00",
             "source": "test",
             "collection_id": None,
             "tag_names": ("tag_" + "x" * 120) + "\x1f" + ("tag_" + "y" * 120),
@@ -1129,6 +1134,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
             "height": 0,
             "file_size": 4,
             "created_at": "2026-07-13T01:58:02",
+            "last_used_at": "2026-07-13T01:58:02",
             "source": "clipboard",
             "collection_id": None,
             "tag_names": "one\x1ftwo\x1fthree\x1ffour\x1ffive\x1fsix",
@@ -1184,6 +1190,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
             "height": 100,
             "file_size": 1024,
             "created_at": "2026-07-13T01:58:02",
+            "last_used_at": "2026-07-13T01:58:02",
             "source": "clipboard",
             "collection_id": None,
             "tag_names": "",

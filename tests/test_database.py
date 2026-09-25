@@ -39,6 +39,46 @@ class LibraryDatabaseTests(unittest.TestCase):
         self.assertEqual(len(self.database.query_items(day="2026-07-11")), 1)
         self.assertEqual(len(self.database.query_items(day="2026-07-10")), 0)
 
+    def test_recent_use_moves_existing_item_without_changing_capture_date(self):
+        old = dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc)
+        newer = dt.datetime(2026, 7, 20, tzinfo=dt.timezone.utc)
+        used = dt.datetime(2026, 7, 21, tzinfo=dt.timezone.utc)
+        old_id = self.database.add_text("old text", old)
+        new_id = self.database.add_text("new text", newer)
+        self.assertEqual([item.id for item in self.database.query_items()], [new_id, old_id])
+
+        self.assertEqual(self.database.touch_text_by_hash("old text", used), old_id)
+        self.assertEqual([item.id for item in self.database.query_items()], [old_id, new_id])
+        item = self.database.get_item(old_id)
+        self.assertEqual(item.created_at, self.database._utc_timestamp(old))
+        self.assertEqual(item.last_used_at, self.database._utc_usage_timestamp(used))
+        self.assertEqual(len(self.database.query_items(day="2026-07-01")), 1)
+
+    def test_usage_journal_survives_reopen_and_skips_malformed_lines(self):
+        old = dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc)
+        newer = dt.datetime(2026, 7, 20, tzinfo=dt.timezone.utc)
+        used = dt.datetime(2026, 7, 21, tzinfo=dt.timezone.utc)
+        old_id = self.database.add_text("journalled text", old)
+        new_id = self.database.add_text("newer text", newer)
+        self.database.touch_text_by_hash("journalled text", used)
+        self.database.close()
+
+        journal = self.root / "Usage" / f"usage-{used.astimezone():%Y-%m}.md"
+        self.assertTrue(journal.is_file())
+        with journal.open("a", encoding="utf-8") as handle:
+            handle.write("this line is garbage\n")
+
+        self.database = LibraryDatabase(self.root / "test.db")
+        self.assertEqual(
+            [item.id for item in self.database.query_items()], [old_id, new_id]
+        )
+        item = self.database.get_item(old_id)
+        self.assertEqual(item.last_used_at, self.database._utc_usage_timestamp(used))
+        self.database.touch_item_used(new_id, used)
+        self.assertEqual(
+            [item.id for item in self.database.query_items()], [new_id, old_id]
+        )
+
     def test_image_metadata_import_and_search(self):
         path = self.root / "example.png"
         Image.new("RGB", (640, 480), "#2f7df6").save(path)
@@ -73,7 +113,7 @@ class LibraryDatabaseTests(unittest.TestCase):
 
         self.assertFalse(
             self.database.update_ai_if_current(
-                item_id, "0" * 64, "stale description", [1.0]
+                item_id, "0" * 64, "stale description"
             )
         )
         self.assertFalse(
@@ -84,7 +124,7 @@ class LibraryDatabaseTests(unittest.TestCase):
 
         self.assertTrue(
             self.database.update_ai_if_current(
-                item_id, item["content_hash"], "current description", [1.0]
+                item_id, item["content_hash"], "current description"
             )
         )
         self.assertTrue(
@@ -114,69 +154,6 @@ class LibraryDatabaseTests(unittest.TestCase):
         row = self.database.get_item(item_id)
         self.assertEqual(row["content_hash"], digest)
         self.assertEqual((row["width"], row["height"]), (11, 7))
-
-    def test_embedding_batches_use_bounded_keyset_pagination(self):
-        ids = []
-        for index in range(5):
-            item_id = self.database.add_text(f"embedded {index}")
-            self.database.update_ai(item_id, "description", [float(index)])
-            ids.append(item_id)
-
-        first = self.database.embedded_items_batch(0, 2)
-        second = self.database.embedded_items_batch(first[-1]["id"], 2)
-        third = self.database.embedded_items_batch(second[-1]["id"], 2)
-
-        self.assertEqual(self.database.embedded_item_count(), 5)
-        self.assertEqual(
-            [row["id"] for row in first + second + third],
-            ids,
-        )
-
-    def test_embedding_profile_filters_old_provider_and_dimension(self):
-        compatible_id = self.database.add_text("compatible embedding")
-        other_model_id = self.database.add_text("other model embedding")
-        other_dimension_id = self.database.add_text("other dimension embedding")
-        self.database.update_ai(
-            compatible_id,
-            "description",
-            [0.1, 0.2],
-            embedding_provider="openai-compatible:one",
-            embedding_model="embed-a",
-            embedding_revision=1,
-        )
-        self.database.update_ai(
-            other_model_id,
-            "description",
-            [0.1, 0.2],
-            embedding_provider="openai-compatible:one",
-            embedding_model="embed-b",
-            embedding_revision=1,
-        )
-        self.database.update_ai(
-            other_dimension_id,
-            "description",
-            [0.1, 0.2, 0.3],
-            embedding_provider="openai-compatible:one",
-            embedding_model="embed-a",
-            embedding_revision=1,
-        )
-
-        kwargs = {
-            "embedding_provider": "openai-compatible:one",
-            "embedding_model": "embed-a",
-            "embedding_dimensions": 2,
-            "embedding_revision": 1,
-        }
-        self.assertEqual(self.database.embedded_item_count(**kwargs), 1)
-        self.assertEqual(
-            [row["id"] for row in self.database.embedded_items_batch(0, 10, **kwargs)],
-            [compatible_id],
-        )
-        stored = self.database.get_item(compatible_id)
-        self.assertEqual(stored["embedding_provider"], "openai-compatible:one")
-        self.assertEqual(stored["embedding_model"], "embed-a")
-        self.assertEqual(stored["embedding_dimensions"], 2)
-        self.assertEqual(stored["embedding_revision"], 1)
 
     def test_new_timestamps_are_utc_and_days_use_local_calendar(self):
         aware = dt.datetime(2026, 7, 12, 23, 30, tzinfo=dt.timezone.utc)
@@ -1872,7 +1849,7 @@ class LibraryDatabaseTests(unittest.TestCase):
             self.database.set_favorite(item_id, True)
             self.database.set_notes(item_id, "Retained notes")
             self.database.update_ocr(item_id, "Retained OCR")
-            self.database.update_ai(item_id, "Retained AI", [0.25, 0.75])
+            self.database.update_ai(item_id, "Retained AI")
             before = self.database.get_item(item_id)
 
             result = self.database.import_file(source, "markdown", copy_to_library=True)
@@ -1888,7 +1865,6 @@ class LibraryDatabaseTests(unittest.TestCase):
         self.assertEqual(after["notes"], "Retained notes")
         self.assertEqual(after["ocr_text"], "Retained OCR")
         self.assertEqual(after["ai_description"], "Retained AI")
-        self.assertEqual(after["embedding"], "[0.25, 0.75]")
         self.assertEqual(after["external"], 0)
         self.assertTrue(Path(after["path"]).is_relative_to(managed.resolve()))
         self.assertTrue(Path(after["path"]).exists())
@@ -2202,7 +2178,7 @@ class LibraryDatabaseTests(unittest.TestCase):
             item_id = self.database.add_text(f"row {index}\n" + (str(index) * 5_000))
             self.database.set_notes(item_id, f"notes {index}" * 500)
             self.database.update_ocr(item_id, f"ocr {index}" * 500)
-            self.database.update_ai(item_id, f"ai {index}" * 500, [float(index)] * 1_000)
+            self.database.update_ai(item_id, f"ai {index}" * 500)
             ids.append(item_id)
         statements = []
         self.database.connection.set_trace_callback(statements.append)

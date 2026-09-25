@@ -42,7 +42,7 @@ def _configured_local_root() -> Path:
 
 
 APP_NAME = "ClipSave"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
 LOCAL_ROOT = _configured_local_root()
 APP_PATHS = AppPaths.build(base_dir=BASE_DIR, local_root=LOCAL_ROOT)
@@ -53,7 +53,7 @@ MARKDOWN_DIR = APP_PATHS.markdown_dir
 LEGACY_DATA_DIR = APP_PATHS.legacy_data_dir
 LEGACY_PICTURE_DIR = APP_PATHS.legacy_picture_dir
 LEGACY_MARKDOWN_DIR = APP_PATHS.legacy_markdown_dir
-THUMB_DIR = APP_PATHS.thumb_dir
+USAGE_DIR = APP_PATHS.usage_dir
 DATABASE_PATH = APP_PATHS.database_path
 SETTINGS_PATH = APP_PATHS.settings_path
 MAINTENANCE_DIR = APP_PATHS.maintenance_dir

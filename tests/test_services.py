@@ -3,6 +3,7 @@ import json
 import io
 import os
 import ctypes
+import datetime as dt
 from ctypes import wintypes
 import tempfile
 import threading
@@ -834,19 +835,45 @@ class ClipboardServiceTests(unittest.TestCase):
         self.assertIn("first entry", content)
         self.assertIn("second entry", content)
 
+    def test_recopy_of_existing_text_reuses_item_and_moves_it_first(self):
+        old = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        later = dt.datetime(2026, 1, 2, tzinfo=dt.timezone.utc)
+        old_id = self.database.add_text("reused text", old)
+        other_id = self.database.add_text("other text", later)
+        reused = []
+        captured = []
+        self.service.reused.connect(reused.append)
+        self.service.captured.connect(captured.append)
+        markdown_dir = Path(self.temp.name) / "Markdown"
+        markdown_dir.mkdir()
+
+        with patch("clipsave_app.services.MARKDOWN_DIR", markdown_dir):
+            self.assertTrue(self.service.save_text("reused text"))
+
+        self.assertEqual([item.id for item in self.database.query_items()], [old_id, other_id])
+        self.assertEqual(reused, [old_id])
+        self.assertEqual(captured, [])
+        self.assertEqual(list(markdown_dir.glob("*.md")), [])
+
     def test_duplicate_image_and_database_failure_remove_new_png(self):
         picture_dir = Path(self.temp.name) / "Pictures"
         image_a = QImage(16, 16, QImage.Format.Format_RGBA8888)
         image_a.fill(QColor("#ff0000"))
         image_b = QImage(16, 16, QImage.Format.Format_RGBA8888)
         image_b.fill(QColor("#0000ff"))
+        reused = []
+        self.service.reused.connect(reused.append)
 
         with patch("clipsave_app.services.PICTURE_DIR", picture_dir):
             self.assertTrue(self.service.save_image(image_a))
+            first_id = self.database.query_items(kind="image")[0].id
             self.assertTrue(self.service.save_image(image_b))
+            second_id = self.database.query_items(kind="image")[0].id
             self.assertTrue(self.service.save_image(image_a))
             self.assertEqual(len(list(picture_dir.rglob("*.png"))), 2)
             self.assertEqual(len(self.database.query_items()), 2)
+            self.assertEqual(reused, [first_id])
+            self.assertEqual([item.id for item in self.database.query_items(kind="image")], [first_id, second_id])
 
             with patch.object(
                 self.database,

@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import secrets
+import sqlite3
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -12,11 +13,13 @@ from send2trash import send2trash
 
 from .constants import MAINTENANCE_DIR
 from .database import LibraryDatabase
+from .database_migrations import downgrade_v6_to_v5
 from .storage import delete_managed_file, is_under_local_store, iter_safe_files, recycle_managed_file
 
 
 CONFIRMATION_PHRASE = "DELETE_INDEXED_DUPLICATES"
 PERMANENT_CONFIRMATION_PHRASE = "PERMANENTLY_DELETE_INDEXED_DUPLICATES"
+DOWNGRADE_CONFIRMATION_PHRASE = "DOWNGRADE_SCHEMA_V6_TO_V5"
 MAX_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_MANIFEST_RECORDS = 200_000
 
@@ -273,3 +276,79 @@ def clean_indexed_duplicates(
         except Exception as exc:
             result["errors"].append({"path": path_text, "error": str(exc)})
     return result
+
+
+def downgrade_schema_v6_to_v5(database_path: Path, confirmation: str) -> dict:
+    if confirmation != DOWNGRADE_CONFIRMATION_PHRASE:
+        raise ValueError(
+            f"Confirmation phrase does not match: {DOWNGRADE_CONFIRMATION_PHRASE}"
+        )
+    database_path = Path(database_path)
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != 6:
+            return {
+                "downgraded": False,
+                "schema_version": version,
+                "note": (
+                    "Database is already at schema version 5 or older"
+                    if version <= 5
+                    else f"Unsupported schema version {version}; expected 6"
+                ),
+            }
+        check = connection.execute("PRAGMA quick_check").fetchone()[0]
+        if check != "ok":
+            raise RuntimeError(f"Source database failed quick_check: {check}")
+
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = database_path.with_name(
+            f"{database_path.stem}.pre-downgrade-v5-{stamp}{database_path.suffix}"
+        )
+        destination = sqlite3.connect(backup_path)
+        try:
+            connection.backup(destination)
+        finally:
+            destination.close()
+        backup_check = sqlite3.connect(backup_path)
+        try:
+            verified = backup_check.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            backup_check.close()
+        if verified != "ok":
+            backup_path.unlink(missing_ok=True)
+            raise RuntimeError(f"Downgrade backup failed integrity_check: {verified}")
+
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            downgrade_v6_to_v5(connection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+        final_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(items)").fetchall()
+        }
+        indexes = {
+            row[0] for row in connection.execute("PRAGMA index_list(items)").fetchall()
+        }
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        if final_version != 5 or "last_used_at" in columns or integrity != "ok":
+            raise RuntimeError(
+                "Downgrade verification failed "
+                f"(version={final_version}, integrity={integrity})"
+            )
+        return {
+            "downgraded": True,
+            "schema_version": final_version,
+            "backup": str(backup_path),
+            "last_used_index_removed": "idx_items_last_used" not in indexes,
+            "integrity_check": integrity,
+        }
+    finally:
+        connection.close()

@@ -11,6 +11,11 @@ from .library_models import CollectionSummary, LibraryItem, TagSummary
 class DatabaseQueryStore:
     """Read-model queries for the ClipSave library database."""
 
+    LAST_USED_EXPRESSION = (
+        "COALESCE((SELECT u.last_used_at FROM usage.item_usage u"
+        " WHERE u.item_id = i.id), rtrim(i.created_at, 'Z') || '.000000Z')"
+    )
+
     def __init__(
         self,
         *,
@@ -29,7 +34,7 @@ class DatabaseQueryStore:
     @staticmethod
     def item_order(sort: str) -> str:
         orders = {
-            "newest": "i.created_at DESC, i.id DESC",
+            "newest": f"{DatabaseQueryStore.LAST_USED_EXPRESSION} DESC, i.id DESC",
             "oldest": "i.created_at ASC, i.id ASC",
             "name": "i.title COLLATE NOCASE ASC, i.id ASC",
             "size": "i.file_size DESC, i.id DESC",
@@ -66,11 +71,12 @@ class DatabaseQueryStore:
             tag_id=tag_id,
             query_terms=query_terms,
         )
-        projection = "i.*"
+        projection = f"i.*, {self.LAST_USED_EXPRESSION} AS last_used_at"
         if summary_only:
             projection = f"""
                 i.id, i.kind, i.title, substr(i.content,1,{self.summary_content_limit}) AS content,
                 i.path, i.resolved_path, i.mime, i.content_hash, i.created_at, i.updated_at,
+                {self.LAST_USED_EXPRESSION} AS last_used_at,
                 i.file_size, i.width, i.height, i.source, i.favorite, '' AS notes,
                 '' AS ocr_text, '' AS ai_description, NULL AS embedding,
                 i.embedding_provider, i.embedding_model, i.embedding_dimensions,
@@ -270,8 +276,8 @@ class DatabaseQueryStore:
     def get_item(self, item_id: int) -> LibraryItem | None:
         with self._lock:
             row = self._connection().execute(
-                """
-                SELECT i.*, c.name AS collection_name,
+                f"""
+                SELECT i.*, {self.LAST_USED_EXPRESSION} AS last_used_at, c.name AS collection_name,
                        (SELECT GROUP_CONCAT(name, char(31)) FROM (
                            SELECT tag.name AS name
                            FROM item_tags link JOIN tags tag ON tag.id=link.tag_id

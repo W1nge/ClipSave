@@ -437,7 +437,7 @@ class StorageTests(unittest.TestCase):
             LIBRARY_DIR=unc_root / "Library",
             PICTURE_DIR=unc_root / "Library" / "Pictures",
             MARKDOWN_DIR=unc_root / "Library" / "Markdown",
-            THUMB_DIR=unc_root / "Data" / "thumbnails",
+            USAGE_DIR=unc_root / "Data" / "Usage",
             MAINTENANCE_DIR=unc_root / "Data" / "maintenance",
         ):
             with self.assertRaisesRegex(RuntimeError, "network path"):
@@ -451,7 +451,7 @@ class StorageTests(unittest.TestCase):
             "LIBRARY_DIR": local_root / "Library",
             "PICTURE_DIR": local_root / "Library" / "Pictures",
             "MARKDOWN_DIR": local_root / "Library" / "Markdown",
-            "THUMB_DIR": local_root / "Data" / "thumbnails",
+            "USAGE_DIR": local_root / "Data" / "Usage",
             "MAINTENANCE_DIR": local_root / "Data" / "maintenance",
         }
         with (
@@ -469,7 +469,7 @@ class StorageTests(unittest.TestCase):
             "LIBRARY_DIR": local_root / "Library",
             "PICTURE_DIR": local_root / "Library" / "Pictures",
             "MARKDOWN_DIR": local_root / "Library" / "Markdown",
-            "THUMB_DIR": local_root / "Data" / "thumbnails",
+            "USAGE_DIR": local_root / "Data" / "Usage",
             "MAINTENANCE_DIR": local_root / "Data" / "maintenance",
         }
         with patch.multiple(storage, **paths):
@@ -490,7 +490,7 @@ class StorageTests(unittest.TestCase):
             paths.library_dir,
             paths.picture_dir,
             paths.markdown_dir,
-            paths.thumb_dir,
+            paths.usage_dir,
             paths.maintenance_dir,
         ):
             self.assertTrue(path.is_dir())

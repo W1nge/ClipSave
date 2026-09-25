@@ -41,6 +41,7 @@ class LibraryItem(RecordMapping):
     content_hash: str | None
     created_at: str
     updated_at: str | None
+    last_used_at: str
     file_size: int
     width: int | None
     height: int | None

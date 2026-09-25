@@ -102,6 +102,34 @@ The default maintenance command only scans the library and writes a manifest und
 
 Cleanup only processes copies whose hashes exactly match valid database records and revalidates each file before acting. Recycle Bin and permanent deletion require explicit confirmation phrases. Unindexed files are never deleted automatically.
 
+### Downgrading the database schema
+
+Your data belongs to you, including the right to return to an earlier ClipSave release. Because a schema migration cannot be opened by older versions, you can explicitly move the database back one schema version:
+
+```powershell
+.\.venv\Scripts\python.exe clipsave_maintenance.py --downgrade-schema --confirm DOWNGRADE_SCHEMA_V6_TO_V5
+```
+
+Close ClipSave first. The command verifies the database, writes a validated backup next to it (`clipsave.db.pre-downgrade-v5-<timestamp>.db`), then removes the schema-version-6 additions. The "last used" times are lost; upgrading again re-derives them from capture dates.
+
+## Where your data lives
+
+Everything lives under `%LOCALAPPDATA%\ClipSave` and belongs to you. ClipSave is a viewer and manager on top of it.
+
+| Path | What it is | If you delete it |
+|---|---|---|
+| `Data\clipsave.db` (+ `-wal`, `-shm`) | Library index: items, tags, collections, notes, favorites, OCR/AI text. Authoritative for metadata. | The app rebuilds an empty index and rescans; tags, collections, notes and favorites are lost. |
+| `Data\clipsave.db.backups\` | Rolling automatic backups (three kept; copies from newer schemas are never pruned). | Only your safety net is gone. |
+| `Data\settings.json` (+ `.bak`) | Preferences in plain JSON. | Recreated with defaults. |
+| `Data\Usage\usage-YYYY-MM.md` | Human-readable usage journal backing "last used" ordering. Append-only, one line per use. | Only recency ordering resets. |
+| `Data\maintenance\` | Orphan-scan manifests (JSON). | Nothing; scans can rerun. |
+| `Data\bulk-image-job.json` | Resumable OCR/AI bulk-job checkpoint. | Interrupted bulk jobs restart. |
+| `Library\Pictures\` | Captured and imported images. Authoritative for pixels. | The images are gone. |
+| `Library\Markdown\clipboard_YYYY-MM-DD.md` | Plain-text export of captured text, one file per day. Readable anywhere; never re-imported by the app. | The export is gone; indexed text stays in the database. |
+| `Library\Markdown\Imported\`, `Library\Pictures\Imported\` | Copies of files you imported. | Same as above. |
+
+You can read these files freely and edit their contents. Do not change the database *structure* (tables, columns, indexes) by hand: a structurally unexpected database is treated as corrupted and gets quarantined automatically. Adding or editing rows with ordinary SQLite tools is accepted as-is.
+
 ## License
 
 [MIT License](LICENSE)

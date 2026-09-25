@@ -12,8 +12,10 @@ from clipsave_app.constants import APP_PATHS
 from clipsave_app.database import LibraryDatabase
 from clipsave_app.maintenance import (
     CONFIRMATION_PHRASE,
+    DOWNGRADE_CONFIRMATION_PHRASE,
     PERMANENT_CONFIRMATION_PHRASE,
     clean_indexed_duplicates,
+    downgrade_schema_v6_to_v5,
     scan_orphans,
 )
 from clipsave_app.storage import ensure_storage_directories, migrate_legacy_layout
@@ -22,6 +24,7 @@ from clipsave_app.storage import ensure_storage_directories, migrate_legacy_layo
 def main() -> int:
     parser = argparse.ArgumentParser(description="ClipSave local library maintenance")
     parser.add_argument("--apply", type=Path, help="Recycle indexed duplicate files from this manifest")
+    parser.add_argument("--downgrade-schema", action="store_true", help="Downgrade the database schema from v6 back to v5")
     parser.add_argument("--confirm", default="", help=f"Required phrase: {CONFIRMATION_PHRASE}")
     parser.add_argument("--permanent", action="store_true", help="Permanently delete instead of using the Recycle Bin")
     args = parser.parse_args()
@@ -35,6 +38,16 @@ def main() -> int:
     ensure_storage_directories(APP_PATHS)
     migrate_legacy_layout(APP_PATHS)
     ensure_storage_directories(APP_PATHS)
+
+    if args.downgrade_schema:
+        if args.confirm != DOWNGRADE_CONFIRMATION_PHRASE:
+            parser.error(f"--downgrade-schema requires --confirm {DOWNGRADE_CONFIRMATION_PHRASE}")
+        # Opened with raw sqlite3: constructing LibraryDatabase here would
+        # immediately migrate the schema back up to the current version.
+        result = downgrade_schema_v6_to_v5(APP_PATHS.database_path, args.confirm)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("downgraded") or result.get("schema_version", 0) <= 5 else 2
+
     database = LibraryDatabase(paths=APP_PATHS)
     try:
         if args.apply:

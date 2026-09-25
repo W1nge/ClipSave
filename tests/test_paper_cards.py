@@ -123,6 +123,7 @@ class PaperCardTests(unittest.TestCase):
         option.font = view.font()
         record = {
             "created_at": "2026-09-22T01:39:00+08:00",
+            "last_used_at": "2026-09-22T01:39:00+08:00",
             "kind": "text",
             "favorite": False,
         }
@@ -159,6 +160,7 @@ class PaperCardTests(unittest.TestCase):
         option.font = view.font()
         record = {
             "created_at": "2026-09-22T01:39:00+08:00",
+            "last_used_at": "2026-09-22T01:39:00+08:00",
             "kind": "text",
             "favorite": False,
         }
@@ -209,6 +211,7 @@ class PaperCardTests(unittest.TestCase):
         option.font = view.font()
         record = {
             "created_at": "2026-09-22T01:39:00+08:00",
+            "last_used_at": "2026-09-22T01:39:00+08:00",
             "kind": "text",
             "favorite": True,
         }
@@ -249,6 +252,7 @@ class PaperCardTests(unittest.TestCase):
         view.paper_peel_state = lambda _row: state
         record = {
             "created_at": "2026-09-22T01:39:00+08:00",
+            "last_used_at": "2026-09-22T01:39:00+08:00",
             "kind": "text",
             "favorite": True,
         }

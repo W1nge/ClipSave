@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import mimetypes
 import os
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
@@ -16,6 +17,13 @@ from PIL import Image
 
 from . import storage
 from .import_staging import prepare_import
+
+
+_CAPTURE_EXPORT_PATTERN = re.compile(r"^clipboard_\d{4}-\d{2}-\d{2}\.md$")
+
+
+def _is_capture_export(path: Path) -> bool:
+    return bool(_CAPTURE_EXPORT_PATTERN.match(path.name))
 
 
 class ImportFileResult(Enum):
@@ -157,6 +165,8 @@ class DatabaseFileIndexStore:
                 if cancel_event is not None and cancel_event.is_set():
                     self._report(scanned, added, failures, errors)
                     return added
+                if kind == "markdown" and _is_capture_export(path):
+                    continue
                 scanned += 1
                 try:
                     importer = self._scan_import_file or self.import_file
@@ -191,6 +201,8 @@ class DatabaseFileIndexStore:
                 if cancel_event is not None and cancel_event.is_set():
                     self._report(scanned, added, failures, errors)
                     return added
+                if kind == "markdown" and _is_capture_export(path):
+                    continue
                 scanned += 1
                 try:
                     key = self._path_key(path)

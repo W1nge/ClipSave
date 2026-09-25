@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,8 +11,10 @@ from PIL import Image
 from clipsave_app.database import LibraryDatabase
 from clipsave_app.maintenance import (
     CONFIRMATION_PHRASE,
+    DOWNGRADE_CONFIRMATION_PHRASE,
     PERMANENT_CONFIRMATION_PHRASE,
     clean_indexed_duplicates,
+    downgrade_schema_v6_to_v5,
     scan_orphans,
 )
 
@@ -36,6 +39,56 @@ class MaintenanceTests(unittest.TestCase):
             permanent=permanent,
             library_dir=self.library,
         )
+
+    def test_downgrade_schema_v6_to_v5_removes_recency_and_backs_up(self):
+        database_path = self.root / "test.db"
+        item_id = self.database.add_text("downgradable")
+        self.database.close()
+
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.executescript(
+                """
+                ALTER TABLE items ADD COLUMN last_used_at TEXT NOT NULL DEFAULT '';
+                UPDATE items SET last_used_at=substr(created_at,1,19) || '.000000Z';
+                CREATE INDEX idx_items_last_used ON items(last_used_at DESC, id DESC);
+                PRAGMA user_version = 6;
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(ValueError):
+            downgrade_schema_v6_to_v5(database_path, "WRONG_PHRASE")
+
+        result = downgrade_schema_v6_to_v5(database_path, DOWNGRADE_CONFIRMATION_PHRASE)
+        self.assertTrue(result["downgraded"])
+        self.assertEqual(result["schema_version"], 5)
+        self.assertTrue(result["last_used_index_removed"])
+        self.assertTrue(Path(result["backup"]).is_file())
+
+        connection = sqlite3.connect(database_path)
+        try:
+            self.assertEqual(
+                int(connection.execute("PRAGMA user_version").fetchone()[0]), 5
+            )
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(items)").fetchall()
+            }
+            self.assertNotIn("last_used_at", columns)
+            self.assertEqual(
+                connection.execute("SELECT title FROM items WHERE id=?", (item_id,)).fetchone()[0],
+                "downgradable",
+            )
+        finally:
+            connection.close()
+
+        reopened = LibraryDatabase(database_path)
+        try:
+            self.assertIsNotNone(reopened.get_item(item_id))
+        finally:
+            reopened.close()
 
     def test_scan_classifies_indexed_duplicate_orphan_duplicate_and_unique(self):
         indexed = self.library / "indexed.png"

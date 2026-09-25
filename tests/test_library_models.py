@@ -71,6 +71,7 @@ class LibraryRecordTests(unittest.TestCase):
             "content_hash": "a" * 64,
             "created_at": "2026-09-20T00:00:00+00:00",
             "updated_at": None,
+            "last_used_at": "2026-09-20T00:00:00+00:00",
             "file_size": 12,
             "width": 2,
             "height": 3,

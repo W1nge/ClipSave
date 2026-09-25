@@ -90,6 +90,34 @@ python -m venv .venv
 
 清理命令只处理清单中与数据库有效文件哈希完全一致的副本，并在操作前重新验证文件。回收站和永久删除都要求显式确认短语；独立未索引文件不会自动删除。
 
+### 数据库结构降级
+
+数据完全归你所有，也包括回到旧版本 ClipSave 的权利。由于结构迁移后的数据库无法被旧版本打开，你可以显式地把数据库退回上一个结构版本：
+
+```powershell
+.\.venv\Scripts\python.exe clipsave_maintenance.py --downgrade-schema --confirm DOWNGRADE_SCHEMA_V6_TO_V5
+```
+
+先关闭 ClipSave。命令会先校验数据库，在数据库旁生成一份经过完整性验证的备份（`clipsave.db.pre-downgrade-v5-<时间戳>.db`），再移除 v6 新增的部分。「最近使用」时间会丢失；再次升级时会按保存时间重新回填。
+
+## 数据存放地图
+
+所有数据都在 `%LOCALAPPDATA%\ClipSave` 下，完全归你所有，ClipSave 只是建立在它之上的查看与管理工具。
+
+| 路径 | 内容 | 删除后 |
+|---|---|---|
+| `Data\clipsave.db`（含 `-wal`、`-shm`） | 资料库索引：条目、标签、合集、备注、收藏、OCR/AI 文本。元数据的权威来源。 | 应用重建空索引并重扫文件；标签、合集、备注、收藏丢失。 |
+| `Data\clipsave.db.backups\` | 自动轮换备份（保留三份；更新结构的备份永不清理）。 | 只是失去安全网。 |
+| `Data\settings.json`（+ `.bak`） | 纯 JSON 偏好设置。 | 按默认值重建。 |
+| `Data\Usage\usage-YYYY-MM.md` | 人可读的使用日志，支撑「最近使用」排序。纯追加，一次使用一行。 | 仅最近使用排序重置。 |
+| `Data\maintenance\` | 孤儿扫描清单（JSON）。 | 无影响，可重新扫描。 |
+| `Data\bulk-image-job.json` | 可续跑的 OCR/AI 批处理断点。 | 中断的批任务重新开始。 |
+| `Library\Pictures\` | 截取与导入的图片。像素数据的权威来源。 | 图片丢失。 |
+| `Library\Markdown\clipboard_YYYY-MM-DD.md` | 每日文本导出，任何工具都能打开；应用不会把它重新导入。 | 导出丢失；已入库文本仍在数据库中。 |
+| `Library\Markdown\Imported\`、`Library\Pictures\Imported\` | 你导入文件的副本。 | 同上。 |
+
+这些文件你可以随时查看、编辑内容。但不要手工改动数据库的**结构**（表、列、索引）：结构不符合预期的数据库会被视为损坏并自动隔离。用普通 SQLite 工具增加或修改数据行是允许的，应用按现状对待。
+
 ## 开源许可
 
 [MIT License](LICENSE)
