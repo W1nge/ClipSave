@@ -68,6 +68,7 @@ class ClipboardService(QObject):
         self.last_text = ""
         self.last_image_key = ""
         self.last_clipboard_sequence: int | None = None
+        self._pending_capture_sequences: set[int] = set()
         self._persistence_succeeded.connect(self._finish_task)
         self._persistence_failed.connect(self._fail_task)
         self._persistence_worker = ClipboardPersistenceWorker(
@@ -345,6 +346,13 @@ class ClipboardService(QObject):
 
     def poll(self) -> None:
         try:
+            if self._pending_capture_sequences:
+                pending_sequence = self.clipboard_sequence()
+                if (
+                    pending_sequence is not None
+                    and pending_sequence in self._pending_capture_sequences
+                ):
+                    return
             snapshot = self._read_stable_snapshot()
             self._clipboard_retry_attempt = 0
             if snapshot is None:
@@ -353,6 +361,8 @@ class ClipboardService(QObject):
             if kind == "image":
                 image = value
                 self._validate_image(image)
+                if sequence is not None:
+                    self._pending_capture_sequences.add(sequence)
                 self._enqueue_task("image", QImage(image), sequence)
                 return
             if kind == "text":
@@ -364,6 +374,8 @@ class ClipboardService(QObject):
                 if text == self.last_text:
                     self.last_clipboard_sequence = sequence
                     return
+                if sequence is not None:
+                    self._pending_capture_sequences.add(sequence)
                 self._enqueue_task("text", text, sequence)
         except _ClipboardBusy:
             if (
@@ -390,33 +402,57 @@ class ClipboardService(QObject):
             if not is_duplicate:
                 self.save_image(task.value)
             with self._persistence_state_lock:
-                self.last_image_key = key
+                if not self._sequence_is_stale(task.sequence):
+                    self.last_image_key = key
             return key
         self.save_text(task.value)
         return task.value
+
+    def _sequence_is_stale(self, task_sequence: int | None) -> bool:
+        """Return True when task_sequence is an older, wrap-aware sequence.
+
+        ``suppress_text``/``suppress_image`` record the clipboard sequence of
+        newer content; a persistence task read before that suppression must
+        not regress the dedup state when it finishes late.
+        """
+        current = self.last_clipboard_sequence
+        if task_sequence is None or current is None or task_sequence == current:
+            return False
+        behind = (current - task_sequence) % (1 << 32)
+        return 0 < behind < (1 << 31)
 
     def _release_pending(self, task: ClipboardTask) -> None:
         self._persistence_worker.release_pending(task)
 
     def _finish_task(self, task: ClipboardTask, result) -> None:
         self._release_pending(task)
-        if task.kind == "image":
-            self.last_image_key = result
-        else:
-            self.last_text = result
-        if task.sequence is not None:
-            self.last_clipboard_sequence = task.sequence
+        with self._persistence_state_lock:
+            if not self._sequence_is_stale(task.sequence):
+                if task.kind == "image":
+                    self.last_image_key = result
+                else:
+                    self.last_text = result
+                if task.sequence is not None:
+                    self.last_clipboard_sequence = task.sequence
+            if task.sequence is not None:
+                self._pending_capture_sequences.discard(task.sequence)
 
     def _finish_task_without_signal(self, task: ClipboardTask, result) -> None:
         self._release_pending(task)
         with self._persistence_state_lock:
-            if task.kind == "text" and result is not None:
-                self.last_text = result
+            if not self._sequence_is_stale(task.sequence):
+                if task.kind == "text" and result is not None:
+                    self.last_text = result
+                if task.sequence is not None:
+                    self.last_clipboard_sequence = task.sequence
             if task.sequence is not None:
-                self.last_clipboard_sequence = task.sequence
+                self._pending_capture_sequences.discard(task.sequence)
 
     def _fail_task(self, task: ClipboardTask, message: str) -> None:
         self._release_pending(task)
+        with self._persistence_state_lock:
+            if task.sequence is not None:
+                self._pending_capture_sequences.discard(task.sequence)
         self.failed.emit(message)
 
     def wait_for_idle(self, timeout: float = 10.0) -> bool:
@@ -524,9 +560,11 @@ class ClipboardService(QObject):
         return True
 
     def suppress_text(self, text: str) -> None:
-        self.last_text = text
-        self.last_clipboard_sequence = self.clipboard_sequence()
+        with self._persistence_state_lock:
+            self.last_text = text
+            self.last_clipboard_sequence = self.clipboard_sequence()
 
     def suppress_image(self, image: QImage) -> None:
-        self.last_image_key = self.image_key(image)
-        self.last_clipboard_sequence = self.clipboard_sequence()
+        with self._persistence_state_lock:
+            self.last_image_key = self.image_key(image)
+            self.last_clipboard_sequence = self.clipboard_sequence()

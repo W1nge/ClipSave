@@ -228,15 +228,10 @@ class NativeClipboardReader:
                     raise ValueError("剪贴板文字过大，已拒绝读取。")
                 payload = cls.copy_clipboard_payload_locked(kernel32, handle, size)
                 payload = payload[: len(payload) - (len(payload) % 2)]
-                terminator = next(
-                    (
-                        offset
-                        for offset in range(0, len(payload), 2)
-                        if payload[offset : offset + 2] == b"\x00\x00"
-                    ),
-                    None,
-                )
-                if terminator is None:
+                terminator = payload.find(b"\x00\x00")
+                while 0 <= terminator and terminator % 2:
+                    terminator = payload.find(b"\x00\x00", terminator + 1)
+                if terminator < 0:
                     raise ValueError("Invalid clipboard Unicode text data")
                 text = payload[:terminator].decode("utf-16-le")
                 if len(text.encode("utf-8")) > MAX_CLIPBOARD_TEXT_BYTES:

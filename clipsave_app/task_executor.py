@@ -156,6 +156,32 @@ class BoundedTaskExecutor:
             worker.join(remaining)
         return all(not worker.is_alive() for worker in self._workers)
 
+    def resume_after_failed_shutdown(self) -> None:
+        """Undo a timed-out shutdown so the executor accepts work again.
+
+        A drain that misses its deadline leaves termination sentinels queued
+        and some workers may already have exited after consuming one. Drop
+        the unconsumed sentinels, respawn workers for the ones that exited,
+        and re-open submission, so a refused quit leaves a usable executor
+        instead of a poisoned one.
+        """
+        with self._queue.mutex:
+            self._queue.queue[:] = [
+                task for task in self._queue.queue if task is not None
+            ]
+        with self._lock:
+            self._shutdown_sentinels_enqueued = 0
+            self._accepting = True
+            self._workers[:] = [worker for worker in self._workers if worker.is_alive()]
+            for index in range(self.max_active - len(self._workers)):
+                replacement = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"ClipSaveAIOrOCR-resume-{index + 1}",
+                    daemon=True,
+                )
+                replacement.start()
+                self._workers.append(replacement)
+
 
 _AI_OCR_EXECUTOR: BoundedTaskExecutor | None = None
 _AI_OCR_EXECUTOR_LOCK = threading.Lock()
@@ -180,4 +206,6 @@ def shutdown_ai_ocr_task_executor(timeout: float = 2.0) -> bool:
         with _AI_OCR_EXECUTOR_LOCK:
             if _AI_OCR_EXECUTOR is executor:
                 _AI_OCR_EXECUTOR = None
+    else:
+        executor.resume_after_failed_shutdown()
     return stopped

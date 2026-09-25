@@ -10,7 +10,7 @@ from PySide6.QtGui import (
     QPainterPath, QPalette, QPen, QPixmap, QPolygonF, QTextDocument,
     QTextOption, QTransform,
 )
-from PySide6.QtWidgets import QStyleOptionViewItem, QStyledItemDelegate
+from PySide6.QtWidgets import QStyle, QStyleOptionViewItem, QStyledItemDelegate
 
 from .asset_grid_transition_renderer import AssetGridTransitionRenderer
 from .asset_text_layout import (
@@ -452,6 +452,14 @@ class AssetGridDelegate(QStyledItemDelegate):
             painter.setClipPath(card_shape)
             painter.setClipPath(retained_path, Qt.ClipOperation.IntersectClip)
             self._paint_card_outline(painter, QRectF(card), border)
+            painter.restore()
+
+        if option.state & QStyle.State.State_Selected:
+            ring_rect = QRectF(card).adjusted(1.0, 1.0, -1.0, -1.0)
+            painter.save()
+            painter.setPen(QPen(QColor("#4da3ff") if dark else QColor("#2f7df6"), 2.0))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(ring_rect, self.CARD_RADIUS - 1.0, self.CARD_RADIUS - 1.0)
             painter.restore()
 
         if state is not None:

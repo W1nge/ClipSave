@@ -836,7 +836,10 @@ class MainWindow(QMainWindow):
                 if self.isMinimized():
                     self._hide_windows_backdrop_window()
                 else:
-                    QTimer.singleShot(0, self._sync_windows_backdrop_window)
+                    # Restore from the taskbar never passes through
+                    # bring_to_front, so re-insert the helper synchronously;
+                    # a deferred sync leaves it occluded for a frame.
+                    self._sync_windows_backdrop_window(visible=True)
         super().changeEvent(event)
 
     def nativeEvent(self, event_type, message):

@@ -381,13 +381,18 @@ def apply_windows_backdrop(
     dark: bool = False,
     *,
     composition_window=None,
+    allow_unowned_composition: bool = True,
 ) -> BackdropResult:
     if os.name != "nt":
         return BackdropResult(BackdropBackend.SOLID, False)
     try:
         hwnd = int(window.winId())
         if composition_window is None:
-            composition_hwnd = hwnd
+            # The dedicated helper HWND renders the Win10 composition acrylic;
+            # without it the effect graph must never attach to the Qt-owned
+            # window (it covers the client content), so callers can opt out
+            # and fall through to legacy blur / solid instead.
+            composition_hwnd = hwnd if allow_unowned_composition else None
         elif isinstance(composition_window, int):
             composition_hwnd = int(composition_window)
         else:
@@ -419,7 +424,7 @@ def apply_windows_backdrop(
                 else:
                     native_error = backdrop_result
             if not backdrop_applied:
-                if system_policy.allows_app_managed_backdrop:
+                if system_policy.allows_app_managed_backdrop and composition_hwnd is not None:
                     # Keep one GPU-composited Acrylic effect active for the
                     # entire lifetime of the Win10 HWND, including live
                     # move/resize. The bridge renders HostBackdrop through a

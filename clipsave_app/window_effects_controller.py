@@ -221,6 +221,7 @@ class WindowEffectsController:
             self.window,
             self.window.dark_theme if dark is None else dark,
             composition_window=composition_window,
+            allow_unowned_composition=False,
         )
         self.native_backdrop_result = result
         self.sync_surface_style(result=result, dark=dark)

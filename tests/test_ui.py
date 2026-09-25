@@ -1473,7 +1473,9 @@ class MainWindowTests(unittest.TestCase):
             "QFrame#CopyToast { background: rgba(40,40,40,230);",
             self.window.styleSheet(),
         )
-        backdrop.assert_called_with(self.window, True, composition_window=None)
+        backdrop.assert_called_with(
+            self.window, True, composition_window=None, allow_unowned_composition=False
+        )
 
         self.settings.data["follow_system_theme"] = False
         self.settings.data["theme_mode"] = "light"

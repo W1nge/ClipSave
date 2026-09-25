@@ -138,7 +138,21 @@ class BulkImageJob:
                             str(item["content_hash"]),
                         )
                         save_checkpoint(self.checkpoint_path, current)
-                    image_snapshot.require_current()
+                    try:
+                        image_snapshot.require_current()
+                    except RuntimeError:
+                        # The file changed while the request was in flight, so
+                        # the saved result is invalid. Advancing here keeps the
+                        # checkpoint moving instead of wedging on the same item
+                        # forever (the pending result would re-fail on resume).
+                        current, checkpoint_error = self._advance_and_save(
+                            current, "skipped"
+                        )
+                        if checkpoint_error:
+                            error = checkpoint_error
+                            break
+                        progress(current.processed, total, item_id, "文件已变化，已跳过")
+                        continue
                     if not self.database.update_ocr_if_current(
                         item_id,
                         item["content_hash"],
@@ -180,7 +194,15 @@ class BulkImageJob:
                         str(item["content_hash"]),
                     )
                     save_checkpoint(self.checkpoint_path, current)
-                image_snapshot.require_current()
+                try:
+                    image_snapshot.require_current()
+                except RuntimeError:
+                    current, checkpoint_error = self._advance_and_save(current, "skipped")
+                    if checkpoint_error:
+                        error = checkpoint_error
+                        break
+                    progress(current.processed, total, item_id, "文件已变化，已跳过")
+                    continue
                 if not self.database.update_ai_if_current(
                     item_id,
                     item["content_hash"],
