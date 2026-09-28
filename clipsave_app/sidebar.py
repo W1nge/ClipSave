@@ -26,7 +26,10 @@ class Sidebar(QWidget):
     EXPANDED_WIDTH = 242
     COLLAPSED_WIDTH = 72
     ANIMATION_DURATION_MS = 190
-    MAX_ANIMATION_REFRESH_RATE = 240.0
+    # The cached grid compositor can sustain the 120 Hz budget at native DPI.
+    # Elapsed-time progress still skips frames when a slower display or DPI
+    # configuration cannot finish one in time.
+    MAX_ANIMATION_REFRESH_RATE = 120.0
     navigation_requested = Signal(str, object)
     add_collection_requested = Signal()
     add_tag_requested = Signal()
@@ -328,7 +331,9 @@ class Sidebar(QWidget):
         self._animation_start_progress = float(start)
         self._animation_end_progress = float(end)
         self._animation_run_duration_ms = self.ANIMATION_DURATION_MS
-        self._animation_refresh_rate = self._display_refresh_rate()
+        self._animation_refresh_rate = min(
+            self.MAX_ANIMATION_REFRESH_RATE, self._display_refresh_rate()
+        )
         self._animation_timer.setInterval(
             max(1, round(1000.0 / self._animation_refresh_rate))
         )
@@ -408,4 +413,3 @@ class Sidebar(QWidget):
             else QColor(115, 129, 150, 38),
         )
         painter.end()
-

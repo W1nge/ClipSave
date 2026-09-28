@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QFont, QFontMetricsF, QTextLayout, QTextOption
@@ -47,25 +48,35 @@ def plain_text_wrap_mode(content: str) -> QTextOption.WrapMode:
 
 
 def plain_text_layout_source(content: str) -> tuple[str, tuple[int, ...]]:
-    source = content[:330]
-    if plain_text_wrap_mode(source) == QTextOption.WrapMode.WrapAnywhere:
-        return source, tuple(range(len(source) + 1))
+    return _layout_source_prefix(content[:330])
+
+
+@lru_cache(maxsize=256)
+def _layout_source_prefix(source: str) -> tuple[str, tuple[int, ...]]:
     machine_positions = [False] * len(source)
-    for match in _MACHINE_TEXT_SPAN_RE.finditer(source):
-        machine_positions[match.start() : match.end()] = [True] * (
-            match.end() - match.start()
-        )
-    if not any(machine_positions):
-        return source, tuple(range(len(source) + 1))
+    if plain_text_wrap_mode(source) != QTextOption.WrapMode.WrapAnywhere:
+        for match in _MACHINE_TEXT_SPAN_RE.finditer(source):
+            machine_positions[match.start() : match.end()] = [True] * (
+                match.end() - match.start()
+            )
     transformed: list[str] = []
     original_boundaries = [0]
     for index, character in enumerate(source):
         transformed.append(character)
+        # QTextLayout reports offsets in UTF-16 code units, not Python code
+        # points.  Keep a boundary for the first half of a surrogate pair so
+        # its line lengths can always map back to the original string.
+        if ord(character) > 0xFFFF:
+            original_boundaries.append(index)
         original_boundaries.append(index + 1)
         if machine_positions[index]:
             transformed.append("\u200b")
             original_boundaries.append(index + 1)
     return "".join(transformed), tuple(original_boundaries)
+
+
+def _utf16_length(text: str) -> int:
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in text)
 
 
 def plain_text_layout(
@@ -79,6 +90,7 @@ def plain_text_layout(
     lines: list[tuple[int, int]] = []
     transformed_offset = 0
     y = 0.0
+    wrap_mode = plain_text_wrap_mode(content)
     segments = source.splitlines(keepends=True) or [source]
     for segment in segments:
         if y >= max(1, height):
@@ -87,7 +99,7 @@ def plain_text_layout(
         paragraph = segment[:-newline_length] if newline_length else segment
         layout = QTextLayout(paragraph, font)
         option = QTextOption()
-        option.setWrapMode(plain_text_wrap_mode(content))
+        option.setWrapMode(wrap_mode)
         layout.setTextOption(option)
         layout.beginLayout()
         paragraph_line_indexes: list[int] = []
@@ -112,8 +124,8 @@ def plain_text_layout(
             y += QFontMetricsF(font).height()
             completed = True
         if completed and newline_length:
-            newline_start = transformed_offset + len(paragraph)
-            newline_end = newline_start + newline_length
+            newline_start = transformed_offset + _utf16_length(paragraph)
+            newline_end = newline_start + _utf16_length(segment[-newline_length:])
             original_newline_length = (
                 original_boundaries[newline_end]
                 - original_boundaries[newline_start]
@@ -129,7 +141,7 @@ def plain_text_layout(
                         original_newline_length,
                     )
                 )
-        transformed_offset += len(segment)
+        transformed_offset += _utf16_length(segment)
     return layouts, tuple(lines)
 
 

@@ -42,7 +42,7 @@ def _configured_local_root() -> Path:
 
 
 APP_NAME = "ClipSave"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
 LOCAL_ROOT = _configured_local_root()
 APP_PATHS = AppPaths.build(base_dir=BASE_DIR, local_root=LOCAL_ROOT)

@@ -196,7 +196,7 @@ jobs:
           "@
           Set-Content -LiteralPath .\build\release-notes.md -Value $body -Encoding UTF8
 
-      - name: Publish GitHub Release
+      - name: Publish GitHub Release draft
         if: steps.meta.outputs.should_release == 'true'
         shell: pwsh
         env:
@@ -210,4 +210,4 @@ jobs:
             "build\release\ClipSave-$version-windows-x64-installer.exe",
             "build\release\ClipSave-$version-windows-x64-installer.exe.sha256"
           )
-          gh release create $tag $assets --repo "${{ github.repository }}" --title "ClipSave $version" --notes-file .\build\release-notes.md --verify-tag --latest
+          gh release create $tag $assets --repo "${{ github.repository }}" --title "ClipSave $version" --notes-file .\build\release-notes.md --verify-tag --draft

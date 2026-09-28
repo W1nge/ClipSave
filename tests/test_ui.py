@@ -10,8 +10,8 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEvent, QRect, Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QPointF, QRect, QSize, Qt
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QRegion
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
@@ -79,6 +79,31 @@ class MainWindowTests(unittest.TestCase):
             time.sleep(0.01)
         self.app.processEvents()
         self.assertNotIn(item_id, self.window.mutation_controller.delete_requests)
+
+    def test_main_window_both_header_bars_drag_without_system_move(self):
+        for bar in (self.window.window_title_bar, self.window.top_bar):
+            with self.subTest(bar=bar.objectName()):
+                self.window.move(100, 100)
+                self.app.processEvents()
+                origin = bar.mapToGlobal(QPoint(20, 20))
+                target = origin + QPoint(26, 14)
+                for event_type, global_pos, buttons in (
+                    (QEvent.Type.MouseButtonPress, origin, Qt.MouseButton.LeftButton),
+                    (QEvent.Type.MouseMove, target, Qt.MouseButton.LeftButton),
+                    (QEvent.Type.MouseButtonRelease, target, Qt.MouseButton.NoButton),
+                ):
+                    event = QMouseEvent(
+                        event_type,
+                        QPointF(20, 20),
+                        QPointF(global_pos),
+                        Qt.MouseButton.LeftButton
+                        if event_type != QEvent.Type.MouseMove
+                        else Qt.MouseButton.NoButton,
+                        buttons,
+                        Qt.KeyboardModifier.NoModifier,
+                    )
+                    QApplication.sendEvent(bar, event)
+                self.assertEqual(self.window.pos(), QPoint(126, 114))
 
     def test_panels_and_navigation(self):
         self.assertEqual(self.window.windowTitle(), "ClipSave")
@@ -582,14 +607,254 @@ class MainWindowTests(unittest.TestCase):
             self.window._constrain_to_available_screen()
         self.assertEqual(self.window.geometry(), QRect(200, 200, 800, 500))
 
-    def test_interactive_resize_defers_grid_layout_until_finished(self):
+    def test_interactive_resize_keeps_grid_layout_live(self):
         with patch.object(self.window.grid, "set_layout_updates_suspended") as suspended:
             self.window._begin_interactive_resize()
             self.window._begin_interactive_resize()
             self.window._end_interactive_resize()
             self.window._end_interactive_resize()
 
-        self.assertEqual([call.args for call in suspended.call_args_list], [(True,), (False,)])
+        self.assertEqual([call.args for call in suspended.call_args_list], [(False,), (False,)])
+
+    def test_cards_follow_interactive_resize_before_mouse_release(self):
+        grid = self.window.grid
+        source = grid.items[0]
+        grid.set_items([
+            {**{key: source[key] for key in source.keys()}, "id": row + 1}
+            for row in range(30)
+        ])
+        self.window.resize(900, 700)
+        self.app.processEvents()
+        index = grid.model().index(0, 0)
+        initial_width = grid.visualRect(index).width()
+
+        self.window._begin_interactive_resize()
+        try:
+            for width in (1050, 1250, 1000, 900, 1250):
+                self.window.resize(width, 700)
+                self.app.processEvents()
+                self.assertEqual(
+                    (grid.columns, grid.gridSize()),
+                    grid._layout_for_viewport_width(grid.viewport().width()),
+                )
+                for row in range(grid.columns):
+                    rect = grid.visualRect(grid.model().index(row, 0))
+                    self.assertLessEqual(rect.right(), grid.viewport().width())
+            expanded_width = grid.visualRect(index).width()
+            self.assertNotEqual(expanded_width, initial_width)
+            self.assertFalse(grid._layout_updates_suspended)
+
+            self.window.resize(900, 700)
+            self.app.processEvents()
+            self.assertEqual(grid.visualRect(index).width(), initial_width)
+        finally:
+            self.window._end_interactive_resize()
+
+    def test_resize_frame_catches_up_before_presenting_backdrop(self):
+        self.window._begin_interactive_resize()
+        self.app.processEvents()
+        handle = self.window.windowHandle()
+        target = self.window.size() + QSize(73, 41)
+        observed = []
+        try:
+            # Simulate the real gap: the platform/QWindow has the new size,
+            # but its queued QWidget resize has not been dispatched yet.
+            handle.resize(target)
+            self.assertNotEqual(self.window.size(), target)
+            self.window.grid.viewport().update(QRect(20, 20, 10, 10))
+            with patch.object(
+                self.window.window_effects_controller, "sync_geometry_now",
+                side_effect=lambda: observed.append((
+                    self.window.size(), self.window.centralWidget().size(),
+                    self.window.backingStore().size(),
+                )),
+            ), patch.object(self.window, "setGeometry") as reset_native_geometry:
+                QCoreApplication.sendEvent(self.window, QEvent(QEvent.Type.UpdateRequest))
+                reset_native_geometry.assert_not_called()
+            self.assertTrue(observed)
+            self.assertTrue(all(sizes == (target, target, target) for sizes in observed))
+            self.app.processEvents()
+            self.assertEqual(self.window.size(), target)
+        finally:
+            self.window._end_interactive_resize()
+
+    def test_resize_frame_keeps_unchanged_chrome_out_of_partial_repaints(self):
+        class PaintRecorder(QObject):
+            def __init__(self):
+                super().__init__()
+                self.regions = []
+
+            def eventFilter(self, watched, event):
+                if event.type() == QEvent.Type.Paint:
+                    self.regions.append(QRegion(event.region()))
+                return False
+
+        self.window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.window._begin_interactive_resize()
+        self.app.processEvents()
+        root_paints, brand_paints = PaintRecorder(), PaintRecorder()
+        self.window.installEventFilter(root_paints)
+        self.window.brand_label.installEventFilter(brand_paints)
+        try:
+            self.window.grid.viewport().update(QRect(20, 20, 10, 10))
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.UpdateRequest)
+            dirty = QRegion()
+            for region in root_paints.regions:
+                dirty |= region
+            self.assertNotEqual(dirty.boundingRect(), self.window.rect())
+            self.assertFalse(brand_paints.regions)
+            # A second idle dispatch must not produce a self-sustaining loop.
+            root_paints.regions.clear()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.UpdateRequest)
+            self.assertFalse(root_paints.regions)
+
+            self.window._end_interactive_resize()
+            self.app.processEvents()
+            root_paints.regions.clear()
+            self.window.grid.viewport().update(QRect(20, 20, 10, 10))
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.UpdateRequest)
+            self.assertFalse(any(
+                region.boundingRect() == self.window.rect()
+                for region in root_paints.regions
+            ))
+        finally:
+            self.window.removeEventFilter(root_paints)
+            self.window.brand_label.removeEventFilter(brand_paints)
+            self.window._end_interactive_resize()
+
+    def test_interactive_resize_animates_column_reorder_and_retargets(self):
+        grid = self.window.grid
+        source = grid.items[0]
+        grid.set_items([
+            {**{key: source[key] for key in source.keys()}, "id": row + 1}
+            for row in range(30)
+        ])
+        self.window.resize(900, 700)
+        self.app.processEvents()
+        self.window._begin_interactive_resize()
+        try:
+            self.window.resize(1250, 700)
+            self.app.processEvents()
+            first = grid._resize_reflow
+            self.assertIsNotNone(first)
+            self.assertTrue(first.overlay.resize_reflow)
+            self.assertFalse(first.elevated_rows)
+            self.assertTrue(all(
+                row in first.under_rows
+                for row in first.positions
+                if divmod(row, first.overlay.expanded_columns)
+                != divmod(row, first.overlay.collapsed_columns)
+            ))
+            paint_order = first.overlay.paint_order_rows
+            self.assertEqual(
+                paint_order[:len(first.under_rows)],
+                [row for row in paint_order if row in first.under_rows],
+            )
+            self.assertTrue(all(
+                len(card.preview_states) <= 1
+                for card in first.overlay.cards
+            ))
+            row = next(
+                row for row, (start, end) in first.positions.items()
+                if start != end
+            )
+            start, end = first.positions[row]
+            self.assertNotEqual(start, end)
+
+            # Width changes within the same column count retarget the moving
+            # cards without forcing another synchronous QListView layout.
+            columns = grid.columns
+            with patch.object(grid, "doItemsLayout") as forced_layout:
+                grid._retarget_resize_reflow()
+            forced_layout.assert_not_called()
+            self.window.resize(1240, 700)
+            self.app.processEvents()
+            self.assertEqual(grid.columns, columns)
+            self.assertIs(grid._resize_reflow, first)
+            for moving_row in first.positions:
+                expected = grid.visualRect(grid.model().index(moving_row, 0))
+                actual = first.overlay._cards_by_row[moving_row].collapsed_rect.toRect()
+                self.assertEqual(actual, expected)
+
+            first.started = time.monotonic() - first.duration / 2
+            moving = first.position(row)
+            self.assertLess(
+                (moving - end).manhattanLength(),
+                (start - end).manhattanLength() / 2,
+            )
+            visible_position = QPointF(grid._resize_reflow_rect(row, first).topLeft())
+
+            self.window.resize(900, 700)
+            self.app.processEvents()
+            second = grid._resize_reflow
+            self.assertIsNotNone(second)
+            self.assertIsNot(second, first)
+            self.assertLess(
+                (second.positions[row][0] - visible_position).manhattanLength(), 32,
+            )
+        finally:
+            self.window._end_interactive_resize()
+
+    def test_shrinking_resize_keeps_moving_cards_inside_viewport(self):
+        grid = self.window.grid
+        source = grid.items[0]
+        grid.set_items([
+            {**{key: source[key] for key in source.keys()}, "id": row + 1}
+            for row in range(30)
+        ])
+        self.window.resize(1250, 700)
+        self.app.processEvents()
+        grid.set_interactive_resize_active(True)
+        was_opaque = grid.viewport().testAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        try:
+            self.window.resize(900, 700)
+            self.app.processEvents()
+            state = grid._resize_reflow
+            self.assertIsNotNone(state)
+            self.assertTrue(grid.viewport().testAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent))
+            first_card = state.overlay._cards_by_row[0]
+            self.assertNotEqual(
+                first_card.expanded_rect.width(), first_card.collapsed_rect.width(),
+            )
+            self.assertLess(
+                min(first_card.expanded_rect.width(), first_card.collapsed_rect.width()),
+                grid._resize_reflow_rect(0, state, 0.5).width(),
+            )
+            self.assertLess(
+                grid._resize_reflow_rect(0, state, 0.5).width(),
+                max(first_card.expanded_rect.width(), first_card.collapsed_rect.width()),
+            )
+            for progress in (0.0, 0.25, 0.5, 0.75, 1.0):
+                for row in state.positions:
+                    rect = grid._resize_reflow_rect(row, state, progress)
+                    self.assertGreaterEqual(rect.left(), 0)
+                    self.assertLessEqual(rect.right(), grid.viewport().rect().right())
+            state.started = time.monotonic()
+            for row in state.under_rows:
+                rect = grid._resize_reflow_rect(row, state, 0.0)
+                anchor = grid._resize_reflow_rect(row - 1, state, 0.0)
+                self.assertEqual(rect.topLeft(), anchor.topLeft())
+                self.assertEqual(grid._visual_index_at(rect.center()).row(), row - 1)
+                break
+            grid._clear_resize_reflow()
+            self.assertEqual(
+                grid.viewport().testAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent),
+                was_opaque,
+            )
+            self.window.resize(1250, 700)
+            self.app.processEvents()
+            settled = grid._resize_reflow
+            self.assertIsNotNone(settled)
+            settled.started = time.monotonic() - settled.duration
+            grid._advance_resize_reflow()
+            self.assertIsNone(grid._resize_reflow)
+            self.assertFalse(grid._resize_reflow_timer.isActive())
+            self.assertEqual(
+                grid.viewport().testAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent),
+                was_opaque,
+            )
+        finally:
+            grid.set_interactive_resize_active(False)
 
     def test_windows_native_event_handles_ncactivate_without_affecting_other_messages(self):
         message = wintypes.MSG()
@@ -645,6 +910,20 @@ class MainWindowTests(unittest.TestCase):
             )
 
         schedule.assert_called_once_with()
+
+    def test_interactive_backdrop_sync_is_owned_by_completed_frame(self):
+        self.window._begin_interactive_resize()
+        try:
+            with patch.object(
+                self.window.window_effects_controller, "sync_geometry_now"
+            ) as sync:
+                self.window._sync_windows_backdrop_geometry_now()
+                self.window._sync_windows_backdrop_window()
+                sync.assert_not_called()
+                self.window.resize_frame_controller.render_frame()
+                sync.assert_called_once_with()
+        finally:
+            self.window._end_interactive_resize()
 
     def test_maximized_bounds_sync_uses_native_physical_work_area(self):
         with patch(
@@ -815,17 +1094,9 @@ class MainWindowTests(unittest.TestCase):
         refresh.assert_called_once_with()
 
         self.window.window_effects_controller.material_refresh_pending = True
-        self.window.window_effects_controller._last_material_apply = time.monotonic()
         with patch.object(self.window, "_apply_native_backdrop") as backdrop:
             self.window._refresh_material_from_system()
         self.assertFalse(self.window.window_effects_controller.material_refresh_pending)
-        backdrop.assert_not_called()
-        self.assertTrue(self.window._material_rebuild_timer.isActive())
-
-        self.window._material_rebuild_timer.stop()
-        self.window.window_effects_controller._last_material_apply = 0.0
-        with patch.object(self.window, "_apply_native_backdrop") as backdrop:
-            self.window._refresh_material_from_system()
         backdrop.assert_called_once_with(force=True)
 
     def test_move_resize_and_detail_toggle_do_not_force_window_back_on_screen(self):
@@ -1455,7 +1726,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(self.window.dark_theme)
         self.assertTrue(self.app.property("darkTheme"))
         self.assertIn("#202020", self.window.styleSheet())
-        self.assertIn("rgba(0,0,0,128)", self.window.styleSheet())
+        self.assertIn("QLineEdit#SearchField { background: rgba(0,0,0,100)", self.window.styleSheet())
         self.assertIn(
             "QWidget#ContentSurface { background: transparent; }",
             self.window.styleSheet(),

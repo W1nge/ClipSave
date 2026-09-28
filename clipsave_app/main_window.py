@@ -45,6 +45,8 @@ from .library_controller import LibrarySearchResult, LibrarySnapshot
 from .library_models import LibraryQuery, LibraryViewState
 from .main_window_backend import MainWindowBackend, ShutdownFailure
 from .native_window_controller import NativeWindowController, windows_resize_hit_test
+from .resize_diagnostics import ResizeTrace
+from .resize_frame_controller import ResizeFrameController
 from .file_preflight import preflight_image_file
 from .services import (
     BackdropResult,
@@ -324,6 +326,13 @@ class MainWindow(QMainWindow):
             unregister_power=lambda handle: unregister_windows_power_saving_notification(handle),
             sync_surface_style=lambda **kwargs: self._sync_surface_style(**kwargs),
         )
+        self._resize_trace = (
+            ResizeTrace(self)
+            if os.name == "nt" and os.environ.get("CLIPSAVE_RESIZE_TRACE") == "1"
+            else None
+        )
+        if self._resize_trace is not None:
+            print("ClipSave resize trace armed; drag a window edge once.", flush=True)
         self.native_window_controller = NativeWindowController(
             self,
             native_events_enabled=lambda: os.name == "nt",
@@ -335,21 +344,13 @@ class MainWindow(QMainWindow):
             handle_nccalcsize=lambda *args: handle_nccalcsize(*args),
             schedule_material_refresh=lambda: self._schedule_material_refresh(),
             schedule_maximized_bounds_sync=lambda: self._schedule_maximized_bounds_sync(),
-            sync_backdrop_from_windowpos=lambda lparam: self._sync_windows_backdrop_from_windowpos(
-                lparam
-            ),
             sync_backdrop_geometry_now=lambda: self._sync_windows_backdrop_geometry_now(),
-            sync_backdrop_proposed_rect=lambda left, top, right, bottom: self.window_effects_controller.sync_proposed_rect(
-                left,
-                top,
-                right,
-                bottom,
-            ),
             sync_backdrop_window=lambda: self._sync_windows_backdrop_window(),
             schedule_soon=lambda callback: QTimer.singleShot(0, callback),
             set_layout_updates_suspended=lambda value: self.grid.set_layout_updates_suspended(
                 value
             ),
+            set_grid_interactive_resize=lambda value: self._set_interactive_resize_active(value),
             sidebar_animation_active=lambda: self.sidebar_interaction_controller.animation_active,
             detail_animation_active=lambda: self.detail_animation_controller.active,
             resize_hit_test=lambda *args: self._windows_resize_hit_test(*args),
@@ -366,6 +367,11 @@ class MainWindow(QMainWindow):
             synchronize_maximized_work_area=lambda hwnd: synchronize_maximized_work_area(
                 hwnd
             ),
+        )
+        self.resize_frame_controller = ResizeFrameController(
+            self,
+            flush_widgets=lambda event: QMainWindow.event(self, event),
+            sync_backdrop=lambda: self.window_effects_controller.sync_geometry_now(),
         )
         self._initial_position_constrained = False
         self.global_hotkey_registered: bool | None = None
@@ -663,6 +669,17 @@ class MainWindow(QMainWindow):
         self._create_resize_handles(root)
         self.copy_toast = CopyToast(root)
         self.copy_toast.reposition()
+        trace = self._resize_trace
+        if trace is not None:
+            for widget, name in (
+                (root, "root"),
+                (self.window_title_bar, "title"),
+                (self.sidebar, "sidebar"),
+                (self.top_bar, "topbar"),
+                (self.library_surface, "library"),
+                (self.grid.viewport(), "grid_viewport"),
+            ):
+                trace.watch(widget, name)
 
     def _create_resize_handles(self, parent) -> None:
         if os.name == "nt":
@@ -720,13 +737,31 @@ class MainWindow(QMainWindow):
         )
 
     def _sync_windows_backdrop_window(self, *, visible: bool | None = None) -> None:
+        frame = getattr(self, "resize_frame_controller", None)
+        if visible is None and frame is not None and frame.active:
+            frame.request_frame()
+            return
+        trace = self._resize_trace
+        if trace is not None:
+            trace.record("helper.full_sync.begin")
         self.window_effects_controller.sync_window(visible=visible)
+        if trace is not None:
+            trace.record("helper.full_sync.end")
 
     def _sync_windows_backdrop_geometry_now(self) -> None:
+        frame = getattr(self, "resize_frame_controller", None)
+        if frame is not None and frame.active:
+            # Shrinking the host must never leave the previous, larger
+            # backdrop outside it while Qt prepares the next frame.
+            self.window_effects_controller.constrain_geometry_to_host()
+            frame.request_frame()
+            return
+        trace = self._resize_trace
+        if trace is not None:
+            trace.record("helper.geometry_sync.begin")
         self.window_effects_controller.sync_geometry_now()
-
-    def _sync_windows_backdrop_from_windowpos(self, lparam: int) -> None:
-        self.window_effects_controller.sync_from_windowpos(lparam)
+        if trace is not None:
+            trace.record("helper.geometry_sync.end")
 
     def _apply_native_backdrop(
         self, *, force: bool = False, dark: bool | None = None
@@ -776,22 +811,6 @@ class MainWindow(QMainWindow):
         ):
             self.apply_theme(force=True)
             return
-        # System broadcasts arrive in bursts; the full detach/re-attach is
-        # coalesced so unrelated Explorer broadcasts do not rebuild the
-        # composition graph. Policy changes still apply within a few seconds.
-        delay_ms = self.window_effects_controller.material_rebuild_delay_ms()
-        if delay_ms <= 0:
-            self._apply_native_backdrop(force=True)
-            return
-        if getattr(self, "_material_rebuild_timer", None) is None:
-            self._material_rebuild_timer = QTimer(self)
-            self._material_rebuild_timer.setSingleShot(True)
-            self._material_rebuild_timer.timeout.connect(self._material_rebuild_timeout)
-        self._material_rebuild_timer.start(delay_ms)
-
-    def _material_rebuild_timeout(self) -> None:
-        if self._closing or self._quit_in_progress:
-            return
         self._apply_native_backdrop(force=True)
 
     def _update_resize_handles(self) -> None:
@@ -818,23 +837,57 @@ class MainWindow(QMainWindow):
             self.resize_handles[key].setGeometry(*geometry)
 
     def resizeEvent(self, event) -> None:
+        trace = getattr(self, "_resize_trace", None)
+        if trace is not None:
+            trace.record(
+                "qt.resize.begin",
+                old=[event.oldSize().width(), event.oldSize().height()],
+                new=[event.size().width(), event.size().height()],
+            )
         super().resizeEvent(event)
         self._update_resize_handles()
-        if (
-            is_windows_qt_platform()
-            and not self.native_window_controller.interactive_resize_active
-        ):
+        if is_windows_qt_platform():
             self._sync_windows_backdrop_geometry_now()
         if hasattr(self, "copy_toast"):
             self.copy_toast.reposition()
+        if trace is not None:
+            trace.record("qt.resize.end")
 
     def moveEvent(self, event) -> None:
+        trace = getattr(self, "_resize_trace", None)
+        if trace is not None:
+            trace.record("qt.move.begin")
         super().moveEvent(event)
         if (
             is_windows_qt_platform()
             and not self.native_window_controller.interactive_resize_active
         ):
             self._sync_windows_backdrop_geometry_now()
+        if trace is not None:
+            trace.record("qt.move.end")
+
+    def event(self, event):
+        trace = getattr(self, "_resize_trace", None)
+        trace_update = (
+            trace is not None
+            and trace.active
+            and event.type() == QEvent.Type.UpdateRequest
+        )
+        if trace_update:
+            started_ns = time.perf_counter_ns()
+            trace.record("qt.update.begin")
+        frame = getattr(self, "resize_frame_controller", None)
+        if event.type() == QEvent.Type.UpdateRequest and frame is not None and frame.active:
+            frame.render_frame(event)
+            handled = True
+        else:
+            handled = super().event(event)
+        if trace_update:
+            trace.record(
+                "qt.update.end",
+                duration_ms=round((time.perf_counter_ns() - started_ns) / 1_000_000, 3),
+            )
+        return handled
 
     def toggle_maximized(self) -> None:
         self.native_window_controller.toggle_maximized()
@@ -864,10 +917,19 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
 
     def nativeEvent(self, event_type, message):
+        trace = getattr(self, "_resize_trace", None)
+        message_number = (
+            trace.before_native(event_type, message) if trace is not None else None
+        )
         handled = self.native_window_controller.handle_native_event(event_type, message)
         if handled is not None:
+            if trace is not None:
+                trace.after_native(message_number)
             return handled
-        return super().nativeEvent(event_type, message)
+        result = super().nativeEvent(event_type, message)
+        if trace is not None:
+            trace.after_native(message_number)
+        return result
 
     def _schedule_maximized_bounds_sync(self) -> None:
         if self.native_window_controller.maximized_bounds_sync_pending:
@@ -906,6 +968,10 @@ class MainWindow(QMainWindow):
 
     def _begin_interactive_resize(self) -> None:
         self.native_window_controller.begin_interactive_resize()
+
+    def _set_interactive_resize_active(self, active: bool) -> None:
+        self.grid.set_interactive_resize_active(active)
+        self.resize_frame_controller.set_active(active)
 
     def _end_interactive_resize(self) -> None:
         self.native_window_controller.end_interactive_resize()
@@ -1688,8 +1754,9 @@ class MainWindow(QMainWindow):
             self.show_status(status)
             return
         self._cancel_item_requests(item_id)
-        if was_selected and self.current_item_id is None:
-            self.hide_detail()
+        # The detail panel deliberately stays open across a deletion: the row
+        # disappears from the grid, but collapsing the panel here would yank
+        # away the view the user was just reading.
         self._refresh_after_mutation()
         if details.get("managed_file") and details.get("file_exists"):
             status = "内容及文件已移入回收站"

@@ -128,6 +128,9 @@ def stylesheet_for_theme(dark: bool, *, backend: str | None = None) -> str:
     return base + (_DARK_SOLID_OVERRIDES if dark else _LIGHT_SOLID_OVERRIDES)
 
 
+# On Windows the translucent main window is click-through where its alpha is
+# exactly zero.  Qt stylesheets render 0.004 as 1/255 alpha: visually clear,
+# but still an input surface for the acrylic title bar and sidebar.
 DARK_STYLESHEET = """
 * {
     font-family: "Microsoft YaHei UI", "Segoe UI";
@@ -146,13 +149,13 @@ QListWidget#DateList::item { padding: 0 12px; border-radius: 4px; background: #2
 QListWidget#DateList::item:hover { background: #343434; }
 QListWidget#DateList::item:selected { background: #26384d; color: #79c4ff; }
 QWidget#WindowBody { background: transparent; }
-QFrame#WindowTitleBar { background: rgba(0,0,0,128); border: 0; }
-QWidget#Sidebar { background: rgba(0,0,0,128); border: 0; }
+QFrame#WindowTitleBar { background: rgba(0,0,0,0.004); border: 0; }
+QWidget#Sidebar { background: rgba(0,0,0,0.004); border: 0; }
 QScrollArea#SidebarClassificationScroll, QScrollArea#SidebarClassificationScroll > QWidget > QWidget { background: transparent; border: 0; }
 QWidget#ContentSurface { background: transparent; }
 QWidget#LibrarySurface { background: #202020; }
 QWidget#DetailPanel, QWidget#DetailPanelContent { background: #181818; border: 0; }
-QFrame#TopBar { background: rgba(0,0,0,128); border-bottom: 1px solid #3c3c3c; }
+QFrame#TopBar { background: rgba(0,0,0,0.004); border-bottom: 1px solid #3c3c3c; }
 QFrame#LibraryHeader { background: transparent; }
 QStackedWidget#ViewStack { background: transparent; }
 QFrame#TagChip { background: #353535; border-radius: 6px; }
@@ -176,7 +179,7 @@ QLineEdit, QTextEdit, QTextBrowser, QComboBox {
     color: #f2f2f2;
     selection-background-color: #2f7df6;
 }
-QLineEdit#SearchField { background: rgba(0,0,0,65); border: 1px solid rgba(220,228,238,72); }
+QLineEdit#SearchField { background: rgba(0,0,0,100); border: 1px solid rgba(220,228,238,72); }
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;

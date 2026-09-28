@@ -5,10 +5,14 @@ from unittest.mock import Mock
 
 from clipsave_app.native_window_controller import (
     NativeWindowController,
-    WM_SIZING,
     windows_resize_hit_test,
 )
-from clipsave_app.windows_frame import WM_GETMINMAXINFO, WM_NCACTIVATE
+from clipsave_app.windows_frame import (
+    WM_GETMINMAXINFO,
+    WM_NCACTIVATE,
+    WM_WINDOWPOSCHANGING,
+    WM_WINDOWPOSCHANGED,
+)
 
 
 class _Window:
@@ -40,12 +44,11 @@ class NativeWindowControllerTests(unittest.TestCase):
             "handle_nccalcsize": Mock(return_value=(False, 0)),
             "schedule_material_refresh": Mock(),
             "schedule_maximized_bounds_sync": Mock(),
-            "sync_backdrop_from_windowpos": Mock(),
             "sync_backdrop_geometry_now": Mock(),
-            "sync_backdrop_proposed_rect": Mock(),
             "sync_backdrop_window": Mock(),
             "schedule_soon": Mock(side_effect=lambda callback: callback()),
             "set_layout_updates_suspended": Mock(),
+            "set_grid_interactive_resize": Mock(),
             "sidebar_animation_active": Mock(return_value=False),
             "detail_animation_active": Mock(return_value=False),
             "resize_hit_test": Mock(return_value=None),
@@ -114,23 +117,35 @@ class NativeWindowControllerTests(unittest.TestCase):
         callbacks["clear_resize_handles"].assert_called_once_with()
         callbacks["install_resize_handles"].assert_not_called()
 
-    def test_sizing_prepositions_backdrop_before_host_bounds_commit(self):
+    def test_backdrop_follows_only_committed_host_bounds(self):
         controller, callbacks = self.make_controller()
         controller.begin_interactive_resize()
+        callbacks["set_grid_interactive_resize"].assert_called_once_with(True)
         proposed = wintypes.RECT(20, 30, 1220, 830)
         message = wintypes.MSG()
         message.hWnd = 123
-        message.message = WM_SIZING
+        message.message = 0x0214  # WM_SIZING
         message.lParam = ctypes.addressof(proposed)
 
         controller.handle_native_event(
             b"windows_generic_MSG",
             ctypes.addressof(message),
         )
+        message.message = WM_WINDOWPOSCHANGING
+        controller.handle_native_event(
+            b"windows_generic_MSG",
+            ctypes.addressof(message),
+        )
+        callbacks["sync_backdrop_geometry_now"].assert_not_called()
 
-        callbacks["sync_backdrop_proposed_rect"].assert_called_once_with(
-            20,
-            30,
-            1220,
-            830,
+        message.message = WM_WINDOWPOSCHANGED
+        controller.handle_native_event(
+            b"windows_generic_MSG",
+            ctypes.addressof(message),
+        )
+        callbacks["sync_backdrop_geometry_now"].assert_called_once_with()
+        controller.end_interactive_resize()
+        self.assertEqual(
+            [call.args for call in callbacks["set_grid_interactive_resize"].call_args_list],
+            [(True,), (False,)],
         )

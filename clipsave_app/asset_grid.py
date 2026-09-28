@@ -70,6 +70,28 @@ class PaperPeelState:
     waiting_for_result: bool = False
 
 
+@dataclass(slots=True)
+class ResizeReflowState:
+    positions: dict[int, tuple[QPointF, QPointF]]
+    elevated_rows: set[int]
+    under_rows: set[int]
+    overlay: AssetGridTransitionOverlay
+    started: float
+    scroll_offset: int
+    duration: float = 0.15
+
+    def progress(self) -> float:
+        elapsed = min(1.0, (time.monotonic() - self.started) / self.duration)
+        return 1.0 - (1.0 - elapsed) ** 3
+
+    def position(self, row: int) -> QPointF | None:
+        pair = self.positions.get(row)
+        if pair is None:
+            return None
+        start, end = pair
+        return start + (end - start) * self.progress()
+
+
 class AssetGrid(QListView):
     item_selected = Signal(int)
     selection_cleared = Signal()
@@ -138,6 +160,13 @@ class AssetGrid(QListView):
         self._layout_updates_suspended = False
         self._layout_update_pending = False
         self._layout_resize_mode = None
+        self._interactive_resize_active = False
+        self._resize_reflow: ResizeReflowState | None = None
+        self._resize_viewport_was_opaque: bool | None = None
+        self._resize_reflow_timer = QTimer(self)
+        self._resize_reflow_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._resize_reflow_timer.setInterval(8)
+        self._resize_reflow_timer.timeout.connect(self._advance_resize_reflow)
         self._thumbnail_loader = self._make_thumbnail_queue(self)
         self._thumbnail_session = ThumbnailSession(self._thumbnail_loader)
         self._thumbnail_loader.decoded.connect(self._thumbnail_decoded)
@@ -155,7 +184,10 @@ class AssetGrid(QListView):
         self._paper_animation.setInterval(16)
         self._paper_animation.timeout.connect(self._advance_paper_animation)
         self._favorite_reflow_animation = QTimer(self)
-        self._favorite_reflow_animation.setInterval(16)
+        self._favorite_reflow_animation.setTimerType(Qt.TimerType.PreciseTimer)
+        self._favorite_reflow_animation.setInterval(
+            round(1000 / Sidebar.MAX_ANIMATION_REFRESH_RATE)
+        )
         self._favorite_reflow_animation.timeout.connect(self._advance_favorite_reflow)
         self._favorite_reflow_started = 0.0
         self._favorite_reflow_duration = Sidebar.ANIMATION_DURATION_MS / 1000.0
@@ -166,6 +198,7 @@ class AssetGrid(QListView):
         self.selectionModel().currentChanged.connect(self._index_selected)
         self.selectionModel().selectionChanged.connect(self._selection_changed)
         self.doubleClicked.connect(self._index_activated)
+        self.verticalScrollBar().valueChanged.connect(self._resize_reflow_scroll_changed)
         self.verticalScrollBar().valueChanged.connect(self._thumbnail_viewport_changed)
         self.verticalScrollBar().valueChanged.connect(lambda _value: self.cancel_paper_peel())
         self._middle_autoscroll = MiddleAutoScrollController(self)
@@ -211,12 +244,16 @@ class AssetGrid(QListView):
         )
         old_rects_by_id: dict[int, QRectF] = {}
         if animate_favorite_reflow:
-            for row in range(self._asset_model.rowCount()):
+            nearby_rows = self._transition_controller.transition_rows(
+                max(1, self.columns), self.gridSize(), self.verticalScrollBar().value()
+            )
+            for row in nearby_rows:
                 index = self._asset_model.index(row, 0)
                 record = index.data(AssetItemModel.ItemRole)
                 if record is not None:
                     old_rects_by_id[int(record["id"])] = QRectF(self.visualRect(index))
         self.cancel_paper_peel()
+        self._clear_resize_reflow()
         self._favorite_reflow_animation.stop()
         self._clear_sidebar_transition(repaint=False)
         self._right_click.cancel()
@@ -239,7 +276,10 @@ class AssetGrid(QListView):
         cards = []
         viewport_rect = QRectF(self.viewport().rect()).adjusted(-32, -32, 32, 32)
         moved = False
-        for row in range(self._asset_model.rowCount()):
+        nearby_rows = self._transition_controller.transition_rows(
+            max(1, self.columns), self.gridSize(), self.verticalScrollBar().value()
+        )
+        for row in nearby_rows:
             index = self._asset_model.index(row, 0)
             record = index.data(AssetItemModel.ItemRole)
             if record is None:
@@ -260,6 +300,14 @@ class AssetGrid(QListView):
             )
         if not moved or not self._transition_controller.begin_reflow(cards):
             return
+        screen = self.screen()
+        refresh_rate = float(screen.refreshRate()) if screen is not None else 60.0
+        if refresh_rate < 30.0:
+            refresh_rate = 60.0
+        refresh_rate = min(Sidebar.MAX_ANIMATION_REFRESH_RATE, refresh_rate)
+        self._favorite_reflow_animation.setInterval(
+            max(1, round(1000.0 / refresh_rate))
+        )
         self._favorite_reflow_started = time.monotonic()
         self._favorite_reflow_animation.start()
         self.viewport().update()
@@ -271,20 +319,212 @@ class AssetGrid(QListView):
         elapsed = time.monotonic() - self._favorite_reflow_started
         progress = min(1.0, elapsed / max(0.001, self._favorite_reflow_duration))
         eased = 1.0 - (1.0 - progress) ** 3
-        self._transition_controller.set_progress(eased)
         if progress < 1.0:
+            self._transition_controller.set_progress(eased)
             return
+        overlay = self._sidebar_transition_overlay
+        if overlay is not None:
+            overlay.set_progress(1.0)
+            # The cached cards already match the final model positions. Paint
+            # that last cheap frame before releasing the overlay instead of
+            # synchronously repainting every live delegate at the finish line.
+            self.viewport().repaint()
         self._favorite_reflow_animation.stop()
-        self._clear_sidebar_transition(repaint=True)
+        self._clear_sidebar_transition(repaint=False)
         self._apply_pending_items_update()
 
     def resizeEvent(self, event) -> None:
+        old_columns = self.columns
+        old_size = self.gridSize()
+        old_scroll = self.verticalScrollBar().value()
+        previous_reflow = self._resize_reflow
+        previous_rects = (
+            {
+                row: QRectF(self._resize_reflow_rect(row, previous_reflow))
+                for row in previous_reflow.positions
+            }
+            if previous_reflow is not None else {}
+        )
         super().resizeEvent(event)
         if self._layout_updates_suspended:
             self._layout_update_pending = True
             return
         self._update_grid_size()
+        if self._interactive_resize_active and not self._sidebar_transition_active:
+            if old_columns != self.columns:
+                self._start_resize_reflow(
+                    old_columns, old_size, old_scroll, previous_rects,
+                )
+            elif self._resize_reflow is not None:
+                self._retarget_resize_reflow()
         self._thumbnail_refresh_timer.start()
+
+    def set_interactive_resize_active(self, active: bool) -> None:
+        active = bool(active)
+        if active == self._interactive_resize_active:
+            return
+        self._interactive_resize_active = active
+        self.delegate.clear_interactive_resize_caches()
+        if active:
+            self.cancel_paper_peel()
+        else:
+            # Refresh final-width text wrapping once, after the mouse drag.
+            self.viewport().update()
+
+    def _start_resize_reflow(
+        self, old_columns: int, old_size: QSize, old_scroll: int,
+        previous_rects: dict[int, QRectF],
+    ) -> None:
+        if old_columns < 1 or not self.isVisible() or self.model().rowCount() == 0:
+            return
+        self.doItemsLayout()
+        scroll = self.verticalScrollBar().value()
+        rows = set(self._transition_controller.transition_rows(
+            old_columns, old_size, old_scroll,
+        )) | set(self._transition_controller.transition_rows(
+            self.columns, self.gridSize(), scroll,
+        ))
+        visible = QRectF(self.viewport().rect()).adjusted(-32, -32, 32, 32)
+        positions: dict[int, tuple[QPointF, QPointF]] = {}
+        under: set[int] = set()
+        cards: list[GridTransitionCard] = []
+        for row in rows:
+            old_rect = self._transition_controller.transition_cell_rect(
+                row, old_columns, old_size, old_scroll,
+            )
+            end_rect = QRectF(self.visualRect(self.model().index(row, 0)))
+            start_rect = previous_rects.get(row)
+            if start_rect is None:
+                start_rect = QRectF(old_rect)
+                if (
+                    old_columns > self.columns
+                    and row % old_columns >= self.columns
+                    and old_rect.right() > self.viewport().width()
+                ):
+                    # The disappearing rightmost column cannot begin outside
+                    # the new window. Let it emerge from beneath the last
+                    # surviving card instead of flashing or showing a strip.
+                    anchor_row = row - (row % old_columns - (self.columns - 1))
+                    anchor = previous_rects.get(anchor_row)
+                    if anchor is None:
+                        anchor = self._transition_controller.transition_cell_rect(
+                            anchor_row, old_columns, old_size, old_scroll,
+                        )
+                    start_rect.moveTopLeft(anchor.topLeft())
+            if not start_rect.intersects(visible) and not end_rect.intersects(visible):
+                continue
+            start = start_rect.topLeft()
+            end = end_rect.topLeft()
+            if start_rect == end_rect:
+                continue
+            positions[row] = (start, end)
+            relocated = divmod(row, old_columns) != divmod(row, self.columns)
+            if relocated:
+                # Every card after a changed row boundary can change cells,
+                # not just the card in the added/removed edge column.  Keep
+                # that entire cascade behind cards that retain their cell.
+                under.add(row)
+            cards.append(GridTransitionCard(
+                row, start_rect, end_rect,
+            ))
+        if not positions:
+            self._clear_resize_reflow()
+            return
+        cards.sort(key=lambda card: (card.row not in under, card.row))
+        overlay = AssetGridTransitionOverlay(
+            self, cards, old_columns, self.columns,
+            clamp_to_viewport=True,
+            resize_reflow=True,
+        )
+        if self._resize_viewport_was_opaque is None:
+            viewport = self.viewport()
+            self._resize_viewport_was_opaque = viewport.testAttribute(
+                Qt.WidgetAttribute.WA_OpaquePaintEvent
+            )
+            viewport.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self._resize_reflow = ResizeReflowState(
+            positions, set(), under, overlay, time.monotonic(), scroll,
+        )
+        screen = self.screen()
+        refresh = float(screen.refreshRate()) if screen is not None else 60.0
+        if refresh < 30.0:
+            refresh = 60.0
+        self._resize_reflow_timer.setInterval(
+            max(1, round(1000.0 / min(Sidebar.MAX_ANIMATION_REFRESH_RATE, refresh)))
+        )
+        self._resize_reflow_timer.start()
+        self.viewport().update()
+
+    def _retarget_resize_reflow(self) -> None:
+        state = self._resize_reflow
+        if state is None:
+            return
+        # QListView will update its own layout as the viewport changes.  The
+        # transition overlay only needs the new cell geometry; forcing a full
+        # model layout on every resize event stalls the entire UI thread.
+        for row, (start, _end) in state.positions.items():
+            index = self.model().index(row, 0)
+            if index.isValid():
+                end_rect = self._transition_controller.transition_cell_rect(
+                    row, self.columns, self.gridSize(),
+                    self.verticalScrollBar().value(),
+                )
+                state.positions[row] = (start, end_rect.topLeft())
+                card = state.overlay._cards_by_row.get(row)
+                if card is not None:
+                    card.collapsed_rect = end_rect
+        self.viewport().update()
+
+    def _advance_resize_reflow(self) -> None:
+        state = self._resize_reflow
+        if state is None or state.progress() >= 1.0:
+            self._clear_resize_reflow()
+            self.viewport().update()
+        else:
+            dirty = state.overlay.set_progress(state.progress())
+            if not dirty.isEmpty():
+                self.viewport().update(dirty)
+
+    def _clear_resize_reflow(self) -> None:
+        self._resize_reflow_timer.stop()
+        self._resize_reflow = None
+        if self._resize_viewport_was_opaque is not None:
+            self.viewport().setAttribute(
+                Qt.WidgetAttribute.WA_OpaquePaintEvent,
+                self._resize_viewport_was_opaque,
+            )
+            self._resize_viewport_was_opaque = None
+
+    def _resize_reflow_rect(
+        self, row: int, state: ResizeReflowState,
+        progress: float | None = None,
+    ) -> QRect:
+        rect = self.visualRect(self.model().index(row, 0))
+        amount = state.progress() if progress is None else progress
+        card = state.overlay._cards_by_row.get(row)
+        return rect if card is None else state.overlay._card_rect(card, amount).toRect()
+
+    def _resize_reflow_scroll_changed(self, value: int) -> None:
+        state = self._resize_reflow
+        if state is None:
+            return
+        if not self._interactive_resize_active:
+            self._clear_resize_reflow()
+            return
+        delta = value - state.scroll_offset
+        if delta:
+            state.positions = {
+                row: (
+                    start - QPointF(0, delta),
+                    end - QPointF(0, delta),
+                )
+                for row, (start, end) in state.positions.items()
+            }
+            for card in state.overlay.cards:
+                card.expanded_rect.translate(0, -delta)
+                card.collapsed_rect.translate(0, -delta)
+            state.scroll_offset = value
+            self.viewport().update()
 
     def wheelEvent(self, event) -> None:
         scaled_event = half_speed_wheel_event(event, self._wheel_remainder)
@@ -296,6 +536,7 @@ class AssetGrid(QListView):
         if suspended == self._layout_updates_suspended:
             return
         if suspended:
+            self._clear_resize_reflow()
             self._layout_updates_suspended = True
             self._layout_update_pending = False
             self._layout_resize_mode = self.resizeMode()
@@ -326,7 +567,8 @@ class AssetGrid(QListView):
         available = max(210, self.viewport().width())
         columns, grid_size = self._layout_for_viewport_width(available)
         self.columns = columns
-        self.setGridSize(grid_size)
+        if self.gridSize() != grid_size:
+            self.setGridSize(grid_size)
 
     def begin_sidebar_transition(
         self,
@@ -385,6 +627,7 @@ class AssetGrid(QListView):
 
     def hideEvent(self, event) -> None:
         self.cancel_paper_peel()
+        self._clear_resize_reflow()
         self._favorite_reflow_animation.stop()
         self._middle_autoscroll.cancel()
         self._clear_sidebar_transition(repaint=False)
@@ -409,6 +652,7 @@ class AssetGrid(QListView):
 
     def closeEvent(self, event) -> None:
         self.cancel_paper_peel()
+        self._clear_resize_reflow()
         self._favorite_reflow_animation.stop()
         self._middle_autoscroll.cancel()
         self._clear_sidebar_transition(repaint=False)
@@ -489,20 +733,32 @@ class AssetGrid(QListView):
             self.viewport().update()
 
     def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        painter = QPainter(self.viewport())
         overlay = self._sidebar_transition_overlay
+        resize_reflow = self._resize_reflow
+        if (not self._sidebar_transition_active or overlay is None) and resize_reflow is None:
+            super().paintEvent(event)
+        painter = QPainter(self.viewport())
         if self._sidebar_transition_active and overlay is not None:
-            overlay.paint(painter, self.viewport().rect())
+            overlay.paint(painter, event.rect())
             self._paint_rows_outside_transition(
-                painter, set(overlay.paint_order_rows)
+                painter, set(overlay.paint_order_rows), event.rect(),
             )
+        elif resize_reflow is not None:
+            self._paint_resize_reflow(painter, resize_reflow, event.rect())
         elif self._asset_model.rowCount() == 0:
             painter.setPen(QColor("#a7adb7" if dark_theme_active() else "#7a8699"))
             painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, "没有找到符合条件的内容")
         else:
             self._paint_active_paper(painter)
         painter.end()
+
+    def _paint_resize_reflow(
+        self, painter: QPainter, state: ResizeReflowState, dirty_rect: QRect,
+    ) -> None:
+        state.overlay.paint(painter, dirty_rect)
+        self._paint_rows_outside_transition(
+            painter, set(state.overlay.paint_order_rows), dirty_rect,
+        )
 
     def _paint_active_paper(self, painter: QPainter) -> None:
         state = self._paper_peel
@@ -526,18 +782,15 @@ class AssetGrid(QListView):
         self.delegate.paint_transition_card(painter, option, index)
 
     def _paint_rows_outside_transition(
-        self, painter: QPainter, covered_rows: set[int]
+        self, painter: QPainter, covered_rows: set[int], dirty_rect: QRect,
     ) -> None:
         # The transition overlay only holds the captured row range; rows the
         # user scrolls into view during the animation would otherwise paint
         # as blank until the transition ends.
-        top_index = self.indexAt(self.viewport().rect().topLeft())
-        bottom_index = self.indexAt(self.viewport().rect().bottomLeft())
-        if not top_index.isValid() or not bottom_index.isValid():
-            return
-        for row in range(
-            max(0, top_index.row() - 1),
-            min(self._asset_model.rowCount(), bottom_index.row() + 2),
+        # Viewport corners often land in the inter-card gap, where indexAt
+        # returns an invalid index despite several rows being visible.
+        for row in self._transition_controller.transition_rows(
+            max(1, self.columns), self.gridSize(), self.verticalScrollBar().value(),
         ):
             if row in covered_rows:
                 continue
@@ -545,7 +798,7 @@ class AssetGrid(QListView):
             if not index.isValid():
                 continue
             rect = self.visualRect(index)
-            if rect.isEmpty() or not self.viewport().rect().intersects(rect):
+            if rect.isEmpty() or not dirty_rect.intersects(rect):
                 continue
             option = QStyleOptionViewItem()
             self.initViewItemOption(option)
@@ -622,6 +875,24 @@ class AssetGrid(QListView):
         overlay = self._sidebar_transition_overlay
         if self._sidebar_transition_active and overlay is not None:
             return overlay.index_at(point)
+        state = self._resize_reflow
+        if state is not None:
+            rows = set(self._transition_controller.transition_rows(
+                max(1, self.columns), self.gridSize(), self.verticalScrollBar().value(),
+            )) | state.positions.keys()
+            for row in sorted(
+                rows,
+                key=lambda value: (
+                    -1 if value in state.under_rows else
+                    1 if value in state.elevated_rows else 0,
+                    value,
+                ),
+                reverse=True,
+            ):
+                index = self.model().index(row, 0)
+                if index.isValid() and self._visual_rect_for_index(index).contains(point):
+                    return index
+            return QModelIndex()
         return self.indexAt(point)
 
     def _visual_rect_for_index(self, index: QModelIndex) -> QRect:
@@ -634,6 +905,10 @@ class AssetGrid(QListView):
             rect = overlay.card_rect(index.row())
             if rect is not None:
                 return rect.toRect()
+        state = self._resize_reflow
+        if state is not None and index.isValid():
+            if index.row() in state.positions:
+                return self._resize_reflow_rect(index.row(), state)
         return self.visualRect(index)
 
     def _favorite_rect_for_index(self, index: QModelIndex) -> QRect:

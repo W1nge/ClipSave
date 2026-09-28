@@ -22,7 +22,7 @@ from PySide6.QtCore import (
     Qt,
     QUrl,
 )
-from PySide6.QtGui import QColor, QEnterEvent, QImage, QPainter, QPixmap, QTextDocument, QWheelEvent
+from PySide6.QtGui import QColor, QEnterEvent, QImage, QMouseEvent, QPainter, QPixmap, QTextDocument, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -64,6 +64,18 @@ from clipsave_app.widgets import (
     _startfile_or_warn,
     thumbnail_pixmap,
 )
+
+
+class PaintCallCounter:
+    """Observe calls without retaining borrowed native QPainter arguments."""
+
+    def __init__(self, callback):
+        self.callback = callback
+        self.call_count = 0
+
+    def __call__(self, *args, **kwargs):
+        self.call_count += 1
+        return self.callback(*args, **kwargs)
 
 
 def asset_records(count: int, *, kind: str = "text", path: str | None = None) -> list[dict]:
@@ -1532,14 +1544,14 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.assertEqual(expanded_widths[-1], Sidebar.EXPANDED_WIDTH)
         sidebar.close()
 
-    def test_sidebar_uses_active_display_refresh_rate_for_one_precise_clock(self):
+    def test_sidebar_caps_precise_clock_to_a_renderable_frame_rate(self):
         sidebar = Sidebar()
         sidebar.show()
         self.app.processEvents()
         samples = []
         sidebar.width_animation_progress.connect(samples.append)
 
-        with patch.object(sidebar, "_display_refresh_rate", return_value=120.0):
+        with patch.object(sidebar, "_display_refresh_rate", return_value=240.0):
             sidebar.set_collapsed(True)
             self.assertEqual(sidebar.animation_refresh_rate, 120.0)
             self.assertEqual(sidebar.animation_frame_interval_ms, 8)
@@ -1674,14 +1686,14 @@ class ThumbnailPixmapTests(unittest.TestCase):
         end_rects = {card.row: card.collapsed_rect for card in overlay.cards}
 
         paint_count = 0
-        paint_transition_card = grid.delegate.paint_transition_card
+        paint_transition_content = overlay._paint_cached_content
 
         def count_transition_card(*args, **kwargs):
             nonlocal paint_count
             paint_count += 1
-            return paint_transition_card(*args, **kwargs)
+            return paint_transition_content(*args, **kwargs)
 
-        grid.delegate.paint_transition_card = count_transition_card
+        overlay._paint_cached_content = count_transition_card
         try:
             grid.set_layout_updates_suspended(True)
             grid.resize(grid.width() + 170, grid.height())
@@ -1715,7 +1727,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
             grid.finish_sidebar_transition()
             self.app.processEvents()
         finally:
-            grid.delegate.paint_transition_card = paint_transition_card
+            overlay._paint_cached_content = paint_transition_content
 
         self.assertFalse(grid._sidebar_transition_active)
         self.assertIsNone(grid._sidebar_transition_overlay)
@@ -1798,14 +1810,108 @@ class ThumbnailPixmapTests(unittest.TestCase):
                 state_count,
                 len(overlay.cards) * overlay.preview_frame_count,
             )
+            self.assertLessEqual(len(overlay._chrome_caches), 2)
 
-            for progress in (0.25, 0.5, 0.75):
-                grid.set_sidebar_transition_progress(progress)
-                grid.viewport().repaint()
+            with patch.object(
+                grid.delegate,
+                "paint_transition_card",
+                new=PaintCallCounter(grid.delegate.paint_transition_card),
+            ) as paint_full_card:
+                with patch.object(
+                    overlay,
+                    "_paint_cached_content",
+                    new=PaintCallCounter(overlay._paint_cached_content),
+                ) as paint_content:
+                    for progress in (0.25, 0.5, 0.75):
+                        grid.set_sidebar_transition_progress(progress)
+                        grid.viewport().repaint()
+                self.assertGreaterEqual(paint_content.call_count, len(overlay.cards))
+                self.assertLessEqual(paint_full_card.call_count, 6)
 
             self.assertEqual(render_preview.call_count, cache_render_count)
 
         grid.finish_sidebar_transition()
+        grid.close()
+
+    def test_grid_transition_skips_offscreen_preview_work_and_caps_frame_samples(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(40))
+        grid.show()
+        self.app.processEvents()
+
+        with patch.object(grid, "screen") as screen:
+            screen.return_value.refreshRate.return_value = 240.0
+            self.assertTrue(grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0))
+        overlay = grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+        self.assertLessEqual(overlay.preview_frame_count, 13)
+        visible = QRectF(grid.viewport().rect())
+        offscreen = [
+            card for card in overlay.cards
+            if not card.expanded_rect.united(card.collapsed_rect).intersects(visible)
+        ]
+        self.assertTrue(offscreen)
+        self.assertTrue(all(not card.preview_states for card in offscreen))
+        self.assertTrue(any(card.preview_states for card in overlay.cards))
+
+        grid.finish_sidebar_transition()
+        grid.close()
+
+    def test_seventy_visible_cards_share_chrome_during_sidebar_reorder(self):
+        grid = AssetGrid()
+        grid.resize(2460, 1570)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(70))
+        grid.show()
+        self.app.processEvents()
+        opaque_before = grid.viewport().testAttribute(
+            Qt.WidgetAttribute.WA_OpaquePaintEvent
+        )
+        self.assertTrue(grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0))
+        self.assertTrue(grid.viewport().testAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent))
+        overlay = grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+        self.assertEqual(len(overlay.cards), 70)
+        self.assertTrue(all(card.chrome_cache is not None for card in overlay.cards))
+        self.assertLessEqual(len(overlay._chrome_caches), 2)
+
+        with patch.object(
+            grid.delegate, "paint_transition_card",
+            new=PaintCallCounter(grid.delegate.paint_transition_card),
+        ) as paint_full_card:
+            grid.set_sidebar_transition_progress(0.5)
+            grid.viewport().repaint()
+        self.assertLessEqual(paint_full_card.call_count, 2)
+        self.assertLessEqual(len(overlay._chrome_caches), 4)
+        grid.finish_sidebar_transition()
+        self.assertEqual(
+            grid.viewport().testAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent),
+            opaque_before,
+        )
+        grid.close()
+
+    def test_transition_text_preview_bitmap_keeps_native_size(self):
+        grid = AssetGrid()
+        record = asset_records(1)[0]
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 245, 190)
+        option.font = grid.font()
+        preview = grid.delegate.preview_rect(option.rect)
+        cache = QPixmap(8, 8)
+        cache.fill(QColor("#ffffff"))
+        canvas = QImage(245, 190, QImage.Format.Format_ARGB32_Premultiplied)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        grid.delegate._paint_sheet(
+            painter, option, grid.model().index(0, 0), record,
+            QColor("#202020"), QColor("#202020"), cache,
+        )
+        painter.end()
+
+        self.assertEqual(canvas.pixelColor(preview.left() + 4, preview.top() + 4), QColor("#ffffff"))
+        self.assertEqual(canvas.pixelColor(preview.left() + 15, preview.top() + 4), QColor("#202020"))
         grid.close()
 
     def test_favorite_transition_preview_keeps_dark_text_on_yellow_paper(self):
@@ -1818,19 +1924,24 @@ class ThumbnailPixmapTests(unittest.TestCase):
         grid.show()
         self.app.processEvents()
 
+        dark_flags = []
+        original_paint_content = grid.delegate._paint_preview_content
+
+        def record_dark_flag(*args, **kwargs):
+            dark_flags.append(args[4])
+            return original_paint_content(*args, **kwargs)
+
         with patch.object(
             grid.delegate,
             "_paint_preview_content",
-            wraps=grid.delegate._paint_preview_content,
+            new=record_dark_flag,
         ) as paint_content:
             self.assertTrue(
                 grid.begin_sidebar_transition(Sidebar.EXPANDED_WIDTH, 0.0)
             )
 
-        self.assertTrue(paint_content.called)
-        self.assertTrue(
-            all(call.args[4] is False for call in paint_content.call_args_list)
-        )
+        self.assertTrue(dark_flags)
+        self.assertTrue(all(flag is False for flag in dark_flags))
         grid.finish_sidebar_transition()
         grid.close()
 
@@ -1845,6 +1956,10 @@ class ThumbnailPixmapTests(unittest.TestCase):
         grid.set_favorite_page_mode(True)
         grid.show()
         self.app.processEvents()
+        grid.viewport().repaint()
+        warm_cache_keys = {
+            pixmap.cacheKey() for pixmap in grid.delegate._card_caches.values()
+        }
 
         removed_row = 1
         old_third_rect = QRectF(grid.visualRect(grid.model().index(2, 0)))
@@ -1855,10 +1970,13 @@ class ThumbnailPixmapTests(unittest.TestCase):
             waiting_for_result=True,
         )
         remaining = [record for record in records if record["id"] != 2]
-        grid.set_items(remaining)
+        with patch.object(grid, "screen") as screen:
+            screen.return_value.refreshRate.return_value = 144.0
+            grid.set_items(remaining)
 
         self.assertTrue(grid._sidebar_transition_active)
         self.assertTrue(grid._favorite_reflow_animation.isActive())
+        self.assertEqual(grid._favorite_reflow_animation.interval(), 8)
         overlay = grid._sidebar_transition_overlay
         self.assertIsNotNone(overlay)
         moved_card = overlay._cards_by_row[1]
@@ -1868,9 +1986,116 @@ class ThumbnailPixmapTests(unittest.TestCase):
             grid.visualRect(grid.model().index(1, 0)),
         )
         self.assertNotEqual(moved_card.expanded_rect, moved_card.collapsed_rect)
+        self.assertTrue(all(card.full_cache is not None for card in overlay.cards))
+        self.assertTrue(all(
+            card.full_cache.cacheKey() in warm_cache_keys for card in overlay.cards
+        ))
+        with patch.object(grid.delegate, "paint_transition_card") as paint_card:
+            grid.set_sidebar_transition_progress(0.5)
+            grid.viewport().repaint()
+        paint_card.assert_not_called()
+
+        grid._favorite_reflow_started -= 1.0
+        with patch.object(grid.delegate, "paint_transition_card") as paint_card:
+            grid._advance_favorite_reflow()
+        paint_card.assert_not_called()
+        self.assertFalse(grid._favorite_reflow_animation.isActive())
+        self.assertIsNone(grid._sidebar_transition_overlay)
 
         grid.finish_sidebar_transition()
         self.assertFalse(grid._favorite_reflow_animation.isActive())
+        grid.close()
+
+    def test_card_bitmap_cache_invalidates_when_visible_content_changes(self):
+        grid = AssetGrid()
+        grid.resize(600, 400)
+        grid.set_preview_loading_enabled(False)
+        record = asset_records(1)[0]
+        grid.set_items([record])
+        grid.show()
+        self.app.processEvents()
+        grid.viewport().repaint()
+        self.assertEqual(len(grid.delegate._card_caches), 1)
+        with patch.object(
+            grid.delegate, "paint_transition_card",
+            new=PaintCallCounter(grid.delegate.paint_transition_card),
+        ) as paint_card:
+            grid.viewport().repaint()
+        self.assertEqual(paint_card.call_count, 0)
+
+        edited = dict(record, content="修改后的文字")
+        grid.set_items([edited])
+        grid.viewport().repaint()
+        self.assertEqual(len(grid.delegate._card_caches), 2)
+        grid.model().set_favorite(edited["id"], True)
+        grid.viewport().repaint()
+        self.assertEqual(len(grid.delegate._card_caches), 3)
+        grid.close()
+
+    def test_card_bitmap_cache_is_bounded(self):
+        grid = AssetGrid()
+        grid.resize(1100, 700)
+        grid.set_preview_loading_enabled(False)
+        grid.delegate.CARD_CACHE_LIMIT = 2
+        grid.set_items(asset_records(8))
+        grid.show()
+        self.app.processEvents()
+        grid.viewport().repaint()
+
+        self.assertEqual(len(grid.delegate._card_caches), 2)
+        self.assertLessEqual(
+            grid.delegate._card_cache_bytes, grid.delegate.CARD_CACHE_BYTES,
+        )
+        grid.close()
+
+    def test_live_resize_reuses_text_preview_until_drag_ends(self):
+        grid = AssetGrid()
+        grid.resize(650, 400)
+        grid.set_preview_loading_enabled(False)
+        grid.set_items(asset_records(1))
+        grid.show()
+        self.app.processEvents()
+        grid.viewport().repaint()
+        normal_cache_count = len(grid.delegate._card_caches)
+
+        grid.set_interactive_resize_active(True)
+        try:
+            for width in (660, 670, 680):
+                grid.resize(width, 400)
+                self.app.processEvents()
+                grid.viewport().repaint()
+            self.assertEqual(len(grid.delegate._interactive_resize_previews), 1)
+            self.assertEqual(len(grid.delegate._card_caches), normal_cache_count)
+        finally:
+            grid.set_interactive_resize_active(False)
+        self.assertFalse(grid.delegate._interactive_resize_previews)
+        grid.viewport().repaint()
+        self.assertGreater(len(grid.delegate._card_caches), normal_cache_count)
+        grid.close()
+
+    def test_favorite_reflow_only_inspects_rows_near_the_viewport(self):
+        grid = AssetGrid()
+        grid.resize(2460, 1570)
+        grid.set_preview_loading_enabled(False)
+        records = asset_records(1001)
+        for record in records:
+            record["favorite"] = 1
+        grid.set_items(records)
+        grid.set_favorite_page_mode(True)
+        grid.show()
+        self.app.processEvents()
+        grid._paper_peel = PaperPeelState(
+            0, QPointF(), QPointF(), waiting_for_result=True,
+        )
+
+        with patch.object(grid, "visualRect", wraps=grid.visualRect) as visual_rect:
+            grid.set_items(records[1:])
+
+        overlay = grid._sidebar_transition_overlay
+        self.assertIsNotNone(overlay)
+        self.assertLess(visual_rect.call_count, 200)
+        self.assertGreaterEqual(sum(card.full_cache is not None for card in overlay.cards), 70)
+        grid.finish_sidebar_transition()
         grid.close()
 
     def test_grid_hiding_releases_transition_pixmap_caches(self):
@@ -1938,7 +2163,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
         with patch.object(
             grid.delegate,
             "_paint_preview_content",
-            wraps=grid.delegate._paint_preview_content,
+            new=PaintCallCounter(grid.delegate._paint_preview_content),
         ) as paint_content:
             repeated = widgets_module._AssetGridTransitionOverlay(
                 grid,
@@ -2097,7 +2322,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
         with patch.object(
             grid.delegate,
             "_draw_plain_text_preview",
-            wraps=grid.delegate._draw_plain_text_preview,
+            new=PaintCallCounter(grid.delegate._draw_plain_text_preview),
         ) as draw_plain_text:
             grid.delegate._paint_preview_content(
                 painter,
@@ -2108,7 +2333,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
                 font,
             )
         painter.end()
-        draw_plain_text.assert_called_once()
+        self.assertEqual(draw_plain_text.call_count, 1)
         grid.close()
 
     def test_transition_preview_cache_uses_the_exact_view_font(self):
@@ -2134,7 +2359,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
         with patch.object(
             grid.delegate,
             "_paint_preview_content",
-            side_effect=record_rendered_font,
+            new=PaintCallCounter(record_rendered_font),
         ) as paint_content:
             preview = grid.delegate.render_transition_preview(
                 index,
@@ -2286,6 +2511,25 @@ class ThumbnailPixmapTests(unittest.TestCase):
             self.app.setProperty("darkTheme", previous_theme)
             grid.close()
 
+    def test_transition_paints_uncovered_rows_even_when_viewport_corners_are_gaps(self):
+        grid = AssetGrid()
+        grid.resize(600, 400)
+        grid.set_items(asset_records(20))
+        grid.show()
+        self.app.processEvents()
+        canvas = QImage(grid.viewport().size(), QImage.Format.Format_ARGB32_Premultiplied)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        try:
+            with patch.object(grid, "indexAt", side_effect=AssertionError("gap lookup")), patch.object(
+                grid.delegate, "paint_transition_card"
+            ) as paint_card:
+                grid._paint_rows_outside_transition(painter, set(), grid.viewport().rect())
+            self.assertGreater(paint_card.call_count, 0)
+        finally:
+            painter.end()
+            grid.close()
+
     def test_grid_transition_elevates_every_added_column_card_both_directions(self):
         expected = [4, 9, 14, 19]
         self.assertEqual(
@@ -2360,9 +2604,9 @@ class ThumbnailPixmapTests(unittest.TestCase):
         for card, time_rect, _favorite in header_samples:
             self.assertEqual(
                 time_rect.left() - card.left(),
-                max(12, round(card.width() * 0.08)),
+                max(12, round(card.width() * 0.08)) - 1,
             )
-            self.assertEqual(card.right() - time_rect.right(), 36)
+            self.assertEqual(card.right() - time_rect.right(), 37)
         for element_index in (1, 2):
             x_positions = [sample[element_index].x() for sample in header_samples]
             self.assertTrue(
@@ -2404,13 +2648,46 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
     def test_large_markdown_uses_plain_text_instead_of_blocking_rich_parse(self):
         content = "# heading\n" + ("x" * (MAX_RICH_MARKDOWN_BYTES + 1))
-        with patch.object(_SafeMarkdownBrowser, "setMarkdown") as set_markdown, patch.object(
-            _SafeMarkdownBrowser, "setPlainText"
-        ) as set_plain_text:
+        with patch.object(_SafeMarkdownBrowser, "setPlainText") as set_plain_text:
             dialog = MarkdownDialog("Large", content)
 
         set_plain_text.assert_called_once_with(content)
-        set_markdown.assert_not_called()
+        dialog.close()
+
+    def test_markdown_dialog_keeps_content_after_literal_angle_brackets(self):
+        content = "# Daily export\n\n---\n\n**04:56:52**\n\ncd <project>\n\n---\n\n**13:48:39**\n\nLater entry"
+        dialog = MarkdownDialog("Daily", content)
+
+        rendered = dialog.browser.toPlainText()
+        self.assertIn("cd <project>", rendered)
+        self.assertIn("13:48:39", rendered)
+        self.assertIn("Later entry", rendered)
+        dialog.close()
+
+    def test_markdown_dialog_title_bar_drag_moves_window(self):
+        dialog = MarkdownDialog("Daily", "content")
+        dialog.move(100, 100)
+        dialog.show()
+        self.app.processEvents()
+        bar = dialog.findChild(QFrame, "DialogTitleBar")
+        self.assertIsNotNone(bar)
+        origin = bar.mapToGlobal(QPoint(30, 20))
+        target = origin + QPoint(26, 14)
+        for event_type, global_pos, buttons in (
+            (QEvent.Type.MouseButtonPress, origin, Qt.MouseButton.LeftButton),
+            (QEvent.Type.MouseMove, target, Qt.MouseButton.LeftButton),
+            (QEvent.Type.MouseButtonRelease, target, Qt.MouseButton.NoButton),
+        ):
+            event = QMouseEvent(
+                event_type,
+                QPointF(30, 20),
+                QPointF(global_pos),
+                Qt.MouseButton.LeftButton if event_type != QEvent.Type.MouseMove else Qt.MouseButton.NoButton,
+                buttons,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            QApplication.sendEvent(bar, event)
+        self.assertEqual(dialog.pos(), QPoint(126, 114))
         dialog.close()
 
 
@@ -2418,6 +2695,26 @@ class WidgetSafetyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_translucent_acrylic_surfaces_remain_mouse_hit_testable(self):
+        for widget_type, name in (
+            (QFrame, "WindowTitleBar"),
+            (QFrame, "TopBar"),
+            (QWidget, "Sidebar"),
+        ):
+            with self.subTest(surface=name):
+                host = QWidget()
+                host.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+                host.resize(100, 100)
+                surface = widget_type(host)
+                surface.setObjectName(name)
+                surface.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                surface.resize(100, 100)
+                host.setStyleSheet(DARK_STYLESHEET)
+                host.show()
+                self.app.processEvents()
+                self.assertEqual(host.grab().toImage().pixelColor(50, 50).alpha(), 1)
+                host.close()
 
     def test_sidebar_tag_color_icon_survives_active_state_refresh(self):
         sidebar = Sidebar()

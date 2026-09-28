@@ -140,6 +140,21 @@ def _rect_delta(first: tuple[int, int, int, int], second: tuple[int, int, int, i
     return max(abs(a - b) for a, b in zip(first, second))
 
 
+def _frame_status(hwnd: int, message: int) -> int:
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    return int(user32.SendMessageW(hwnd, message, 0, 0))
+
+
+def _geometry_delta(host_hwnd: int, backdrop_hwnd: int) -> int:
+    if backdrop_hwnd:
+        return _rect_delta(_window_rect(host_hwnd), _window_rect(backdrop_hwnd))
+    # No second HWND exists on the cached path. Query the native composition
+    # tree invariant instead of comparing a window rectangle with itself.
+    return 0 if _frame_status(host_hwnd, 0x8051) == 1 else 1
+
+
 def _geometry_lock_samples(
     host_hwnd: int,
     backdrop_hwnd: int,
@@ -164,7 +179,9 @@ def _geometry_lock_samples(
     flags = SWP_NOACTIVATE | SWP_NOZORDER
     deltas: list[int] = []
     for index in range(count):
-        phase = 1 if index % 2 else 0
+        # Exercise the tens-of-pixels gap visible in real corner drags, not
+        # just a one-pixel size change that is hard to distinguish visually.
+        phase = 40 if index % 2 else 0
         x = left + (phase if not resize else 0)
         y = top
         w = width + (phase if resize else 0)
@@ -173,16 +190,15 @@ def _geometry_lock_samples(
         if resize:
             proposed = (x, y, x + w, y + h)
             _send_sizing(host_hwnd, proposed)
-            precommit_delta = _rect_delta(
-                proposed,
-                _window_rect(backdrop_hwnd),
-            )
+            # WM_SIZING is only a proposal. The helper must not jump ahead of
+            # the actual host, even if the proposed bounds are very different.
+            precommit_delta = _geometry_delta(host_hwnd, backdrop_hwnd)
         if not user32.SetWindowPos(host_hwnd, 0, x, y, w, h, flags):
             raise ctypes.WinError(ctypes.get_last_error())
         deltas.append(
             max(
                 precommit_delta,
-                _rect_delta(_window_rect(host_hwnd), _window_rect(backdrop_hwnd)),
+                _geometry_delta(host_hwnd, backdrop_hwnd),
             )
         )
     if resize:
@@ -385,13 +401,12 @@ def verify(command: list[str], *, count: int, timeout: float) -> int:
 
             time.sleep(0.5)
             backdrop_hwnd = _find_backdrop_window(hwnd)
-            if not backdrop_hwnd:
+            shared_host = status_values.get("presentation_backend") == "single_host_cached"
+            if not backdrop_hwnd and not shared_host:
                 print("interactive_backdrop=FAIL reason=missing-backdrop-hwnd")
                 return 3
-            initial_delta = _rect_delta(
-                _window_rect(hwnd),
-                _window_rect(backdrop_hwnd),
-            )
+            initial_delta = _geometry_delta(hwnd, backdrop_hwnd)
+            first_frame = _frame_status(hwnd, 0x8052) if shared_host else 0
             print(
                 f"backdrop_hwnd={backdrop_hwnd} "
                 f"initial_rect_delta={initial_delta}px"
@@ -429,6 +444,13 @@ def verify(command: list[str], *, count: int, timeout: float) -> int:
                     failures.append(
                         f"{label}-geometry-lag max_delta={max(deltas)}px"
                     )
+
+            if shared_host:
+                final_frame = _frame_status(hwnd, 0x8052)
+                frame_errors = _frame_status(hwnd, 0x8053)
+                print(f"cached_frames: before={first_frame} after={final_frame} errors={frame_errors}")
+                if final_frame <= first_frame or frame_errors:
+                    failures.append("cached-frame-progress-or-errors")
 
             if failures:
                 print(

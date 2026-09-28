@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.5 - 2026-09-29
+
+- On Windows 10, Acrylic and the Qt foreground now share one native window and composition clip. Resizing from the left/top keeps their edges aligned while the cached Qt backing store drives live card reflow.
+- Connected keyboard and Chinese IME input to that host, including focus recovery after resize, candidate positioning, and normal minimize/tray/close behavior.
+- Reused card and text preview caches during resize and sidebar transitions, preserving text size and improving reflow performance for large grids.
+- Upgraded PySide6/Qt to 6.9.3 to fix repeated `qt_imageToWinHBITMAP, failed to create dibsection` errors and UI stalls when dragging the window over the taskbar.
+- Deleting an item now keeps the detail panel open instead of collapsing it while the grid updates.
+- Tuned dark-mode Acrylic to blur 10, saturation 2.0 and #181B20 tint at 100/255 alpha; removed the top and sidebar black overlays and set the search overlay to 100/255.
+- Moved card timestamps left by 1 px, kept text previews at a fixed font size during card movement, restored dragging on frameless windows with an imperceptible Acrylic hit-test layer, and prevented raw HTML in captured Markdown from hiding later entries.
+- Hardened clipboard capture, background-job cancellation, usage-journal recovery and schema downgrade handling; improved Markdown previews and error diagnostics.
+
 ## 1.1.4 - 2026-09-25
 
 - Re-capturing existing text or images now reuses the stored item and moves it to the top of the newest ordering instead of being silently ignored. Usage is recorded as plain-text lines in a human-readable journal under `Data\Usage`, so the database schema stays at v5 and remains openable by every earlier release.

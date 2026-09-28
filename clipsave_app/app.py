@@ -138,10 +138,20 @@ def _smoke_backdrop_status(window) -> str:
     )
     backdrop_success = bool(getattr(backdrop_result, "success", False))
     backdrop_error = getattr(backdrop_result, "native_error", None)
+    host = getattr(window, "_composition_host", None)
+    composition_status = ""
+    if getattr(window, "_composition_enabled", False) is True:
+        metrics = (host.frame_count, len(host.errors)) if host is not None else window._composition_metrics
+        composition_status = (
+            "presentation_backend=single_host_cached\n"
+            f"presentation_frames={metrics[0] if metrics else 0}\n"
+            f"presentation_errors={metrics[1] if metrics else 0}\n"
+        )
     return (
         f"backdrop_backend={backdrop_backend}\n"
         f"backdrop_success={backdrop_success}\n"
         f"backdrop_native_error={backdrop_error}\n"
+        + composition_status
     )
 
 
@@ -297,7 +307,8 @@ def main() -> int:
         except OSError as exc:
             startup_error = str(exc)
     try:
-        window = MainWindow(
+        from .composition_main_window import composition_window_class
+        window = composition_window_class(MainWindow)(
             database,
             settings,
             icon,

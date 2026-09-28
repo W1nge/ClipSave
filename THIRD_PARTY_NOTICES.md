@@ -9,8 +9,8 @@ ClipSave uses and distributes third-party software. This document records the ve
 | CPython runtime | 3.13.5 | Python Software Foundation License Version 2 | [CPython](https://github.com/python/cpython) |
 | OpenSSL runtime libraries | 3.x | Apache-2.0 | [OpenSSL](https://www.openssl.org/) |
 | SQLite runtime library | 3.x | Public domain | [SQLite](https://www.sqlite.org/) |
-| PySide6 Essentials | 6.9.1 | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only; Qt also offers commercial terms separately | [Qt for Python](https://code.qt.io/cgit/pyside/pyside-setup.git/) |
-| shiboken6 | 6.9.1 | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only; Qt also offers commercial terms separately | [Qt for Python](https://code.qt.io/cgit/pyside/pyside-setup.git/) |
+| PySide6 Essentials | 6.9.3 | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only; Qt also offers commercial terms separately | [Qt for Python](https://code.qt.io/cgit/pyside/pyside-setup.git/) |
+| shiboken6 | 6.9.3 | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only; Qt also offers commercial terms separately | [Qt for Python](https://code.qt.io/cgit/pyside/pyside-setup.git/) |
 | lucide Python package | 1.1.4 | MIT | [lucide-python](https://github.com/fmacedo/lucide-python) |
 | Pillow | 12.3.0 | HPND/Pillow license family; the 12.3.0 wheel's included license text describes it as MIT-CMU | [Pillow](https://github.com/python-pillow/Pillow) |
 | Send2Trash | 2.1.0 | BSD-3-Clause | [Send2Trash](https://github.com/arsenetar/send2trash) |
@@ -26,7 +26,7 @@ Official ClipSave release archives use PyInstaller `--onedir`. Qt dynamic librar
 
 Source retrieval information for the pinned Qt/PySide line:
 
-- Qt 6.9.1 source archive: [Qt 6.9.1 sources](https://download.qt.io/archive/qt/6.9/6.9.1/single/)
+- Qt 6.9.3 source archive: [Qt 6.9.3 sources](https://download.qt.io/archive/qt/6.9/6.9.3/single/)
 - Qt for Python/PySide source archive: [PySide6 release sources](https://download.qt.io/official_releases/QtForPython/pyside6/)
 - Qt licensing texts and FAQ: [Qt licensing](https://www.qt.io/licensing/)
 

@@ -32,6 +32,28 @@ class AssetTextLayoutTests(unittest.TestCase):
         self.assertEqual(transformed.replace("\u200b", ""), content)
         self.assertEqual(boundaries[-1], len(content))
 
+    def test_non_bmp_text_uses_qt_utf16_offsets(self):
+        content = "hello 😀 world"
+        transformed, boundaries = plain_text_layout_source(content)
+
+        self.assertEqual(len(boundaries), len(transformed.encode("utf-16-le")) // 2 + 1)
+        self.assertEqual(boundaries[-1], len(content))
+        self.assertEqual(
+            plain_text_layout_signature(content, 500, 180, QFont()),
+            ((0, len(content)),),
+        )
+
+    def test_non_bmp_text_with_machine_span_and_newline(self):
+        content = "Read https://example.com/😀\nnext line"
+        transformed, boundaries = plain_text_layout_source(content)
+
+        self.assertEqual(len(boundaries), len(transformed.encode("utf-16-le")) // 2 + 1)
+        self.assertEqual(boundaries[-1], len(content))
+        self.assertEqual(
+            plain_text_layout_signature(content, 500, 180, QFont()),
+            ((0, content.index("\n") + 1), (content.index("\n") + 1, len("next line"))),
+        )
+
     def test_signature_is_stable_for_same_inputs(self):
         font = QFont()
         first = plain_text_layout_signature("https://example.com/abcdef", 160, 180, font)

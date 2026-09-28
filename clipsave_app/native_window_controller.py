@@ -9,7 +9,6 @@ from .windows_frame import (
     WM_GETMINMAXINFO,
     WM_NCACTIVATE,
     WM_NCCALCSIZE,
-    WM_WINDOWPOSCHANGING,
     WM_WINDOWPOSCHANGED,
 )
 
@@ -20,7 +19,6 @@ WM_THEMECHANGED = 0x031A
 WM_DWMCOMPOSITIONCHANGED = 0x031E
 WM_ENTERSIZEMOVE = 0x0231
 WM_EXITSIZEMOVE = 0x0232
-WM_SIZING = 0x0214
 WM_NCHITTEST = 0x0084
 
 
@@ -83,12 +81,11 @@ class NativeWindowController:
         handle_nccalcsize: Callable[..., tuple[bool, int]],
         schedule_material_refresh: Callable[[], None],
         schedule_maximized_bounds_sync: Callable[[], None],
-        sync_backdrop_from_windowpos: Callable[[int], None],
         sync_backdrop_geometry_now: Callable[[], None],
-        sync_backdrop_proposed_rect: Callable[[int, int, int, int], None],
         sync_backdrop_window: Callable[[], None],
         schedule_soon: Callable[[Callable[[], None]], None],
         set_layout_updates_suspended: Callable[[bool], None],
+        set_grid_interactive_resize: Callable[[bool], None],
         sidebar_animation_active: Callable[[], bool],
         detail_animation_active: Callable[[], bool],
         resize_hit_test: Callable[..., int | None],
@@ -110,12 +107,11 @@ class NativeWindowController:
         self.handle_nccalcsize = handle_nccalcsize
         self.schedule_material_refresh = schedule_material_refresh
         self.schedule_maximized_bounds_sync = schedule_maximized_bounds_sync
-        self.sync_backdrop_from_windowpos = sync_backdrop_from_windowpos
         self.sync_backdrop_geometry_now = sync_backdrop_geometry_now
-        self.sync_backdrop_proposed_rect = sync_backdrop_proposed_rect
         self.sync_backdrop_window = sync_backdrop_window
         self.schedule_soon = schedule_soon
         self.set_layout_updates_suspended = set_layout_updates_suspended
+        self.set_grid_interactive_resize = set_grid_interactive_resize
         self.sidebar_animation_active = sidebar_animation_active
         self.detail_animation_active = detail_animation_active
         self.resize_hit_test = resize_hit_test
@@ -173,12 +169,16 @@ class NativeWindowController:
         if self.interactive_resize_active:
             return
         self.interactive_resize_active = True
-        self.set_layout_updates_suspended(True)
+        self.set_grid_interactive_resize(True)
+        # Keep the grid in Adjust mode so cards follow each committed window
+        # size instead of jumping to their new layout when the drag ends.
+        self.set_layout_updates_suspended(False)
 
     def end_interactive_resize(self) -> None:
         if not self.interactive_resize_active:
             return
         self.interactive_resize_active = False
+        self.set_grid_interactive_resize(False)
         if self.platform_check():
             self.schedule_soon(self.sync_backdrop_window)
         self.set_layout_updates_suspended(
@@ -235,24 +235,6 @@ class NativeWindowController:
                 return True, result
 
         interactive_resize = self.interactive_resize_active
-        if native_message == WM_SIZING and interactive_resize and msg.lParam:
-            try:
-                proposed = wintypes.RECT.from_address(int(msg.lParam))
-            except (TypeError, ValueError):
-                proposed = None
-            if proposed is not None:
-                # WM_SIZING arrives before Windows commits the host HWND's new
-                # bounds.  Move the no-redirection Acrylic helper now so DWM
-                # never has to expose an uncovered strip on fast expansion.
-                self.sync_backdrop_proposed_rect(
-                    int(proposed.left),
-                    int(proposed.top),
-                    int(proposed.right),
-                    int(proposed.bottom),
-                )
-        if native_message == WM_WINDOWPOSCHANGING and interactive_resize:
-            self.sync_backdrop_from_windowpos(int(msg.lParam))
-
         if native_message in (WM_WINDOWPOSCHANGED, WM_DPICHANGED):
             self.schedule_maximized_bounds_sync()
             if interactive_resize:

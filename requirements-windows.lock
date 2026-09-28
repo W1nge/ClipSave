@@ -1,7 +1,7 @@
-PySide6-Essentials==6.9.1 \
-    --hash=sha256:ad1ac94011492dba33051bc33db1c76a7d6f815a81c01422cb6220273b369145
-shiboken6==6.9.1 \
-    --hash=sha256:209ccf02c135bd70321143dcbc5023ae0c056aa4850a845955dd2f9b2ff280a9
+PySide6-Essentials==6.9.3 \
+    --hash=sha256:21f98077c135864473089e59a6a0bd828e64c6644b3dd7267b102da4a2ee8f21
+shiboken6==6.9.3 \
+    --hash=sha256:f1498176d2d5bcade7d662e1fc5143980fb008b6c78b966289d29a4ae86cd0c6
 lucide==1.1.4 \
     --hash=sha256:c2aa88a2bd7d99fcb56a9cdd4959cdf0c5ecd75f05d7ebbeb41010341639f449
 Pillow==12.3.0 \

@@ -79,6 +79,8 @@ class AssetGridDelegate(QStyledItemDelegate):
     CARD_RADIUS = 7.0
     CORNER_SIZE = 24
     CORNER_HIT_SIZE = 40
+    CARD_CACHE_LIMIT = 128
+    CARD_CACHE_BYTES = 96 * 1024 * 1024
 
     def __init__(self, view):
         super().__init__(view)
@@ -87,13 +89,25 @@ class AssetGridDelegate(QStyledItemDelegate):
         self._transition_renderer = AssetGridTransitionRenderer(self)
         self._transition_preview_caches = self._transition_renderer.preview_caches
         self._transition_layout_signatures = self._transition_renderer.layout_signatures
+        self._card_caches: OrderedDict[tuple[object, ...], QPixmap] = OrderedDict()
+        self._card_cache_bytes = 0
+        self._interactive_resize_previews: OrderedDict[tuple[object, ...], QPixmap] = OrderedDict()
+
+    def clear_interactive_resize_caches(self) -> None:
+        self._interactive_resize_previews.clear()
 
     def clear_transition_caches(self) -> None:
         self._transition_renderer.clear()
         self._markdown_documents.clear()
+        self._card_caches.clear()
+        self._card_cache_bytes = 0
+        self.clear_interactive_resize_caches()
 
     def clear_markdown_documents(self) -> None:
         self._markdown_documents.clear()
+        self._card_caches.clear()
+        self.clear_interactive_resize_caches()
+        self._card_cache_bytes = 0
 
     def sizeHint(self, option, index) -> QSize:
         return self.view.gridSize()
@@ -113,7 +127,7 @@ class AssetGridDelegate(QStyledItemDelegate):
             card.top() + 9,
             max(1, card.width() - left_inset - 36),
             24,
-        )
+        ).translated(-1, 0)
 
     def favorite_rect(self, rect: QRect) -> QRect:
         card = self.card_rect(rect)
@@ -250,10 +264,9 @@ class AssetGridDelegate(QStyledItemDelegate):
     def _paint_sheet(
         self, painter, option, index, record, fill, border, preview_cache=None,
         paint_outline: bool = True,
+        paint_content: bool = True,
     ) -> None:
         card = self.card_rect(option.rect)
-        dark = dark_theme_active()
-        yellow_paper = isinstance(fill, QColor) and fill.red() > fill.blue() * 2
         paper_rect = QRectF(card)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(fill)
@@ -262,11 +275,24 @@ class AssetGridDelegate(QStyledItemDelegate):
         # be clipped by the item's half-open raster bounds.
         if paint_outline:
             self._paint_card_outline(painter, paper_rect, border)
+        if paint_content:
+            self._paint_sheet_content(
+                painter, option, index, record, fill, preview_cache,
+            )
+
+    def _paint_sheet_content(
+        self, painter, option, index, record, fill, preview_cache=None,
+        timestamp_text: str | None = None,
+    ) -> None:
+        card = self.card_rect(option.rect)
+        dark = dark_theme_active()
+        yellow_paper = isinstance(fill, QColor) and fill.red() > fill.blue() * 2
         painter.setFont(option.font)
         painter.setPen(QColor("#34404e" if yellow_paper else "#d9e1eb" if dark else "#45576a"))
         painter.drawText(self.time_rect(option.rect),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                         format_card_timestamp(record["last_used_at"]))
+                         timestamp_text if timestamp_text is not None
+                         else format_card_timestamp(record["last_used_at"]))
         divider_y = card.top() + 41
         divider = (
             QColor(53, 62, 73, 48)
@@ -285,12 +311,10 @@ class AssetGridDelegate(QStyledItemDelegate):
                 painter.drawPixmap(self.transition_image_target(preview, preview_cache),
                                    preview_cache, QRectF(preview_cache.rect()))
             else:
-                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-                painter.drawPixmap(
-                    QRectF(preview),
-                    preview_cache,
-                    QRectF(preview_cache.rect()),
-                )
+                # Text is rendered with the view's font into the transition
+                # cache.  Scaling that bitmap as the card moves briefly
+                # changes the apparent font size between layout states.
+                painter.drawPixmap(preview.topLeft(), preview_cache)
             painter.restore()
         else:
             self._paint_preview_content(
@@ -316,14 +340,99 @@ class AssetGridDelegate(QStyledItemDelegate):
         local.end()
         return pixmap
 
+    def cached_card_pixmap(self, option, index) -> QPixmap | None:
+        record = index.data(AssetItemModel.ItemRole)
+        if record is None or record["kind"] == "image":
+            return None
+        kind = str(record["kind"])
+        content = str(record["content"] or "").strip() or str(record["title"])
+        preview_source = content[:2000 if kind == "markdown" else 330]
+        dpr = max(1.0, float(self.view.devicePixelRatioF()))
+        key = (
+            int(record["id"]), kind, preview_source,
+            str(record["last_used_at"]), bool(record["favorite"]),
+            option.rect.size().width(), option.rect.size().height(),
+            option.font.toString(), dpr, dark_theme_active(),
+            bool(getattr(self.view, "favorite_page_mode", False)),
+            dt.date.today(),
+        )
+        cached = self._card_caches.get(key)
+        if cached is not None:
+            self._card_caches.move_to_end(key)
+            return cached
+        width = max(1, option.rect.width())
+        height = max(1, option.rect.height())
+        cached = QPixmap(max(1, round(width * dpr)), max(1, round(height * dpr)))
+        cached.setDevicePixelRatio(dpr)
+        cached.fill(Qt.GlobalColor.transparent)
+        copy = QStyleOptionViewItem(option)
+        copy.rect = QRect(0, 0, width, height)
+        local = QPainter(cached)
+        self.paint_transition_card(local, copy, index)
+        local.end()
+        self._card_caches[key] = cached
+        self._card_cache_bytes += cached.width() * cached.height() * 4
+        while (
+            len(self._card_caches) > self.CARD_CACHE_LIMIT
+            or self._card_cache_bytes > self.CARD_CACHE_BYTES
+        ):
+            _old_key, old = self._card_caches.popitem(last=False)
+            self._card_cache_bytes -= old.width() * old.height() * 4
+        return cached
+
     def paint(self, painter, option, index) -> None:
         if getattr(self.view, "_sidebar_transition_active", False):
             return
         if getattr(self.view, "paper_peel_state", lambda _row: None)(index.row()) is not None:
             return
-        self.paint_transition_card(painter, option, index)
+        if getattr(self.view, "_interactive_resize_active", False):
+            record = index.data(AssetItemModel.ItemRole)
+            if record is not None and record["kind"] != "image":
+                # A full-card cache includes the exact cell dimensions. During
+                # a live resize that would regenerate every visible text card
+                # for nearly every mouse pixel. Keep its preview at native
+                # glyph size and redraw only the inexpensive paper geometry;
+                # normal text wrapping resumes when the drag ends.
+                key = (
+                    self.view.model().generation, index.row(),
+                    int(record["id"]), bool(record["favorite"]),
+                    option.font.toString(),
+                    round(self.view.devicePixelRatioF(), 3),
+                    dark_theme_active(),
+                )
+                preview = self._interactive_resize_previews.get(key)
+                if preview is None:
+                    preview = self.render_transition_preview(index, option.rect.size())
+                    if preview is not None:
+                        self._interactive_resize_previews[key] = preview
+                        while len(self._interactive_resize_previews) > 96:
+                            self._interactive_resize_previews.popitem(last=False)
+                self.paint_transition_card(painter, option, index, preview)
+                return
+        cached = self.cached_card_pixmap(option, index)
+        if cached is not None:
+            painter.drawPixmap(option.rect.topLeft(), cached)
+        else:
+            self.paint_transition_card(painter, option, index)
 
-    def paint_transition_card(self, painter, option, index, preview_cache=None) -> None:
+    def paint_transition_content(
+        self, painter, option, index, preview_cache=None,
+        *, record=None, timestamp_text: str | None = None,
+    ) -> None:
+        if record is None:
+            record = index.data(AssetItemModel.ItemRole)
+        if record is None:
+            return
+        dark = dark_theme_active()
+        front, _back, _border = self._paper_colors(bool(record["favorite"]), dark)
+        self._paint_sheet_content(
+            painter, option, index, record, front, preview_cache, timestamp_text,
+        )
+
+    def paint_transition_card(
+        self, painter, option, index, preview_cache=None,
+        *, paint_content: bool = True,
+    ) -> None:
         record = index.data(AssetItemModel.ItemRole)
         if record is None:
             return
@@ -368,10 +477,10 @@ class AssetGridDelegate(QStyledItemDelegate):
             painter.save()
             painter.setClipPath(card_shape)
             painter.setClipPath(removed_path, Qt.ClipOperation.IntersectClip)
-            self._paint_sheet(
-                painter, option, index, record, back, border, preview_cache,
-                paint_outline=False,
-            )
+            # Only the small exposed corner of the sheet beneath is visible.
+            # Its timestamp/preview are outside that clip, so laying them out
+            # again doubles the cost of every card without changing a pixel.
+            painter.fillPath(card_shape, back)
             painter.restore()
         painter.save()
         painter.setClipPath(card_shape)
@@ -379,7 +488,7 @@ class AssetGridDelegate(QStyledItemDelegate):
         if state is None:
             self._paint_sheet(
                 painter, option, index, record, front, border, preview_cache,
-                paint_outline=False,
+                paint_outline=False, paint_content=paint_content,
             )
             front_pixmap = None
         else:
@@ -461,14 +570,6 @@ class AssetGridDelegate(QStyledItemDelegate):
             painter.setClipPath(card_shape)
             painter.setClipPath(retained_path, Qt.ClipOperation.IntersectClip)
             self._paint_card_outline(painter, QRectF(card), border)
-            painter.restore()
-
-        if option.state & QStyle.State.State_Selected:
-            ring_rect = QRectF(card).adjusted(1.0, 1.0, -1.0, -1.0)
-            painter.save()
-            painter.setPen(QPen(QColor("#4da3ff") if dark else QColor("#2f7df6"), 2.0))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(ring_rect, self.CARD_RADIUS - 1.0, self.CARD_RADIUS - 1.0)
             painter.restore()
 
         if state is not None:

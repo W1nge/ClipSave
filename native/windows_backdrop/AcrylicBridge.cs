@@ -7,7 +7,7 @@ using Windows.UI.Composition.Desktop;
 
 namespace ClipSave.WindowsBackdrop;
 
-internal static class AcrylicBridge
+internal static partial class AcrylicBridge
 {
     private const int WcaAccentPolicy = 19;
     private const int AccentDisabled = 0;
@@ -43,7 +43,7 @@ internal static class AcrylicBridge
     private static Windows.UI.Color TintColor(bool dark)
     {
         return dark
-            ? Windows.UI.Color.FromArgb(0x58, 0x18, 0x1B, 0x20)
+            ? Windows.UI.Color.FromArgb(0x64, 0x18, 0x1B, 0x20)
             : Windows.UI.Color.FromArgb(0x48, 0xF6, 0xF7, 0xF9);
     }
 
@@ -204,7 +204,7 @@ internal static class AcrylicBridge
             GaussianBlurEffect blurEffect = new()
             {
                 Name = "BackdropBlur",
-                BlurAmount = 20.0f,
+                BlurAmount = dark ? 10.0f : 20.0f,
                 BorderMode = EffectBorderMode.Hard,
                 Optimization = EffectOptimization.Speed,
                 Source = new CompositionEffectSourceParameter("Backdrop"),
@@ -212,7 +212,7 @@ internal static class AcrylicBridge
             SaturationEffect acrylicEffect = new()
             {
                 Name = "BackdropSaturation",
-                Saturation = 1.25f,
+                Saturation = dark ? 2.0f : 1.25f,
                 Source = blurEffect,
             };
             _blurEffectFactory = _compositor.CreateEffectFactory(acrylicEffect);
@@ -271,6 +271,7 @@ internal static class AcrylicBridge
         try
         {
             _lastError = 0;
+            ReleaseFrames();
             _attachedHwnd = 0;
             try
             {

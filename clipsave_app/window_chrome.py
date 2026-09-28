@@ -21,7 +21,40 @@ from PySide6.QtWidgets import (
 from .ui_controls import AutoHideScrollBar, IconButton, ThemedSelectableLabel, lucide_icon
 
 
-class WindowTitleBar(QFrame):
+class _ManualWindowDrag:
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            window = self.window()
+            host = getattr(window, "_composition_host", None)
+            if host is not None and not host.closed:
+                host.start_system_move()
+                event.accept()
+                return
+            handle = window.windowHandle()
+            if handle is not None and handle.startSystemMove():
+                event.accept()
+                return
+            is_maximized = getattr(window, "_window_is_maximized", window.isMaximized)()
+            if not is_maximized and not window.isFullScreen():
+                self._drag_offset = event.globalPosition().toPoint() - window.pos()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        offset = getattr(self, "_drag_offset", None)
+        if offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class WindowTitleBar(_ManualWindowDrag, QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("WindowTitleBar")
@@ -55,14 +88,6 @@ class WindowTitleBar(QFrame):
         self.maximize_button.setToolTip(label)
         self.maximize_button.setAccessibleName(label)
 
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            handle = self.window().windowHandle()
-            if handle is not None and handle.startSystemMove():
-                event.accept()
-                return
-        super().mousePressEvent(event)
-
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             window = self.window()
@@ -77,15 +102,7 @@ class WindowTitleBar(QFrame):
         super().mouseDoubleClickEvent(event)
 
 
-class DraggableBar(QFrame):
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            handle = self.window().windowHandle()
-            if handle is not None and handle.startSystemMove():
-                event.accept()
-                return
-        super().mousePressEvent(event)
-
+class DraggableBar(_ManualWindowDrag, QFrame):
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             window = self.window()
@@ -294,4 +311,3 @@ class FluentMessageBox:
     def critical(cls, parent, title: str, message: str, *_args, **_kwargs):
         cls._exec(FluentMessageDialog(title, message, parent, kind="critical"))
         return QMessageBox.StandardButton.Ok
-

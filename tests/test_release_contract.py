@@ -11,6 +11,12 @@ from clipsave_app.constants import APP_VERSION
 
 
 class ReleaseContractTests(unittest.TestCase):
+    def test_release_stays_draft_until_desktop_gates_pass(self):
+        workflow = Path('.github/workflows/release.yml').read_text(encoding='utf-8')
+        publish = next(line for line in workflow.splitlines() if 'gh release create ' in line)
+        self.assertIn('--draft', publish)
+        self.assertNotIn('--latest', publish)
+
     def test_public_version_has_single_source(self):
         self.assertEqual(__version__, APP_VERSION)
         init_text = Path("clipsave_app/__init__.py").read_text(encoding="utf-8")

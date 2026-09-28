@@ -34,4 +34,11 @@ Both commands must pass. The interactive gate must also report:
 - `success=True`
 - `geometry_lock: max_delta=0px`
 
+For `single_host_cached`, geometry samples query the native composition tree:
+the background and foreground must share the root clip and relative bounds.
+The gate also requires new cached frames during resizing and zero callback errors.
+
 Do not publish a release when either visual gate is skipped or failing.
+
+The tag workflow uploads a **draft** release. Download its exact assets, run both
+desktop gates above, and only then publish the draft as the latest release.

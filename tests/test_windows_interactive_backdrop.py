@@ -1,12 +1,20 @@
 import unittest
+from unittest.mock import patch
 
 from verify_windows_interactive_backdrop import (
     _backdrop_status_failure,
     _performance_failure_reason,
+    _geometry_delta,
 )
 
 
 class InteractiveBackdropGateTests(unittest.TestCase):
+    def test_cached_geometry_requires_native_shared_clip_evidence(self):
+        with patch('verify_windows_interactive_backdrop._frame_status', return_value=1):
+            self.assertEqual(_geometry_delta(42, 0), 0)
+        with patch('verify_windows_interactive_backdrop._frame_status', return_value=0):
+            self.assertNotEqual(_geometry_delta(42, 0), 0)
+
     def test_single_scheduler_outlier_does_not_fail_performance_gate(self):
         values = [7.0] * 239 + [40.0]
         self.assertIsNone(_performance_failure_reason("resize", values))

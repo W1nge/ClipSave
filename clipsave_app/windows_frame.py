@@ -181,9 +181,8 @@ def enable_native_resize_frame(hwnd: int) -> bool:
 def create_backdrop_host_window() -> int | None:
     """Create a pure Win32, non-activating backdrop HWND owned by no UI toolkit.
 
-    Using a native helper rather than a second Qt top-level is important:
-    SetWindowPos can then be called synchronously from the host's
-    WM_WINDOWPOSCHANGING callback without re-entering Qt's window state machine.
+    A native helper can follow the committed host HWND bounds without
+    re-entering Qt's window state machine.
     """
     if not is_windows_qt_platform():
         return None

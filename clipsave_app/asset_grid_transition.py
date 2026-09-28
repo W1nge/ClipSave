@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QModelIndex, QPoint, QPointF, QRect, QRectF, QSize
-from PySide6.QtGui import QColor, QPainter, QPixmap, QRegion
+from PySide6.QtCore import QModelIndex, QPoint, QPointF, QRect, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import QListView, QStyle, QStyleOptionViewItem
 
+from .asset_grid_delegate import format_card_timestamp
 from .item_models import AssetItemModel
 from .sidebar import Sidebar
 from .ui_primitives import dark_theme_active
+
+_TIME_ALIGNMENT = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
 
 
 @dataclass(slots=True)
@@ -24,6 +27,15 @@ class _GridTransitionCard:
     elevated: bool = False
     preview_states: list[_GridTransitionPreviewState] = field(default_factory=list)
     preview_samples: list[int] = field(default_factory=list)
+    full_cache: QPixmap | None = None
+    chrome_cache: QPixmap | None = None
+    record: object | None = None
+    timestamp_text: str | None = None
+    paint_option: QStyleOptionViewItem | None = None
+    index: QModelIndex | None = None
+    text_color: QColor | None = None
+    divider_pen: QPen | None = None
+    kind: str = ""
 
 def _interpolate_rect(start: QRectF, end: QRectF, progress: float) -> QRectF:
     return QRectF(
@@ -49,6 +61,8 @@ def _grid_transition_card_elevated(
     return row % expanded_columns >= collapsed_columns
 
 class _AssetGridTransitionOverlay:
+    MAX_PREVIEW_SAMPLE_RATE = 60.0
+
     def __init__(
         self,
         view: QListView,
@@ -56,17 +70,26 @@ class _AssetGridTransitionOverlay:
         expanded_columns: int,
         collapsed_columns: int,
         initial_progress: float = 0.0,
+        cache_full_cards: bool = False,
+        clamp_to_viewport: bool = False,
+        resize_reflow: bool = False,
     ):
         self.view = view
         self.cards = cards
         self.expanded_columns = expanded_columns
         self.collapsed_columns = collapsed_columns
         self.progress = max(0.0, min(1.0, float(initial_progress)))
+        self.cache_full_cards = cache_full_cards
+        self.clamp_to_viewport = clamp_to_viewport
+        self.resize_reflow = resize_reflow
         screen = view.screen()
         refresh_rate = float(screen.refreshRate()) if screen is not None else 60.0
         if refresh_rate <= 0:
             refresh_rate = 60.0
-        refresh_rate = min(Sidebar.MAX_ANIMATION_REFRESH_RATE, refresh_rate)
+        # Preview line wrapping changes only at discrete widths. Motion may
+        # run at 120 Hz, but re-measuring text 120 times per second merely
+        # delays the first frame without adding intermediate visual states.
+        refresh_rate = min(self.MAX_PREVIEW_SAMPLE_RATE, refresh_rate)
         self.preview_frame_count = max(
             2,
             round(Sidebar.ANIMATION_DURATION_MS * refresh_rate / 1000.0) + 1,
@@ -76,6 +99,7 @@ class _AssetGridTransitionOverlay:
             *(card for card in cards if not card.elevated),
             *(card for card in cards if card.elevated),
         ]
+        self._chrome_caches: dict[tuple[object, ...], QPixmap] = {}
         self._prepare_preview_caches()
 
     @property
@@ -87,15 +111,52 @@ class _AssetGridTransitionOverlay:
         return [card.row for card in self._paint_cards if card.elevated]
 
     def _prepare_preview_caches(self) -> None:
+        visible = QRectF(self.view.viewport().rect())
         for card in self.cards:
+            # Keep the card in the transition for hit testing and scrolling,
+            # but avoid eager text layout for rows that never enter the view.
+            if not card.expanded_rect.united(card.collapsed_rect).intersects(visible):
+                continue
             index = self.view.model().index(card.row, 0)
             if not index.isValid():
                 continue
             record = index.data(AssetItemModel.ItemRole)
             if record is None:
                 continue
+            card.record = record
+            card.index = index
+            card.timestamp_text = format_card_timestamp(record["last_used_at"])
+            card.kind = str(record["kind"])
+            favorite = bool(record["favorite"])
+            dark = dark_theme_active()
+            card.text_color = QColor(
+                "#34404e" if favorite else "#d9e1eb" if dark else "#45576a"
+            )
+            card.divider_pen = QPen(
+                QColor(53, 62, 73, 48) if favorite
+                else QColor(142, 170, 200, 36) if dark
+                else QColor(57, 76, 96, 34),
+                1,
+            )
+            option = QStyleOptionViewItem()
+            self.view.initViewItemOption(option)
+            option.widget = self.view
+            option.state |= QStyle.StateFlag.State_Active | QStyle.StateFlag.State_Enabled
+            card.paint_option = option
+            if self.cache_full_cards and card.expanded_rect.size() == card.collapsed_rect.size():
+                self._cache_full_card(card, index)
+                continue
+            initial_size = _grid_transition_rect(card, self.progress).size()
+            card.chrome_cache = self._chrome_cache(card.row, record, initial_size)
             state_by_signature: dict[tuple[object, ...], int] = {}
-            if record["kind"] == "image":
+            if self.resize_reflow and record["kind"] != "image":
+                # A resize breakpoint can involve dozens of cards. Preparing
+                # every wrapping width before its first frame stalls the UI.
+                # Keep one final-layout preview.  Its glyphs stay at their
+                # normal size while the card moves, and the last animation
+                # frame matches the normal delegate without a content swap.
+                sample_progresses = [1.0]
+            elif record["kind"] == "image":
                 sample_progresses = [
                     max(
                         (0.0, 1.0),
@@ -136,8 +197,62 @@ class _AssetGridTransitionOverlay:
                     )
                 card.preview_samples.append(state_index)
 
-            if record["kind"] == "image":
+            if record["kind"] == "image" or self.resize_reflow:
                 card.preview_samples *= self.preview_frame_count
+
+    def _chrome_cache(
+        self, row: int, record, size,
+    ) -> QPixmap:
+        width = max(1, round(size.width()))
+        height = max(1, round(size.height()))
+        dpr = max(1.0, float(self.view.devicePixelRatioF()))
+        key = (
+            width, height, dpr, bool(record["favorite"]),
+            bool(getattr(self.view, "favorite_page_mode", False)), dark_theme_active(),
+        )
+        cached = self._chrome_caches.get(key)
+        if cached is not None:
+            return cached
+        cached = QPixmap(max(1, round(width * dpr)), max(1, round(height * dpr)))
+        cached.setDevicePixelRatio(dpr)
+        cached.fill(QColor(0, 0, 0, 0))
+        option = QStyleOptionViewItem()
+        self.view.initViewItemOption(option)
+        option.rect = QRect(0, 0, width, height)
+        option.widget = self.view
+        option.state |= QStyle.StateFlag.State_Active | QStyle.StateFlag.State_Enabled
+        painter = QPainter(cached)
+        self.view.delegate.paint_transition_card(
+            painter, option, self.view.model().index(row, 0), paint_content=False,
+        )
+        painter.end()
+        self._chrome_caches[key] = cached
+        return cached
+
+    def _cache_full_card(self, card: _GridTransitionCard, index: QModelIndex) -> None:
+        width = max(1, round(card.collapsed_rect.width()))
+        height = max(1, round(card.collapsed_rect.height()))
+        option = QStyleOptionViewItem()
+        self.view.initViewItemOption(option)
+        option.rect = QRect(0, 0, width, height)
+        option.widget = self.view
+        option.state |= QStyle.StateFlag.State_Active | QStyle.StateFlag.State_Enabled
+        if self.view.selectionModel().isSelected(index):
+            option.state |= QStyle.StateFlag.State_Selected
+        else:
+            option.state &= ~QStyle.StateFlag.State_Selected
+        cached = self.view.delegate.cached_card_pixmap(option, index)
+        if cached is not None:
+            card.full_cache = cached
+            return
+        dpr = max(1.0, float(self.view.devicePixelRatioF()))
+        cache = QPixmap(max(1, round(width * dpr)), max(1, round(height * dpr)))
+        cache.setDevicePixelRatio(dpr)
+        cache.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(cache)
+        self.view.delegate.paint_transition_card(painter, option, index)
+        painter.end()
+        card.full_cache = cache
 
     def preview_state_index(
         self,
@@ -170,14 +285,17 @@ class _AssetGridTransitionOverlay:
         previous = self.progress
         self.progress = progress
         dirty = QRegion()
+        visible = QRectF(self.view.viewport().rect())
         for card in self.cards:
+            if not card.expanded_rect.united(card.collapsed_rect).intersects(visible):
+                continue
             dirty |= QRegion(
-                _grid_transition_rect(card, previous)
+                self._card_rect(card, previous)
                 .toAlignedRect()
                 .adjusted(-2, -2, 2, 2)
             )
             dirty |= QRegion(
-                _grid_transition_rect(card, progress)
+                self._card_rect(card, progress)
                 .toAlignedRect()
                 .adjusted(-2, -2, 2, 2)
             )
@@ -185,12 +303,21 @@ class _AssetGridTransitionOverlay:
 
     def card_rect(self, row: int) -> QRectF | None:
         card = self._cards_by_row.get(row)
-        return None if card is None else _grid_transition_rect(card, self.progress)
+        return None if card is None else self._card_rect(card, self.progress)
+
+    def _card_rect(self, card: _GridTransitionCard, progress: float) -> QRectF:
+        rect = _grid_transition_rect(card, progress)
+        if self.clamp_to_viewport:
+            rect.moveLeft(min(
+                max(0.0, rect.left()),
+                max(0.0, self.view.viewport().width() - rect.width()),
+            ))
+        return rect
 
     def index_at(self, point: QPoint) -> QModelIndex:
         point_f = QPointF(point)
         for card in reversed(self._paint_cards):
-            if _grid_transition_rect(card, self.progress).contains(point_f):
+            if self._card_rect(card, self.progress).contains(point_f):
                 return self.view.model().index(card.row, 0)
         return QModelIndex()
 
@@ -205,10 +332,34 @@ class _AssetGridTransitionOverlay:
         )
         painter.setClipRect(rect)
         for card in self._paint_cards:
+            target = self._card_rect(card, self.progress)
+            if not target.intersects(QRectF(rect)):
+                continue
+            if card.full_cache is not None:
+                dpr = max(1.0, float(self.view.devicePixelRatioF()))
+                painter.drawPixmap(
+                    QPointF(round(target.x() * dpr) / dpr,
+                            round(target.y() * dpr) / dpr),
+                    card.full_cache,
+                )
+                continue
+            if card.chrome_cache is not None:
+                dpr = max(1.0, float(self.view.devicePixelRatioF()))
+                if card.record is None:
+                    continue
+                cache = self._chrome_cache(card.row, card.record, target.size())
+                card.chrome_cache = cache
+                snapped = QPointF(
+                    round(target.x() * dpr) / dpr,
+                    round(target.y() * dpr) / dpr,
+                )
+                painter.drawPixmap(snapped, cache)
+                self._draw_card(painter, card, target, content_only=True)
+                continue
             self._draw_card(
                 painter,
                 card,
-                _grid_transition_rect(card, self.progress),
+                target,
             )
 
     def _draw_card(
@@ -216,12 +367,14 @@ class _AssetGridTransitionOverlay:
         painter: QPainter,
         card: _GridTransitionCard,
         target: QRectF,
+        content_only: bool = False,
     ) -> None:
-        index = self.view.model().index(card.row, 0)
+        index = card.index or self.view.model().index(card.row, 0)
         if not index.isValid():
             return
-        option = QStyleOptionViewItem()
-        self.view.initViewItemOption(option)
+        option = card.paint_option or QStyleOptionViewItem()
+        if card.paint_option is None:
+            self.view.initViewItemOption(option)
         option.rect = QRect(
             0,
             0,
@@ -245,13 +398,49 @@ class _AssetGridTransitionOverlay:
             round(target.x() * dpr) / dpr,
             round(target.y() * dpr) / dpr,
         )
-        self.view.delegate.paint_transition_card(
-            painter,
-            option,
-            index,
-            self.preview_cache(card),
-        )
+        if content_only:
+            self._paint_cached_content(painter, option, card, index)
+        else:
+            self.view.delegate.paint_transition_card(
+                painter, option, index, self.preview_cache(card),
+            )
         painter.restore()
+
+    def _paint_cached_content(
+        self, painter: QPainter, option: QStyleOptionViewItem,
+        card: _GridTransitionCard, index: QModelIndex,
+    ) -> None:
+        cache = self.preview_cache(card)
+        if cache is None or card.text_color is None or card.divider_pen is None:
+            self.view.delegate.paint_transition_content(
+                painter, option, index, cache,
+                record=card.record, timestamp_text=card.timestamp_text,
+            )
+            return
+        cell = option.rect
+        paper = cell.adjusted(6, 6, -6, -6)
+        left_inset = max(12, round(paper.width() * 0.08))
+        time_rect = QRect(
+            paper.left() + left_inset - 1,
+            paper.top() + 9,
+            max(1, paper.width() - left_inset - 36),
+            24,
+        )
+        painter.setFont(option.font)
+        painter.setPen(card.text_color)
+        painter.drawText(time_rect, _TIME_ALIGNMENT, card.timestamp_text or "")
+        painter.setPen(card.divider_pen)
+        divider_y = paper.top() + 41
+        painter.drawLine(paper.left() + 12, divider_y, paper.right() - 12, divider_y)
+        preview = paper.adjusted(12, 54, -12, -12)
+        painter.setClipRect(preview, Qt.ClipOperation.IntersectClip)
+        if card.kind == "image":
+            painter.drawPixmap(
+                self.view.delegate.transition_image_target(preview, cache),
+                cache, QRectF(cache.rect()),
+            )
+        else:
+            painter.drawPixmap(preview.topLeft(), cache)
 
 
 GridTransitionCard = _GridTransitionCard

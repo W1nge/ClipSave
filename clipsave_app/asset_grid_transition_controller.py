@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, QSize
+from PySide6.QtCore import QRectF, QSize, Qt
 
 from .asset_grid_delegate import AssetGridDelegate
 from .asset_grid_transition import (
@@ -18,6 +18,17 @@ class AssetGridTransitionController:
         self.view = view
         self.active = False
         self.overlay: AssetGridTransitionOverlay | None = None
+        self._viewport_was_opaque: bool | None = None
+
+    def _activate(self) -> None:
+        viewport = self.view.viewport()
+        self._viewport_was_opaque = viewport.testAttribute(
+            Qt.WidgetAttribute.WA_OpaquePaintEvent
+        )
+        # The overlay fills every exposed pixel itself. Avoid Qt's extra
+        # background pass over a high-DPI viewport while cards are moving.
+        viewport.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.active = True
 
     @staticmethod
     def layout_for_viewport_width(width: int) -> tuple[int, QSize]:
@@ -146,7 +157,7 @@ class AssetGridTransitionController:
             end_columns,
             progress,
         )
-        self.active = True
+        self._activate()
         return True
 
     def set_progress(self, progress: float) -> None:
@@ -169,8 +180,9 @@ class AssetGridTransitionController:
             columns,
             columns,
             0.0,
+            cache_full_cards=True,
         )
-        self.active = True
+        self._activate()
         return True
 
     def clear(self, repaint: bool) -> None:
@@ -178,6 +190,11 @@ class AssetGridTransitionController:
             return
         self.active = False
         self.overlay = None
+        if self._viewport_was_opaque is not None:
+            self.view.viewport().setAttribute(
+                Qt.WidgetAttribute.WA_OpaquePaintEvent, self._viewport_was_opaque,
+            )
+            self._viewport_was_opaque = None
         if repaint and self.view.viewport().isVisible():
             self.view.viewport().repaint()
 
