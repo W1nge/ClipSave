@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.5 - 2026-09-29
+## 1.2.0 - 2026-09-29
 
 - On Windows 10, Acrylic and the Qt foreground now share one native window and composition clip. Resizing from the left/top keeps their edges aligned while the cached Qt backing store drives live card reflow.
 - Connected keyboard and Chinese IME input to that host, including focus recovery after resize, candidate positioning, and normal minimize/tray/close behavior.

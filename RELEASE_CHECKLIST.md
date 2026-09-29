@@ -15,21 +15,21 @@ git diff --check
 
 Build the Windows backdrop and the release package from a clean source tree.
 
-## Replacing the withdrawn 1.1.5 draft
+## Fresh 1.2.0 release
 
-The withdrawn `v1.1.5` originally pointed to `5a04f5a`, before the resize and UI
-repairs. Its old draft assets must not be published again. Ordinary release runs
-skip existing releases. To rebuild an unpublished draft, explicitly dispatch the
-release workflow with `tag=v1.1.5` and `replace_draft=true` after updating the tag
-to the reviewed commit. The workflow refuses to replace a published release and
-keeps the rebuilt release as a draft for desktop acceptance.
+Version 1.1.5 has been retired at the user's request. Remove its release, assets,
+and tag; do not recreate it or reuse any of its packaged binaries. Build 1.2.0
+from the current reviewed source under a new `v1.2.0` tag and new asset names.
 
-Before publishing the replacement, commit the reviewed changes, deliberately
-update the withdrawn tag/draft through the release process, and build fresh
-official artifacts. Verify that the tag's commit, packaged `BUILD_INFO.txt`,
-and reviewed source commit agree; verify both new asset checksums. Run the gates
-below against those exact new artifacts. Previous desktop results for `5a04f5a`
-do not validate the repaired release.
+Commit the reviewed source and build fresh official artifacts from a clean
+checkout. Verify that the tag's commit, packaged `BUILD_INFO.txt`, and reviewed
+source commit agree. Check that the executable version is 1.2.0 and verify both
+new asset checksums. Run the gates below against those exact new artifacts.
+
+Ordinary release runs skip existing releases. To rebuild an unpublished draft,
+explicitly dispatch the release workflow with its tag and `replace_draft=true`.
+The workflow refuses to replace a published release and keeps the rebuilt
+release as a draft until the publication checks are complete.
 
 ## Interactive Windows visual gates
 

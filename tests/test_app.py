@@ -152,8 +152,8 @@ class AppTests(unittest.TestCase):
         ]):
             self.assertEqual(constants._configured_local_root(), Path("C:/override"))
 
-    def test_release_version_is_1_1_5(self):
-        self.assertEqual(constants.APP_VERSION, "1.1.5")
+    def test_release_version_is_1_2_0(self):
+        self.assertEqual(constants.APP_VERSION, "1.2.0")
 
     @unittest.skipUnless(os.name == "nt", "Windows SID lookup is Windows-only")
     def test_windows_user_sid_uses_real_process_token(self):
