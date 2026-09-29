@@ -64,9 +64,20 @@ jobs:
             throw "Could not check tag $tag (HTTP $($tagResponse.StatusCode))"
           }
 
-          $releaseResponse = Invoke-WebRequest -Headers $headers -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" -SkipHttpErrorCheck
-          if ($releaseResponse.StatusCode -eq 200) {
-            $existingRelease = $releaseResponse.Content | ConvertFrom-Json
+          # The tag endpoint omits unpublished drafts. Enumerate authenticated
+          # releases so tag pushes cannot create a duplicate draft.
+          $matchingReleases = @()
+          $page = 1
+          do {
+            $releaseResponse = Invoke-WebRequest -Headers $headers -Uri "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100&page=$page" -SkipHttpErrorCheck
+            if ($releaseResponse.StatusCode -ne 200) { throw "Could not list releases (HTTP $($releaseResponse.StatusCode))" }
+            $releases = @($releaseResponse.Content | ConvertFrom-Json)
+            $matchingReleases += @($releases | Where-Object { $_.tag_name -eq $tag })
+            $page++
+          } while ($releases.Count -eq 100)
+          if ($matchingReleases.Count -gt 1) { throw "Multiple releases use $tag; resolve the duplicate drafts before rebuilding." }
+          if ($matchingReleases.Count -eq 1) {
+            $existingRelease = $matchingReleases[0]
             if ($env:REPLACE_DRAFT -eq 'true') {
               if (-not $existingRelease.draft) { throw 'Only unpublished drafts may be replaced.' }
               "replace_draft=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -76,10 +87,6 @@ jobs:
               exit 0
             }
           }
-          if ($releaseResponse.StatusCode -ne 200 -and $releaseResponse.StatusCode -ne 404) {
-            throw "Could not check release $tag (HTTP $($releaseResponse.StatusCode))"
-          }
-
           "should_release=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Checkout tagged source

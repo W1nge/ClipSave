@@ -30,19 +30,20 @@ function Invoke-WebRequest {
     return [pscustomobject]@{StatusCode=[int]$env:MOCK_STATUS; Content=$env:MOCK_RELEASE}
 }
 '''
-        for status, draft, replace, success, release, replaced in (
-            (200, True, True, True, True, True),
-            (200, False, True, False, False, False),
-            (200, True, False, True, False, False),
-            (404, False, False, True, True, False),
+        for payload, replace, success, release, replaced in (
+            ('[{"tag_name":"v1.1.5","draft":true}]', True, True, True, True),
+            ('[{"tag_name":"v1.1.5","draft":false}]', True, False, False, False),
+            ('[{"tag_name":"v1.1.5","draft":true}]', False, True, False, False),
+            ('[]', False, True, True, False),
+            ('[{"tag_name":"v1.1.5","draft":true},{"tag_name":"v1.1.5","draft":true}]', True, False, False, False),
         ):
-            with self.subTest(status=status, draft=draft, replace=replace), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(payload=payload, replace=replace), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 script = root / 'resolve.ps1'
                 script.write_text(mock + resolver, encoding='utf-8')
                 output = root / 'output.txt'
                 env = dict(os.environ, INPUT_TAG='v1.1.5', REPLACE_DRAFT=str(replace).lower(),
-                           MOCK_STATUS=str(status), MOCK_RELEASE='{"draft":' + str(draft).lower() + '}',
+                           MOCK_STATUS='200', MOCK_RELEASE=payload,
                            GITHUB_OUTPUT=str(output))
                 result = subprocess.run([shutil.which('pwsh'), '-NoProfile', '-File', str(script)],
                                         env=env, capture_output=True, timeout=30)
