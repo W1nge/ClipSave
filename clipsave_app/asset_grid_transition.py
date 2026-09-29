@@ -152,10 +152,9 @@ class _AssetGridTransitionOverlay:
             if self.resize_reflow and record["kind"] != "image":
                 # A resize breakpoint can involve dozens of cards. Preparing
                 # every wrapping width before its first frame stalls the UI.
-                # Keep one final-layout preview.  Its glyphs stay at their
-                # normal size while the card moves, and the last animation
-                # frame matches the normal delegate without a content swap.
-                sample_progresses = [1.0]
+                # Start with one current-width preview; preview_cache updates
+                # it lazily when the moving card crosses a wrap threshold.
+                sample_progresses = [self.progress]
             elif record["kind"] == "image":
                 sample_progresses = [
                     max(
@@ -195,6 +194,14 @@ class _AssetGridTransitionOverlay:
                             ),
                         )
                     )
+                elif record["kind"] != "image":
+                    state = card.preview_states[state_index]
+                    if state.cache is not None and not self.view.delegate.transition_preview_covers(
+                        state.cache, cell_size,
+                    ):
+                        state.cache = self.view.delegate.render_transition_preview(
+                            index, cell_size, signature,
+                        )
                 card.preview_samples.append(state_index)
 
             if record["kind"] == "image" or self.resize_reflow:
@@ -276,6 +283,19 @@ class _AssetGridTransitionOverlay:
         state_index = self.preview_state_index(card, progress)
         if state_index < 0:
             return None
+        if self.resize_reflow and card.kind != "image":
+            # The target can change again before this animation finishes.
+            # Text and paper must use the same interpolated size, including
+            # on the last frame before the live delegate takes over.
+            target = self._card_rect(card, self.progress if progress is None else progress)
+            size = QSize(max(1, round(target.width())), max(1, round(target.height())))
+            index = card.index or self.view.model().index(card.row, 0)
+            signature = self.view.delegate.transition_layout_signature(index, size)
+            state = card.preview_states[state_index]
+            if (state.signature != signature or state.cache is None
+                    or not self.view.delegate.transition_preview_covers(state.cache, size)):
+                state.cache = self.view.delegate.render_transition_preview(index, size, signature)
+                state.signature = signature
         return card.preview_states[state_index].cache
 
     def set_progress(self, progress: float) -> QRegion:
@@ -330,7 +350,7 @@ class _AssetGridTransitionOverlay:
             rect,
             QColor("#202020" if dark_theme_active() else "#f6f6f6"),
         )
-        painter.setClipRect(rect)
+        painter.setClipRect(rect, Qt.ClipOperation.IntersectClip)
         for card in self._paint_cards:
             target = self._card_rect(card, self.progress)
             if not target.intersects(QRectF(rect)):

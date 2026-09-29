@@ -68,6 +68,8 @@ class PaperPeelState:
     animation_curved: bool = False
     commit: bool = False
     waiting_for_result: bool = False
+    departure_progress: float = 0.0
+    animation_peel_duration: float = 0.0
 
 
 @dataclass(slots=True)
@@ -93,6 +95,8 @@ class ResizeReflowState:
 
 
 class AssetGrid(QListView):
+    PAPER_DEPARTURE_MS = 360
+
     item_selected = Signal(int)
     selection_cleared = Signal()
     item_activated = Signal(int)
@@ -181,6 +185,7 @@ class AssetGrid(QListView):
         self._paper_peel: PaperPeelState | None = None
         self._favorite_page_mode = False
         self._paper_animation = QTimer(self)
+        self._paper_animation.setTimerType(Qt.TimerType.PreciseTimer)
         self._paper_animation.setInterval(16)
         self._paper_animation.timeout.connect(self._advance_paper_animation)
         self._favorite_reflow_animation = QTimer(self)
@@ -368,7 +373,7 @@ class AssetGrid(QListView):
         if active:
             self.cancel_paper_peel()
         else:
-            # Refresh final-width text wrapping once, after the mouse drag.
+            # Switch back to the full-card cache at the final layout size.
             self.viewport().update()
 
     def _start_resize_reflow(
@@ -964,9 +969,17 @@ class AssetGrid(QListView):
         state.animation_start = QPointF(state.current)
         state.animation_end = QPointF(end)
         state.animation_started = time.monotonic()
-        state.animation_duration = max(0.001, duration_ms / 1000.0)
+        state.animation_peel_duration = max(0.001, duration_ms / 1000.0)
+        state.animation_duration = state.animation_peel_duration + (
+            self.PAPER_DEPARTURE_MS / 1000.0 if commit else 0.0
+        )
         state.animation_curved = curved
         state.commit = commit
+        state.departure_progress = 0.0
+        screen = self.screen()
+        refresh_rate = float(screen.refreshRate()) if screen is not None else 60.0
+        refresh_rate = min(Sidebar.MAX_ANIMATION_REFRESH_RATE, max(60.0, refresh_rate))
+        self._paper_animation.setInterval(max(1, round(1000.0 / refresh_rate)))
         self._paper_animation.start()
 
     def _settle_new_paper_corner(self, item_id: int) -> None:
@@ -986,14 +999,24 @@ class AssetGrid(QListView):
 
     def _advance_paper_animation(self) -> None:
         state = self._paper_peel
-        if state is None or state.animation_start is None or state.animation_end is None:
+        if state is None or state.waiting_for_result or state.animation_start is None or state.animation_end is None:
             self._paper_animation.stop()
             return
-        progress = min(1.0, (time.monotonic() - state.animation_started) / state.animation_duration)
+        elapsed = max(0.0, time.monotonic() - state.animation_started)
+        progress = min(1.0, elapsed / state.animation_duration)
+        # Time the detached fade separately so softening it does not slow
+        # the fold or make paper translucent while still over its content.
+        peel_progress = min(1.0, elapsed / state.animation_peel_duration)
+        departure = (
+            min(1.0, max(0.0, (elapsed - state.animation_peel_duration)
+                         / (state.animation_duration - state.animation_peel_duration)))
+            if state.commit else 0.0
+        )
+        state.departure_progress = departure * departure * (3.0 - 2.0 * departure)
         eased = (
-            progress * progress * (3.0 - 2.0 * progress)
+            peel_progress * peel_progress * (3.0 - 2.0 * peel_progress)
             if state.animation_curved
-            else 1.0 - (1.0 - progress) ** 3
+            else 1.0 - (1.0 - peel_progress) ** 3
         )
         if state.animation_curved:
             start, end = state.animation_start, state.animation_end
@@ -1117,6 +1140,8 @@ class AssetGrid(QListView):
             state = self._paper_peel
             index = self.model().index(pressed_row, 0)
             if state is not None and index.isValid():
+                # A fast drag may release beyond the last delivered move.
+                state.current = self._bounded_paper_point(index, event.position().toPoint())
                 cell = self._visual_rect_for_index(index)
                 card = self.delegate.card_rect(QRect(0, 0, cell.width(), cell.height()))
                 corner = self.delegate.paper_corner(card)
@@ -1126,10 +1151,27 @@ class AssetGrid(QListView):
                 click = math.hypot(state.current.x() - state.press.x(),
                                    state.current.y() - state.press.y()) < 5.0
                 if click or travelled >= 0.42:
-                    destination = corner + (QPointF(card.left(), card.bottom()) - corner) * 2.15
+                    if click:
+                        destination = corner + (QPointF(card.left(), card.bottom()) - corner) * 2.04
+                    else:
+                        # Continue along the existing fold normal, rather
+                        # than steering every release toward the bottom-left.
+                        vector = state.current - corner
+                        distance = math.hypot(vector.x(), vector.y())
+                        direction = vector / distance
+                        bounds = QRectF(card)
+                        far_edge = max(
+                            QPointF.dotProduct(point - corner, direction)
+                            for point in (bounds.topLeft(), bounds.topRight(),
+                                          bounds.bottomLeft(), bounds.bottomRight())
+                        )
+                        # The fold lies halfway to the dragged corner. Move
+                        # it beyond every card edge before fading the sheet.
+                        distance = max(distance, 2.0 * far_edge) + diagonal * 0.04
+                        destination = corner + direction * distance
                     self._animate_paper_peel(
                         destination,
-                        360 if click else 220,
+                        288 if click else 216,
                         True,
                         curved=click,
                     )

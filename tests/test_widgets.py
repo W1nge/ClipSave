@@ -851,7 +851,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
         favorite_point = grid.delegate.favorite_rect(grid.visualRect(index)).center()
         QTest.mouseClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=favorite_point)
-        QTest.qWait(420)
+        self.assertTrue(wait_for(lambda: favorite.call_count == 1, timeout=1.5))
         favorite.assert_called_once_with(1, True)
         selected.assert_called_once_with(1)
 
@@ -889,7 +889,10 @@ class ThumbnailPixmapTests(unittest.TestCase):
         favorite_point = grid.delegate.favorite_rect(grid.visualRect(index)).center()
 
         QTest.mouseClick(grid.viewport(), Qt.MouseButton.LeftButton, pos=favorite_point)
-        QTest.qWait(420)
+        self.assertTrue(wait_for(
+            lambda: grid._paper_peel is not None and grid._paper_peel.waiting_for_result,
+            timeout=1.5,
+        ))
         state = grid._paper_peel
         self.assertIsNotNone(state)
         self.assertTrue(state.waiting_for_result)
@@ -1174,6 +1177,10 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
     def test_detail_panel_scrolls_in_a_small_work_area(self):
         panel = DetailPanel()
+        panel.set_item(dict(
+            asset_records(1)[0], source="clipboard", collection_id=None,
+            tag_colors="", ai_description="", ocr_text="", notes="",
+        ))
         self.assertEqual(panel.maximumWidth(), 340)
         panel.resize(340, 300)
         panel.show()
@@ -1925,6 +1932,7 @@ class ThumbnailPixmapTests(unittest.TestCase):
         self.app.processEvents()
 
         dark_flags = []
+        grid.delegate._transition_preview_caches.clear()
         original_paint_content = grid.delegate._paint_preview_content
 
         def record_dark_flag(*args, **kwargs):
@@ -2072,6 +2080,122 @@ class ThumbnailPixmapTests(unittest.TestCase):
         grid.viewport().repaint()
         self.assertGreater(len(grid.delegate._card_caches), normal_cache_count)
         grid.close()
+
+    def test_live_resize_text_wrap_matches_current_card_width(self):
+        for kind in ("text", "markdown"):
+            with self.subTest(kind=kind):
+                grid = AssetGrid()
+                record = asset_records(1, kind=kind)[0]
+                record["content"] = "中文卡片 resize preview ABCDEFGHIJKLMNOPQRSTUVWXYZ " * 8
+                grid.set_items([record])
+                index = grid.model().index(0, 0)
+                option = QStyleOptionViewItem()
+                grid.initViewItemOption(option)
+
+                def render(width, live=True):
+                    height = round(width * 0.77)
+                    option.rect = QRect(0, 0, width, height)
+                    dpr = grid.devicePixelRatioF()
+                    canvas = QImage(round(width * dpr), round(height * dpr),
+                                    QImage.Format.Format_ARGB32_Premultiplied)
+                    canvas.setDevicePixelRatio(dpr)
+                    canvas.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(canvas)
+                    if live:
+                        grid.delegate.paint(painter, option, index)
+                    else:
+                        painter.drawPixmap(option.rect.topLeft(), grid.delegate.cached_card_pixmap(option, index))
+                    painter.end()
+                    return canvas
+
+                # Exercise shrinking, growing, and revisiting a cached width.
+                # Compare with freshly rasterized text at the current width,
+                # as painted after release. Include sizes where wrapping stays unchanged
+                # but more of the final glyph or line becomes visible.
+                grid.set_interactive_resize_active(True)
+                for width in (320, *range(190, 330, 3), 190):
+                    actual = render(width)
+                    grid.delegate._transition_preview_caches.clear()
+                    grid.delegate._card_caches.clear()
+                    grid.delegate._card_cache_bytes = 0
+                    expected = render(width, live=False)
+                    self.assertEqual(actual, expected, f"{kind} at {width}px")
+                grid.set_interactive_resize_active(False)
+                grid.close()
+
+    def test_card_paint_preserves_outer_clip_with_cached_and_live_text(self):
+        for kind in ("text", "markdown"):
+            for use_cache in (False, True):
+                with self.subTest(kind=kind, cached=use_cache):
+                    grid = AssetGrid()
+                    record = asset_records(1, kind=kind)[0]
+                    record["content"] = "卡片内容 ABCDEFGHIJKLMNOPQRSTUVWXYZ " * 10
+                    grid.set_items([record])
+                    index = grid.model().index(0, 0)
+                    option = QStyleOptionViewItem()
+                    grid.initViewItemOption(option)
+                    option.rect = QRect(0, 0, 245, 190)
+                    cache = (grid.delegate.render_transition_preview(index, QSize(400, 300))
+                             if use_cache else None)
+                    canvas = QImage(245, 190, QImage.Format.Format_ARGB32_Premultiplied)
+                    canvas.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(canvas)
+                    clip = QRect(0, 0, 120, 110)
+                    painter.setClipRect(clip)
+                    grid.delegate.paint_transition_card(painter, option, index, cache)
+                    painter.end()
+                    self.assertTrue(any(canvas.pixelColor(x, 70).alpha() for x in range(30, 110)))
+                    self.assertFalse(any(
+                        canvas.pixelColor(x, y).alpha()
+                        for y in range(canvas.height()) for x in range(canvas.width())
+                        if not clip.contains(x, y)
+                    ))
+                    grid.close()
+
+    def test_resize_reflow_text_follows_interpolated_and_retargeted_width(self):
+        for kind in ("text", "markdown"):
+            with self.subTest(kind=kind):
+                grid = AssetGrid()
+                grid.resize(600, 400)
+                record = asset_records(1, kind=kind)[0]
+                record["content"] = "中文卡片 resize ABCDEFGHIJKLMNOPQRSTUVWXYZ " * 10
+                grid.set_items([record])
+                grid.show()
+                self.app.processEvents()
+                card = widgets_module._GridTransitionCard(
+                    0, QRectF(0, 0, 320, 220), QRectF(10, 0, 190, 220),
+                )
+                overlay = widgets_module._AssetGridTransitionOverlay(
+                    grid, [card], 2, 3, resize_reflow=True,
+                )
+                for progress, end_width in ((0.0, 190), (0.5, 190), (0.75, 275), (1.0, 275)):
+                    card.collapsed_rect.setWidth(end_width)
+                    overlay.set_progress(progress)
+                    dpr = grid.devicePixelRatioF()
+                    actual = QImage(round(400 * dpr), round(240 * dpr),
+                                    QImage.Format.Format_ARGB32_Premultiplied)
+                    actual.setDevicePixelRatio(dpr)
+                    actual.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(actual)
+                    overlay.paint(painter, actual.rect())
+                    painter.end()
+
+                    target = overlay.card_rect(0)
+                    size = QSize(round(target.width()), round(target.height()))
+                    # Force an independently laid-out preview for this frame.
+                    # Keep the same chrome and glyph size when comparing.
+                    expected_preview = grid.delegate.render_transition_preview(
+                        grid.model().index(0, 0), size,
+                    )
+                    expected = QImage(actual.size(), actual.format())
+                    expected.setDevicePixelRatio(dpr)
+                    expected.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(expected)
+                    with patch.object(overlay, "preview_cache", return_value=expected_preview):
+                        overlay.paint(painter, expected.rect())
+                    painter.end()
+                    self.assertEqual(actual, expected, f"{kind} at progress {progress}")
+                grid.close()
 
     def test_favorite_reflow_only_inspects_rows_near_the_viewport(self):
         grid = AssetGrid()
@@ -2350,10 +2474,11 @@ class ThumbnailPixmapTests(unittest.TestCase):
 
         index = grid.model().index(0, 0)
         rendered_fonts = []
+        grid.delegate._transition_preview_caches.clear()
         original_paint_content = grid.delegate._paint_preview_content
 
-        def record_rendered_font(*args):
-            original_paint_content(*args)
+        def record_rendered_font(*args, **kwargs):
+            original_paint_content(*args, **kwargs)
             rendered_fonts.append(args[0].font().toString())
 
         with patch.object(
@@ -2865,7 +2990,7 @@ class WidgetSafetyTests(unittest.TestCase):
         self.assertEqual(dialog.layout().contentsMargins().left(), 1)
         self.assertEqual(dialog.browser.searchPaths(), [])
         self.assertIsInstance(panel.text_preview, _SafeMarkdownBrowser)
-        for markdown_browser in (browser, dialog.browser, panel.text_preview):
+        for markdown_browser in (browser, dialog.browser):
             self.assertEqual(
                 markdown_browser.horizontalScrollBarPolicy(),
                 Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
@@ -2874,6 +2999,9 @@ class WidgetSafetyTests(unittest.TestCase):
                 markdown_browser.verticalScrollBarPolicy(),
                 Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
             )
+        for policy in (panel.text_preview.horizontalScrollBarPolicy(),
+                       panel.text_preview.verticalScrollBarPolicy()):
+            self.assertEqual(policy, Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         dialog.close()
         panel.close()
         browser.close()

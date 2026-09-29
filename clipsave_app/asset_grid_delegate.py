@@ -6,7 +6,7 @@ from collections import OrderedDict
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import (
-    QAbstractTextDocumentLayout, QColor, QFont, QLinearGradient, QPainter,
+    QAbstractTextDocumentLayout, QColor, QFont, QPainter,
     QPainterPath, QPalette, QPen, QPixmap, QPolygonF, QTextDocument,
     QTextOption, QTransform,
 )
@@ -155,13 +155,15 @@ class AssetGridDelegate(QStyledItemDelegate):
             self._markdown_documents.popitem(last=False)
         return document
 
-    def _draw_markdown_preview(self, painter, rect, content, dark, font) -> None:
+    def _draw_markdown_preview(self, painter, rect, content, dark, font, *, clip=True) -> None:
         document = self._markdown_document(content, rect.width(), dark, font)
         painter.save()
-        painter.setClipRect(rect)
+        if clip:
+            painter.setClipRect(rect, Qt.ClipOperation.IntersectClip)
         painter.translate(rect.topLeft())
         context = QAbstractTextDocumentLayout.PaintContext()
-        context.clip = QRectF(0, 0, rect.width(), rect.height())
+        if clip:
+            context.clip = QRectF(0, 0, rect.width(), rect.height())
         context.palette.setColor(QPalette.ColorRole.Text,
                                  QColor("#e5e7eb" if dark else "#303947"))
         document.documentLayout().draw(painter, context)
@@ -184,11 +186,12 @@ class AssetGridDelegate(QStyledItemDelegate):
         return plain_text_layout_signature(content, width, height, font)
 
     @staticmethod
-    def _draw_plain_text_preview(painter, rect, content, font) -> None:
+    def _draw_plain_text_preview(painter, rect, content, font, *, clip=True) -> None:
         layouts, _lines = AssetGridDelegate._plain_text_layout(
             content, max(1, rect.width()), max(1, rect.height()), font)
         painter.save()
-        painter.setClipRect(rect)
+        if clip:
+            painter.setClipRect(rect, Qt.ClipOperation.IntersectClip)
         for layout in layouts:
             layout.draw(painter, QPointF(rect.left(), rect.top()))
         painter.restore()
@@ -196,7 +199,7 @@ class AssetGridDelegate(QStyledItemDelegate):
     def transition_layout_signature(self, index, cell_size):
         return self._transition_renderer.layout_signature(index, cell_size)
 
-    def _paint_preview_content(self, painter, preview, index, record, dark, font) -> None:
+    def _paint_preview_content(self, painter, preview, index, record, dark, font, *, clip=True) -> None:
         painter.setFont(font)
         path = record["path"] if record["kind"] == "image" else None
         if path and self.view.preview_loading_enabled and self.view.isVisible():
@@ -215,12 +218,15 @@ class AssetGridDelegate(QStyledItemDelegate):
             content = str(record["content"] or "").strip() or str(record["title"])
             painter.setPen(QColor("#e5e7eb" if dark else "#303947"))
             if record["kind"] == "markdown":
-                self._draw_markdown_preview(painter, preview, content, dark, font)
+                self._draw_markdown_preview(painter, preview, content, dark, font, clip=clip)
             else:
-                self._draw_plain_text_preview(painter, preview, content, font)
+                self._draw_plain_text_preview(painter, preview, content, font, clip=clip)
 
     def render_transition_preview(self, index, cell_size, layout_signature=None):
         return self._transition_renderer.render_preview(index, cell_size, layout_signature)
+
+    def transition_preview_covers(self, cache, cell_size) -> bool:
+        return self._transition_renderer.preview_covers(cache, cell_size)
 
     @staticmethod
     def transition_image_target(preview: QRect, pixmap: QPixmap) -> QRectF:
@@ -233,7 +239,7 @@ class AssetGridDelegate(QStyledItemDelegate):
     @staticmethod
     def _paper_colors(favorite: bool, dark: bool):
         navy = QColor("#292929") if dark else QColor("#ffffff")
-        yellow = QColor(247, 195, 63, 210) if dark else QColor(248, 196, 63, 210)
+        yellow = QColor(247, 195, 63) if dark else QColor(248, 196, 63)
         border = QColor(232, 236, 242, 62) if dark else QColor(55, 63, 74, 46)
         return (yellow, navy, border) if favorite else (navy, yellow, border)
 
@@ -306,7 +312,10 @@ class AssetGridDelegate(QStyledItemDelegate):
         preview = self.preview_rect(option.rect)
         if preview_cache is not None and not preview_cache.isNull():
             painter.save()
-            painter.setClipRect(self.transition_preview_clip(preview, record["kind"]))
+            painter.setClipRect(
+                self.transition_preview_clip(preview, record["kind"]),
+                Qt.ClipOperation.IntersectClip,
+            )
             if record["kind"] == "image":
                 painter.drawPixmap(self.transition_image_target(preview, preview_cache),
                                    preview_cache, QRectF(preview_cache.rect()))
@@ -325,20 +334,6 @@ class AssetGridDelegate(QStyledItemDelegate):
                 False if yellow_paper else dark,
                 option.font,
             )
-
-    def _sheet_pixmap(self, option, index, record, fill, border, preview_cache) -> QPixmap:
-        dpr = max(1.0, float(self.view.devicePixelRatioF()))
-        pixmap = QPixmap(max(1, round(option.rect.width() * dpr)),
-                         max(1, round(option.rect.height() * dpr)))
-        pixmap.setDevicePixelRatio(dpr)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        copy = QStyleOptionViewItem(option)
-        copy.rect = QRect(0, 0, option.rect.width(), option.rect.height())
-        local = QPainter(pixmap)
-        local.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self._paint_sheet(local, copy, index, record, fill, border, preview_cache)
-        local.end()
-        return pixmap
 
     def cached_card_pixmap(self, option, index) -> QPixmap | None:
         record = index.data(AssetItemModel.ItemRole)
@@ -368,7 +363,11 @@ class AssetGridDelegate(QStyledItemDelegate):
         copy = QStyleOptionViewItem(option)
         copy.rect = QRect(0, 0, width, height)
         local = QPainter(cached)
-        self.paint_transition_card(local, copy, index)
+        # Use the same preview raster in settled and moving cards. At a
+        # fractional DPI, drawing glyphs directly into the full card instead
+        # uses a different subpixel origin and flashes when the drag ends.
+        preview = self.render_transition_preview(index, copy.rect.size())
+        self.paint_transition_card(local, copy, index, preview)
         local.end()
         self._card_caches[key] = cached
         self._card_cache_bytes += cached.width() * cached.height() * 4
@@ -390,19 +389,21 @@ class AssetGridDelegate(QStyledItemDelegate):
             if record is not None and record["kind"] != "image":
                 # A full-card cache includes the exact cell dimensions. During
                 # a live resize that would regenerate every visible text card
-                # for nearly every mouse pixel. Keep its preview at native
-                # glyph size and redraw only the inexpensive paper geometry;
-                # normal text wrapping resumes when the drag ends.
+                # for nearly every mouse pixel. Reuse previews while their
+                # wrapping is unchanged, but never freeze the drag's initial
+                # line layout as the paper shrinks or grows underneath it.
+                signature = self.transition_layout_signature(index, option.rect.size())
                 key = (
                     self.view.model().generation, index.row(),
                     int(record["id"]), bool(record["favorite"]),
                     option.font.toString(),
                     round(self.view.devicePixelRatioF(), 3),
                     dark_theme_active(),
+                    signature,
                 )
                 preview = self._interactive_resize_previews.get(key)
-                if preview is None:
-                    preview = self.render_transition_preview(index, option.rect.size())
+                if preview is None or not self.transition_preview_covers(preview, option.rect.size()):
+                    preview = self.render_transition_preview(index, option.rect.size(), signature)
                     if preview is not None:
                         self._interactive_resize_previews[key] = preview
                         while len(self._interactive_resize_previews) > 96:
@@ -438,7 +439,12 @@ class AssetGridDelegate(QStyledItemDelegate):
             return
         dark = dark_theme_active()
         front, back, border = self._paper_colors(bool(record["favorite"]), dark)
+        # A light outline disappears on yellow paper. Give its resting fold
+        # a darker warm edge while keeping the paper back flat/opaque.
+        fold_border = QColor(130, 87, 24, 140) if record["favorite"] else border
         state = getattr(self.view, "paper_peel_state", lambda _row: None)(index.row())
+        if state is not None and paint_content and preview_cache is None and record["kind"] != "image":
+            preview_cache = self.render_transition_preview(index, option.rect.size())
         card = self.card_rect(option.rect)
         single_sheet = bool(getattr(self.view, "favorite_page_mode", False))
         corner = self.paper_corner(card)
@@ -470,31 +476,48 @@ class AssetGridDelegate(QStyledItemDelegate):
         # the same intersection at rasterization time without corrupting the
         # path fill rule.
         retained_path = _polygon_path(retained)
-        removed_path = _polygon_path(removed)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if not single_sheet:
             painter.save()
-            painter.setClipPath(card_shape)
-            painter.setClipPath(removed_path, Qt.ClipOperation.IntersectClip)
-            # Only the small exposed corner of the sheet beneath is visible.
-            # Its timestamp/preview are outside that clip, so laying them out
-            # again doubles the cost of every card without changing a pixel.
-            painter.fillPath(card_shape, back)
+            painter.setClipPath(card_shape, Qt.ClipOperation.IntersectClip)
+            # A complete opaque base prevents a translucent seam between
+            # the two antialiased paper edges. At rest only its corner shows;
+            # while peeling, reveal the same record in the next paper color.
+            if state is None or not paint_content:
+                painter.fillPath(card_shape, back)
+            else:
+                # Match the raster and text contrast of the sheet that will
+                # remain after favorite toggles, including fractional DPI.
+                back_preview = None
+                if record["kind"] != "image":
+                    back_preview = self._transition_renderer.render_preview(
+                        index, option.rect.size(),
+                        dark=dark and bool(record["favorite"]),
+                    )
+                self._paint_sheet(
+                    painter, option, index, record, back, border, back_preview,
+                    paint_outline=False,
+                )
             painter.restore()
         painter.save()
-        painter.setClipPath(card_shape)
+        painter.setClipPath(card_shape, Qt.ClipOperation.IntersectClip)
         painter.setClipPath(retained_path, Qt.ClipOperation.IntersectClip)
-        if state is None:
-            self._paint_sheet(
-                painter, option, index, record, front, border, preview_cache,
-                paint_outline=False, paint_content=paint_content,
-            )
-            front_pixmap = None
-        else:
-            front_pixmap = self._sheet_pixmap(option, index, record, front, border, preview_cache)
-            painter.drawPixmap(option.rect.topLeft(), front_pixmap)
+        self._paint_sheet(
+            painter, option, index, record, front, border, preview_cache,
+            paint_outline=False, paint_content=paint_content,
+        )
         painter.restore()
+
+        # The stationary sheet's outline must sit beneath the lifted paper.
+        if not single_sheet:
+            self._paint_card_outline(painter, QRectF(card), border)
+        else:
+            painter.save()
+            painter.setClipPath(card_shape, Qt.ClipOperation.IntersectClip)
+            painter.setClipPath(retained_path, Qt.ClipOperation.IntersectClip)
+            self._paint_card_outline(painter, QRectF(card), border)
+            painter.restore()
 
         if len(removed) >= 3:
             nx, ny = normal.x() / length, normal.y() / length
@@ -506,80 +529,47 @@ class AssetGridDelegate(QStyledItemDelegate):
             # Avoid QPainterPath boolean operations and mapped rounded paths.
             # Qt 6 can corrupt their native storage during repeated transition
             # rendering on Python 3.11/3.12.  Reflect the painter instead: the
-            # original rounded card path and sheet pixmap then supply the exact
-            # source-corner radius without manufacturing a derived path.
+            # original rounded card path supplies the exact source-corner
+            # radius without manufacturing a derived path.
             reflected_path = _polygon_path(
                 QPolygonF([reflection.map(point) for point in removed])
             )
+            # The lifted sheet presents a flat, unprinted, opaque back.
+            painter.save()
+            departure = state.departure_progress if state is not None else 0.0
+            if departure > 0.0:
+                # Fade the detached sheet as one object, including its edge.
+                # The resting card and its revealed content stay unchanged.
+                center = reflection.map(QRectF(card).center())
+                painter.setOpacity(painter.opacity() * (1.0 - departure))
+                drift = math.hypot(card.width(), card.height()) * 0.075 * departure
+                painter.translate(nx * drift, ny * drift)
+                painter.translate(center)
+                painter.rotate(-5.0 * departure)
+                painter.scale(1.0 - 0.04 * departure, 1.0 - 0.04 * departure)
+                painter.translate(-center)
+            # During a peel the reflected sheet can extend past the original
+            # card. Keep the caller's viewport clip, not the stationary card's.
             if state is None:
-                fold_face = QColor(front)
-                fold_face.setAlpha(min(190, fold_face.alpha() + 42))
-                painter.save()
-                painter.setClipPath(card_shape)
-                painter.setClipPath(reflected_path, Qt.ClipOperation.IntersectClip)
-                painter.setTransform(reflection, True)
-                painter.setPen(QPen(QColor(235, 242, 250, 54), 1.0))
-                painter.setBrush(fold_face)
-                painter.drawPath(card_shape)
-                painter.restore()
+                painter.setClipPath(card_shape, Qt.ClipOperation.IntersectClip)
+            painter.setClipPath(reflected_path, Qt.ClipOperation.IntersectClip)
+            painter.setTransform(reflection, True)
+            # At rest the back shares the front's color. Keep its physical
+            # edge visible without restoring the removed translucent coating.
+            painter.setPen(QPen(fold_border, 1.0) if state is None else Qt.PenStyle.NoPen)
+            painter.setBrush(front)
+            painter.drawPath(card_shape)
+            if state is not None:
+                # This edge belongs to the lifted sheet, so it must follow
+                # the reflection instead of remaining at the original card.
+                self._paint_card_outline(painter, QRectF(card), border)
+            painter.restore()
+            if state is None:
                 tangent = QPointF(-normal.y() / length, normal.x() / length)
                 painter.save()
-                painter.setClipPath(card_shape)
-                painter.setPen(QPen(QColor(235, 242, 250, 54), 1.0))
-                painter.drawLine(
-                    midpoint - tangent * 5000,
-                    midpoint + tangent * 5000,
-                )
-                painter.restore()
-            else:
-                painter.save()
-                painter.setClipPath(reflected_path)
                 painter.setClipPath(card_shape, Qt.ClipOperation.IntersectClip)
-                painter.setTransform(reflection, True)
-                painter.drawPixmap(option.rect.topLeft(), front_pixmap)
-                painter.restore()
-                gradient = QLinearGradient(midpoint, cursor)
-                gradient.setColorAt(0, QColor(255, 255, 255, 48))
-                gradient.setColorAt(0.45, QColor(255, 255, 255, 12))
-                gradient.setColorAt(1, QColor(0, 0, 0, 42))
-                painter.save()
-                painter.setClipPath(reflected_path)
-                painter.setTransform(reflection, True)
-                source_gradient = QLinearGradient(
-                    reflection.map(midpoint),
-                    reflection.map(cursor),
-                )
-                source_gradient.setStops(gradient.stops())
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(source_gradient)
-                painter.drawPath(card_shape)
+                painter.setPen(QPen(fold_border, 1.0))
+                painter.drawLine(midpoint - tangent * 5000, midpoint + tangent * 5000)
                 painter.restore()
 
-        # The two stationary paper layers are painted through complementary
-        # clipping paths. Their shared outer boundary excludes the last device
-        # pixel on the right and bottom, so draw one unclipped inner outline.
-        # A single sheet must not leave that complete outline behind while it
-        # is being peeled away; constrain its outline to the retained paper.
-        if not single_sheet:
-            self._paint_card_outline(painter, QRectF(card), border)
-        else:
-            # Keep the lifted yellow flap, but do not draw the complete card
-            # outline through the exposed corner: that curve would read as a
-            # second sheet underneath the favorite card.
-            painter.save()
-            painter.setClipPath(card_shape)
-            painter.setClipPath(retained_path, Qt.ClipOperation.IntersectClip)
-            self._paint_card_outline(painter, QRectF(card), border)
-            painter.restore()
-
-        if state is not None:
-            tangent = QPointF(-normal.y() / length, normal.x() / length)
-            painter.save()
-            painter.setClipRect(card)
-            painter.setPen(QPen(QColor(0, 0, 0, 32), 7.0, Qt.PenStyle.SolidLine,
-                                Qt.PenCapStyle.RoundCap))
-            painter.drawLine(midpoint - tangent * 5000, midpoint + tangent * 5000)
-            painter.setPen(QPen(QColor(235, 242, 250, 68), 1.0))
-            painter.drawLine(midpoint - tangent * 5000, midpoint + tangent * 5000)
-            painter.restore()
         painter.restore()

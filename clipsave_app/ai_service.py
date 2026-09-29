@@ -196,14 +196,30 @@ class AIService:
             # a cancel unblocks the caller immediately while the daemon thread
             # finishes (or times out on) its discarded attempt.
             open_result: dict[str, object] = {}
+            open_lock = threading.Lock()
+            open_abandoned = False
+
+            def close_discarded(value) -> None:
+                close = getattr(value, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
 
             def _open_in_background() -> None:
                 try:
-                    open_result["response"] = self._open_request(
+                    value = self._open_request(
                         request, timeout=remaining_timeout
                     )
+                    key = "response"
                 except BaseException as exc:  # re-raised on the caller thread
-                    open_result["error"] = exc
+                    key, value = "error", exc
+                with open_lock:
+                    if not open_abandoned:
+                        open_result[key] = value
+                        return
+                close_discarded(value)
 
             opener_thread = threading.Thread(
                 target=_open_in_background,
@@ -213,6 +229,12 @@ class AIService:
             opener_thread.start()
             while opener_thread.is_alive():
                 if cancel_event is not None and cancel_event.is_set():
+                    with open_lock:
+                        open_abandoned = True
+                        discarded = list(open_result.values())
+                        open_result.clear()
+                    for value in discarded:
+                        close_discarded(value)
                     raise OperationCancelled("Operation cancelled")
                 opener_thread.join(0.05)
             if "error" in open_result:

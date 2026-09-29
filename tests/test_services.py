@@ -128,6 +128,9 @@ class ClipboardServiceTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.database = LibraryDatabase(Path(self.temp.name) / "test.db")
         self.service = ClipboardService(self.database)
+        # These cross-platform tests inject Qt clipboard fixtures. Production
+        # Windows acquisition is covered separately in test_clipboard_capture.
+        self.service._read_clipboard_snapshot = self.service._read_qt_clipboard_snapshot
 
     def tearDown(self):
         self.service.shutdown()
@@ -332,7 +335,8 @@ class ClipboardServiceTests(unittest.TestCase):
         self.service._monitoring_enabled = True
 
         self.service.notifier.changed.emit()
-
+        self.service.poll.assert_not_called()
+        self.app.processEvents()
         self.service.poll.assert_called_once_with()
 
     def test_sequence_change_during_read_retries_latest_snapshot(self):
@@ -1260,6 +1264,36 @@ class AIServiceTests(unittest.TestCase):
             with self.assertRaises(OperationCancelled):
                 service._post("/test", {}, cancel_event)
         self.assertTrue(closed.is_set())
+
+    def test_cancelled_ai_connect_closes_a_response_that_arrives_late(self):
+        service = AIService("http://localhost/v1", "", "vision")
+        cancel_event = threading.Event()
+        connecting, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+        class LateResponse(FakeResponse):
+            def close(self):
+                closed.set()
+
+        def connect(*_args, **_kwargs):
+            connecting.set()
+            release.wait(2)
+            return LateResponse(b"{}")
+
+        def cancel():
+            connecting.wait(1)
+            cancel_event.set()
+
+        canceller = threading.Thread(target=cancel)
+        canceller.start()
+        try:
+            with patch.object(service, "_open_request", side_effect=connect):
+                with self.assertRaises(OperationCancelled):
+                    service._post("/test", {}, cancel_event)
+                release.set()
+                self.assertTrue(closed.wait(1), "A cancelled connect left its late response open")
+        finally:
+            release.set()
+            canceller.join(1)
 
     def test_cross_origin_ai_redirect_is_refused_before_forwarding_headers(self):
         service = AIService("https://api.example/v1", "secret", "vision")

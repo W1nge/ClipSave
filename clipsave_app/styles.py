@@ -22,10 +22,34 @@ QScrollArea#SidebarClassificationScroll, QScrollArea#SidebarClassificationScroll
 QWidget#ContentSurface { background: transparent; }
 QWidget#LibrarySurface { background: #f6f6f6; }
 QWidget#DetailPanel, QWidget#DetailPanelContent { background: #f6f6f6; border: 0; }
+QFrame#DetailHeader { background: #f6f6f6; border-bottom: 1px solid #e0e3e8; }
+QFrame#DetailCollectionPopup { background: #ffffff; border: 1px solid #c8d0db; border-radius: 6px; }
+QListView#DetailCollectionList { background: #ffffff; border: 0; outline: 0; }
+QListView#DetailCollectionList::item { min-height: 30px; padding: 0 8px; border-radius: 4px; }
+QListView#DetailCollectionList::item:selected { background: #e3efff; color: #135fc7; }
+QListView#DetailCollectionList::item:hover { background: #eef3fa; }
+QLabel#DetailHeading { font-size: 15px; font-weight: 600; }
+QLabel#DetailItemTitle { font-size: 14px; font-weight: 600; }
+QLabel#DetailSectionTitle { color: #4b5667; font-size: 12px; font-weight: 600; }
+QLabel#DetailCaption { color: #6f7b8d; font-size: 12px; }
+QTextBrowser#DetailValue { color: #4b5667; font-size: 12px; background: transparent; border: 0; padding: 0; }
+QTextBrowser#DetailTextPreview { background: #ffffff; border: 1px solid #e0e3e8; border-radius: 8px; padding: 10px; }
+QTextEdit#DetailNotes { background: #ffffff; border: 1px solid #d9dee6; border-radius: 8px; padding: 8px; }
+QTextEdit#DetailNotes:focus { border-color: #2f7df6; }
+QLabel#DetailResult { background: #eceff3; border-radius: 6px; padding: 10px; }
+QPushButton#DetailCopy { background: #2f7df6; color: #ffffff; font-weight: 600; padding: 7px 10px; }
+QPushButton#DetailCopy:hover { background: #246be0; }
+QPushButton#DetailCopy:pressed { background: #195cc6; }
+QPushButton#DetailCopy:disabled { background: #e0e3e8; color: #7c8796; }
+QFrame#DetailHeader QPushButton#IconButton:checked { background: #fff0c2; border-color: #e0c56b; }
+QPushButton#DetailToolAction { color: #1769d2; padding: 5px 8px; }
+QPushButton#DetailToolAction:disabled { color: #8d95a0; }
+QPushButton#DetailInfoToggle { text-align: left; color: #6f7b8d; padding: 6px 0; font-size: 12px; }
 QFrame#TopBar { background: rgba(255,255,255,70); border-bottom: 1px solid rgba(115,129,150,38); }
 QFrame#LibraryHeader { background: transparent; }
 QStackedWidget#ViewStack { background: transparent; }
 QFrame#TagChip { background: rgba(236,240,246,210); border-radius: 6px; }
+QPushButton#TagRemoveButton { min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px; padding: 0; font-size: 16px; }
 QLabel#Muted { color: #6f7b8d; }
 QLabel#SectionTitle { font-size: 15px; font-weight: 600; color: #273247; }
 QLabel#Title { font-size: 17px; font-weight: 600; }
@@ -121,8 +145,14 @@ QFrame#WindowTitleBar, QWidget#Sidebar, QFrame#TopBar { background: #202020; }
 """
 
 
-def stylesheet_for_theme(dark: bool, *, backend: str | None = None) -> str:
+def stylesheet_for_theme(
+    dark: bool, *, backend: str | None = None, composition_host: bool = False,
+) -> str:
     base = DARK_STYLESHEET if dark else LIGHT_STYLESHEET
+    if dark and composition_host:
+        # The native composition host owns hit testing, so its Qt surface can
+        # be fully clear instead of using the layered-window input alpha.
+        base = base.replace("rgba(0,0,0,0.004)", "rgba(0,0,0,0)")
     if backend != "solid":
         return base
     return base + (_DARK_SOLID_OVERRIDES if dark else _LIGHT_SOLID_OVERRIDES)
@@ -155,10 +185,34 @@ QScrollArea#SidebarClassificationScroll, QScrollArea#SidebarClassificationScroll
 QWidget#ContentSurface { background: transparent; }
 QWidget#LibrarySurface { background: #202020; }
 QWidget#DetailPanel, QWidget#DetailPanelContent { background: #181818; border: 0; }
+QFrame#DetailHeader { background: #181818; border-bottom: 1px solid #303030; }
+QFrame#DetailCollectionPopup { background: #292929; border: 1px solid #505050; border-radius: 6px; }
+QListView#DetailCollectionList { background: #292929; border: 0; outline: 0; }
+QListView#DetailCollectionList::item { min-height: 30px; padding: 0 8px; border-radius: 4px; }
+QListView#DetailCollectionList::item:selected { background: #314b68; color: #d9ecff; }
+QListView#DetailCollectionList::item:hover { background: #383838; }
+QLabel#DetailHeading { font-size: 15px; font-weight: 600; }
+QLabel#DetailItemTitle { font-size: 14px; font-weight: 600; }
+QLabel#DetailSectionTitle { color: #c4c8cf; font-size: 12px; font-weight: 600; }
+QLabel#DetailCaption { color: #9399a3; font-size: 12px; }
+QTextBrowser#DetailValue { color: #b5bbc4; font-size: 12px; background: transparent; border: 0; padding: 0; }
+QTextBrowser#DetailTextPreview { background: #232323; border: 1px solid #363636; border-radius: 8px; padding: 10px; }
+QTextEdit#DetailNotes { background: #232323; border: 1px solid #3b3b3b; border-radius: 8px; padding: 8px; }
+QTextEdit#DetailNotes:focus { border-color: #4da3ff; }
+QLabel#DetailResult { background: #232323; border-radius: 6px; padding: 10px; }
+QPushButton#DetailCopy { background: #2f7df6; color: #ffffff; font-weight: 600; padding: 7px 10px; }
+QPushButton#DetailCopy:hover { background: #438bf7; }
+QPushButton#DetailCopy:pressed { background: #246be0; }
+QPushButton#DetailCopy:disabled { background: #303030; color: #777777; }
+QFrame#DetailHeader QPushButton#IconButton:checked { background: #514321; border-color: #8c733b; }
+QPushButton#DetailToolAction { color: #79b8f7; padding: 5px 8px; }
+QPushButton#DetailToolAction:disabled { color: #737373; }
+QPushButton#DetailInfoToggle { text-align: left; color: #9399a3; padding: 6px 0; font-size: 12px; }
 QFrame#TopBar { background: rgba(0,0,0,0.004); border-bottom: 1px solid #3c3c3c; }
 QFrame#LibraryHeader { background: transparent; }
 QStackedWidget#ViewStack { background: transparent; }
 QFrame#TagChip { background: #353535; border-radius: 6px; }
+QPushButton#TagRemoveButton { min-width: 22px; max-width: 22px; min-height: 22px; max-height: 22px; padding: 0; font-size: 16px; }
 QLabel#Muted { color: #a7adb7; }
 QLabel#SectionTitle { font-size: 15px; font-weight: 600; color: #f2f2f2; }
 QLabel#Title { font-size: 17px; font-weight: 600; color: #ffffff; }

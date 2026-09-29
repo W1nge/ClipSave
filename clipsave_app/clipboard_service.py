@@ -29,7 +29,7 @@ class ClipboardService(QObject):
     CLIPBOARD_READ_ATTEMPTS = 3
     POLL_INTERVAL_MS = 700
     EVENT_FALLBACK_INTERVAL_MS = 5000
-    CLIPBOARD_RETRY_DELAYS_MS = (25, 50, 100, 200)
+    CLIPBOARD_RETRY_DELAYS_MS = (25, 50, 100, 200, 400, 800, 1000)
     WAIT_INTERVAL_SECONDS = 0.01
     PROCESS_EVENTS_MAX_MS = 2
     PERSISTENCE_QUEUE_SIZE = 4
@@ -59,8 +59,10 @@ class ClipboardService(QObject):
         self.timer.setInterval(self.POLL_INTERVAL_MS)
         self.timer.timeout.connect(self._poll_if_monitoring)
         self.notifier = WindowsClipboardNotifier(self)
-        self.notifier.changed.connect(self._poll_if_monitoring)
+        self.notifier.changed.connect(self._queue_clipboard_poll)
         self._monitoring_enabled = False
+        self._polling = False
+        self._poll_requested = False
         self._clipboard_retry_attempt = 0
         self._clipboard_retry_timer = QTimer(self)
         self._clipboard_retry_timer.setSingleShot(True)
@@ -229,6 +231,18 @@ class ClipboardService(QObject):
         if self._monitoring_enabled and self._accepting_tasks:
             self.poll()
 
+    def _queue_clipboard_poll(self) -> None:
+        if not self._monitoring_enabled or not self._accepting_tasks:
+            return
+        if self._polling:
+            self._poll_requested = True
+            return
+        # Finish WM_CLIPBOARDUPDATE dispatch before asking the owner for data.
+        # Reading inline can enter OLE's retry/message loop before Qt has even
+        # processed the change. A new change also expedites any busy retry.
+        if not self._clipboard_retry_timer.isActive() or self._clipboard_retry_timer.remainingTime() > 0:
+            self._clipboard_retry_timer.start(0)
+
     @staticmethod
     def _validate_image(image: QImage) -> None:
         validate_clipboard_image(image)
@@ -345,6 +359,10 @@ class ClipboardService(QObject):
         return text
 
     def poll(self) -> None:
+        if self._polling:
+            self._poll_requested = True
+            return
+        self._polling = True
         try:
             if self._pending_capture_sequences:
                 pending_sequence = self.clipboard_sequence()
@@ -378,18 +396,18 @@ class ClipboardService(QObject):
                     self._pending_capture_sequences.add(sequence)
                 self._enqueue_task("text", text, sequence)
         except _ClipboardBusy:
-            if (
-                self._clipboard_retry_attempt < len(self.CLIPBOARD_RETRY_DELAYS_MS)
-                and not self._clipboard_retry_timer.isActive()
-            ):
-                index = self._clipboard_retry_attempt
-                self._clipboard_retry_attempt += 1
+            if not self._clipboard_retry_timer.isActive():
+                index = min(self._clipboard_retry_attempt, len(self.CLIPBOARD_RETRY_DELAYS_MS) - 1)
+                self._clipboard_retry_attempt = index + 1
                 self._clipboard_retry_timer.start(self.CLIPBOARD_RETRY_DELAYS_MS[index])
-            elif not self._clipboard_retry_timer.isActive():
-                self._clipboard_retry_attempt = 0
         except Exception as exc:
             self._clipboard_retry_attempt = 0
             self.failed.emit(str(exc))
+        finally:
+            self._polling = False
+            if self._poll_requested:
+                self._poll_requested = False
+                self._queue_clipboard_poll()
 
     def _enqueue_task(self, kind: str, value: QImage | str, sequence: int | None) -> None:
         self._persistence_worker.enqueue(kind, value, sequence)
@@ -499,39 +517,7 @@ class ClipboardService(QObject):
             sequence_before = self.clipboard_sequence()
             if sequence_before is not None and sequence_before == self.last_clipboard_sequence:
                 return None
-            clipboard = self._clipboard()
-            mime = clipboard.mimeData()
-            snapshot: tuple[str, QImage | str] | None
-            candidate_errors: list[ValueError] = []
-            file_paths = None
-            if mime.hasUrls():
-                try:
-                    file_paths = self._snapshot_clipboard_file_paths()
-                except ValueError as exc:
-                    candidate_errors.append(exc)
-            if file_paths is not None:
-                snapshot = (
-                    "text",
-                    file_paths,
-                )
-            elif mime.hasImage():
-                try:
-                    snapshot = (
-                        "image",
-                        self._snapshot_clipboard_image(clipboard),
-                    )
-                except ValueError as exc:
-                    candidate_errors.append(exc)
-                    snapshot = None
-            else:
-                snapshot = None
-            if snapshot is None and mime.hasText():
-                try:
-                    snapshot = ("text", self._snapshot_clipboard_text(clipboard))
-                except ValueError as exc:
-                    candidate_errors.append(exc)
-            if snapshot is None and candidate_errors:
-                raise candidate_errors[-1]
+            snapshot = self._read_clipboard_snapshot()
             sequence_after = self.clipboard_sequence()
             if (
                 sequence_before is not None
@@ -543,7 +529,64 @@ class ClipboardService(QObject):
                 return None
             sequence = sequence_after if sequence_after is not None else sequence_before
             return snapshot[0], snapshot[1], sequence
-        raise RuntimeError("读取剪贴板时内容持续变化，请稍后重试。")
+        raise _ClipboardBusy("Clipboard changed while copying its contents")
+
+    def _read_clipboard_snapshot(self) -> tuple[str, QImage | str] | None:
+        if os.name != "nt":
+            return self._read_qt_clipboard_snapshot()
+        # Qt's OLE MIME object can be unavailable or stale while another
+        # application owns the clipboard. Detect and copy native formats
+        # directly; an OLE format-query failure must not suppress acquisition
+        # or prevent ClipboardBusy from reaching the retry timer.
+        errors: list[ValueError] = []
+        try:
+            paths = self._snapshot_clipboard_file_paths()
+            if paths is not None:
+                return "text", paths
+        except ValueError as exc:
+            errors.append(exc)
+        try:
+            image = self._native_clipboard_image_snapshot()
+            if image is not None:
+                return "image", self._decode_native_clipboard_image(*image)
+        except ValueError as exc:
+            errors.append(exc)
+        try:
+            text = self._native_clipboard_text_snapshot()
+            if text is not None:
+                return "text", text
+        except ValueError as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[-1]
+        return None
+
+    def _read_qt_clipboard_snapshot(self) -> tuple[str, QImage | str] | None:
+        clipboard = self._clipboard()
+        mime = clipboard.mimeData()
+        if mime is None:
+            raise _ClipboardBusy("Qt clipboard data is temporarily unavailable")
+        errors: list[ValueError] = []
+        if mime.hasUrls():
+            try:
+                paths = self._snapshot_clipboard_file_paths()
+                if paths is not None:
+                    return "text", paths
+            except ValueError as exc:
+                errors.append(exc)
+        if mime.hasImage():
+            try:
+                return "image", self._snapshot_clipboard_image(clipboard)
+            except ValueError as exc:
+                errors.append(exc)
+        if mime.hasText():
+            try:
+                return "text", self._snapshot_clipboard_text(clipboard)
+            except ValueError as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[-1]
+        return None
 
     def save_image(self, image: QImage) -> bool:
         result = self._capture_store.save_image(image)

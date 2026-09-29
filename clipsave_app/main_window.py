@@ -37,6 +37,7 @@ from .clipboard_service import ClipboardService
 from .constants import APP_NAME
 from .database import LibraryDatabase
 from .detail_animation_controller import DetailAnimationController
+from .elided_label import ElidedLabel
 from .image_task_controller import ImageOperationPreparationState
 from .library_metadata_controller import (
     MetadataMutationResult,
@@ -479,8 +480,7 @@ class MainWindow(QMainWindow):
         self.window_title_bar.update_maximize_state(self._window_is_maximized())
         self.sidebar.set_active(getattr(self.sidebar, "active_key", ""))
         self.expanded_search_button.setIcon(lucide_icon("sparkles"))
-        self.detail.ai_button.setIcon(lucide_icon("sparkles"))
-        self.detail.ocr_button.setIcon(lucide_icon("scan-text"))
+        self.detail.refresh_theme()
         self.grid.delegate.clear_markdown_documents()
         self.grid.viewport().update()
         self.table.viewport().update()
@@ -577,7 +577,7 @@ class MainWindow(QMainWindow):
         title_bar.setFixedHeight(44)
         title_layout = QHBoxLayout(title_bar)
         title_layout.setContentsMargins(20, 12, 20, 6)
-        self.page_title = QLabel("全部内容")
+        self.page_title = ElidedLabel("全部内容")
         self.page_title.setObjectName("SectionTitle")
         title_layout.addWidget(self.page_title)
         self.result_count = QLabel()
@@ -792,6 +792,7 @@ class MainWindow(QMainWindow):
         stylesheet = stylesheet_for_theme(
             self.dark_theme if dark is None else dark,
             backend=backend,
+            composition_host=bool(getattr(self, "_composition_enabled", False)),
         )
         if self.styleSheet() != stylesheet:
             self.setStyleSheet(stylesheet)

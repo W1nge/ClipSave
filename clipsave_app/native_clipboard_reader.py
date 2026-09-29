@@ -115,7 +115,7 @@ class NativeClipboardReader:
             format_id = int(user32.EnumClipboardFormats(format_id))
             if not format_id:
                 if kernel32.GetLastError() != 0:
-                    raise ValueError("Unable to enumerate clipboard formats")
+                    raise ClipboardBusy("Clipboard formats are temporarily unavailable")
                 return results
             name_buffer = ctypes.create_unicode_buffer(128)
             if not user32.GetClipboardFormatNameW(
@@ -129,7 +129,7 @@ class NativeClipboardReader:
                 continue
             handle = user32.GetClipboardData(format_id)
             if not handle:
-                raise ValueError("Unable to inspect registered clipboard image data")
+                raise ClipboardBusy("Registered clipboard image data is not ready")
             size = int(kernel32.GlobalSize(handle))
             if size <= 0:
                 raise ValueError("Invalid registered clipboard image data")
@@ -154,13 +154,13 @@ class NativeClipboardReader:
         provider = api_provider or cls.windows_clipboard_apis
         try:
             with _opened_clipboard(provider) as (user32, kernel32):
-                errors: list[ValueError] = []
+                errors: list[ValueError | ClipboardBusy] = []
                 try:
                     registered = cls.registered_image_descriptors_locked(
                         user32,
                         kernel32,
                     )
-                except ValueError as exc:
+                except (ValueError, ClipboardBusy) as exc:
                     registered = []
                     errors.append(exc)
                 dibs = []
@@ -173,14 +173,14 @@ class NativeClipboardReader:
                     try:
                         handle = user32.GetClipboardData(format_id)
                         if not handle:
-                            raise ValueError("Unable to inspect clipboard DIB data")
+                            raise ClipboardBusy("Clipboard DIB data is not ready")
                         size = int(kernel32.GlobalSize(handle))
                         if size <= 0:
                             raise ValueError("Invalid clipboard DIB data")
                         if size > MAX_CLIPBOARD_IMAGE_BYTES:
                             raise ValueError("Clipboard image payload is too large")
                         dibs.append((name, handle, size))
-                    except ValueError as exc:
+                    except (ValueError, ClipboardBusy) as exc:
                         errors.append(exc)
                 candidates = registered + dibs
                 for name, handle, size in candidates:
@@ -202,6 +202,12 @@ class NativeClipboardReader:
                     except ValueError as exc:
                         errors.append(exc)
                 if errors:
+                    # Prefer another valid image representation above; if no
+                    # candidate worked, a delayed owner/conversion can still
+                    # supply data on the next read. This is not corrupt data.
+                    for error in errors:
+                        if isinstance(error, ClipboardBusy):
+                            raise error
                     raise errors[-1]
                 return None
         except ValueError:
@@ -220,7 +226,7 @@ class NativeClipboardReader:
                     return None
                 handle = user32.GetClipboardData(cls.CF_UNICODETEXT)
                 if not handle:
-                    raise ValueError("Unable to inspect clipboard text data")
+                    raise ClipboardBusy("Clipboard text data is not ready")
                 size = int(kernel32.GlobalSize(handle))
                 if size <= 0:
                     raise ValueError("Invalid clipboard Unicode text data")
@@ -259,7 +265,7 @@ class NativeClipboardReader:
                     return None
                 drop_handle = user32.GetClipboardData(cls.CF_HDROP)
                 if not drop_handle:
-                    raise ValueError("Unable to inspect clipboard file paths")
+                    raise ClipboardBusy("Clipboard file paths are not ready")
                 count = int(
                     shell32.DragQueryFileW(
                         drop_handle,

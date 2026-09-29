@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import math
 
 from PySide6.QtCore import QModelIndex, QRect, QRectF, QSize, QSizeF, Qt
 from PySide6.QtGui import QFont, QPainter, QPixmap
@@ -134,6 +135,7 @@ class AssetGridTransitionRenderer:
         index: QModelIndex,
         cell_size: QSize,
         layout_signature: tuple[object, ...] | None = None,
+        *, dark: bool | None = None,
     ) -> QPixmap | None:
         record = index.data(AssetItemModel.ItemRole)
         if record is None or cell_size.isEmpty():
@@ -147,7 +149,8 @@ class AssetGridTransitionRenderer:
         # are cached independently from the live delegate, so carrying the
         # application's dark theme through here briefly painted their body
         # text white while the sidebar was moving.
-        dark = dark_theme_active() and not bool(record["favorite"])
+        if dark is None:
+            dark = dark_theme_active() and not bool(record["favorite"])
         font = self.view.font()
         if layout_signature is None:
             layout_signature = self.layout_signature(index, cell_size)
@@ -193,12 +196,12 @@ class AssetGridTransitionRenderer:
             round(device_pixel_ratio, 3),
         )
         cached = self.preview_caches.pop(cache_key, None)
-        if cached is not None:
+        if cached is not None and self.preview_covers(cached, cell_size):
             self.preview_caches[cache_key] = cached
             return cached
         pixmap = QPixmap(
-            max(1, round(preview.width() * device_pixel_ratio)),
-            max(1, round(preview.height() * device_pixel_ratio)),
+            max(1, math.ceil(preview.width() * device_pixel_ratio) + 1),
+            max(1, math.ceil(preview.height() * device_pixel_ratio) + 1),
         )
         pixmap.setDevicePixelRatio(device_pixel_ratio)
         pixmap.fill(Qt.GlobalColor.transparent)
@@ -211,10 +214,23 @@ class AssetGridTransitionRenderer:
             record,
             dark,
             font,
+            # Clip once at the destination card. Pre-clipping the bitmap
+            # doubles edge alpha at fractional DPI and loses partial glyphs
+            # when a larger preview reuses this wrapping signature.
+            clip=False,
         )
         painter.end()
         self._remember_preview(cache_key, pixmap)
         return pixmap
+
+    def preview_covers(self, cache: QPixmap, cell_size: QSize) -> bool:
+        # A wrapping signature can stay unchanged while more of the last
+        # glyph/line becomes visible. A bitmap clipped at the smaller size
+        # cannot supply those pixels when the paper grows.
+        preview = self.delegate.preview_rect(QRect(0, 0, cell_size.width(), cell_size.height()))
+        dpr = cache.devicePixelRatioF()
+        return (cache.width() >= math.ceil(preview.width() * dpr) + 1
+                and cache.height() >= math.ceil(preview.height() * dpr) + 1)
 
     def _remember_preview(self, key: tuple[object, ...], pixmap: QPixmap) -> None:
         self.preview_caches[key] = pixmap

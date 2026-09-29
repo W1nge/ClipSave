@@ -9,6 +9,11 @@ on:
         description: Existing tag to publish (for example v1.1.1)
         required: false
         type: string
+      replace_draft:
+        description: Rebuild and replace assets of an existing unpublished draft
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -29,6 +34,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
+          REPLACE_DRAFT: ${{ inputs.replace_draft }}
         run: |
           if ($env:INPUT_TAG) {
             $tag = $env:INPUT_TAG.Trim()
@@ -60,11 +66,17 @@ jobs:
 
           $releaseResponse = Invoke-WebRequest -Headers $headers -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" -SkipHttpErrorCheck
           if ($releaseResponse.StatusCode -eq 200) {
-            Write-Host "Release $tag already exists; nothing to publish."
-            "should_release=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-            exit 0
+            $existingRelease = $releaseResponse.Content | ConvertFrom-Json
+            if ($env:REPLACE_DRAFT -eq 'true') {
+              if (-not $existingRelease.draft) { throw 'Only unpublished drafts may be replaced.' }
+              "replace_draft=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            } else {
+              Write-Host "Release $tag already exists; nothing to publish."
+              "should_release=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              exit 0
+            }
           }
-          if ($releaseResponse.StatusCode -ne 404) {
+          if ($releaseResponse.StatusCode -ne 200 -and $releaseResponse.StatusCode -ne 404) {
             throw "Could not check release $tag (HTTP $($releaseResponse.StatusCode))"
           }
 
@@ -210,4 +222,12 @@ jobs:
             "build\release\ClipSave-$version-windows-x64-installer.exe",
             "build\release\ClipSave-$version-windows-x64-installer.exe.sha256"
           )
-          gh release create $tag $assets --repo "${{ github.repository }}" --title "ClipSave $version" --notes-file .\build\release-notes.md --verify-tag --draft
+          if ('${{ steps.meta.outputs.replace_draft }}' -eq 'true') {
+            $draft = gh release view $tag --repo "${{ github.repository }}" --json isDraft | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or -not $draft.isDraft) { throw 'The release must still be an unpublished draft.' }
+            gh release upload $tag $assets --repo "${{ github.repository }}" --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Could not replace draft assets.' }
+            gh release edit $tag --repo "${{ github.repository }}" --draft --title "ClipSave $version" --notes-file .\build\release-notes.md
+          } else {
+            gh release create $tag $assets --repo "${{ github.repository }}" --title "ClipSave $version" --notes-file .\build\release-notes.md --verify-tag --draft
+          }

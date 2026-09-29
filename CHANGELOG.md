@@ -5,9 +5,20 @@
 - On Windows 10, Acrylic and the Qt foreground now share one native window and composition clip. Resizing from the left/top keeps their edges aligned while the cached Qt backing store drives live card reflow.
 - Connected keyboard and Chinese IME input to that host, including focus recovery after resize, candidate positioning, and normal minimize/tray/close behavior.
 - Reused card and text preview caches during resize and sidebar transitions, preserving text size and improving reflow performance for large grids.
+- Kept text wrapping and preview clipping aligned with each moving card during resize, including cache growth and fractional-DPI transitions back to settled cards.
+- Made paper layers opaque and restored the underlying card's content during peeling, with a flat, unprinted folded back and no gradient, highlight, or shadow coating.
+- Softened paper removal with a detached drift, slight rotation and a 360 ms fade, while keeping the original peel speed, opaque paper during the peel, and its moving outline.
+- Kept dragged paper moving and fading along the release direction, with full detachment in every direction instead of a fixed bottom-left destination.
+- Improved the resting fold's visibility on yellow paper with a darker warm outline and crease.
+- Kept long tags and collection headings within narrow panels, added explicit tag removal buttons, and preserved text preview position and selection during metadata updates.
+- Redesigned item details with pinned actions, content-sized text previews, distinct collection/tag/note sections, collapsible metadata, and image-only recognition tools. Long Markdown opens at the beginning, and missing images show an explicit state.
+- Fixed native-host wheel routing through child widgets into enclosing scroll areas, including detail labels and handoff from short previews or the end of long text.
+- Kept the detail collection picker inside the main composition surface, anchored to its field; wheel scrolling no longer changes an item's collection.
+- Restored task execution after a refused shutdown, closed late AI connections after cancellation, and prevented the original card outline from showing across lifted paper while preserving the lifted sheet's own moving outline.
+- Fixed missed external clipboard captures by detecting Windows formats directly, deferring notification reads, and retrying busy or not-yet-rendered clipboard data without committing the change as processed.
 - Upgraded PySide6/Qt to 6.9.3 to fix repeated `qt_imageToWinHBITMAP, failed to create dibsection` errors and UI stalls when dragging the window over the taskbar.
 - Deleting an item now keeps the detail panel open instead of collapsing it while the grid updates.
-- Tuned dark-mode Acrylic to blur 10, saturation 2.0 and #181B20 tint at 100/255 alpha; removed the top and sidebar black overlays and set the search overlay to 100/255.
+- Tuned dark-mode Acrylic to blur 8, saturation 0.77 and #2D2D2D tint at 98/255 alpha; removed the top and sidebar black overlays and set the search overlay to 100/255.
 - Moved card timestamps left by 1 px, kept text previews at a fixed font size during card movement, restored dragging on frameless windows with an imperceptible Acrylic hit-test layer, and prevented raw HTML in captured Markdown from hiding later entries.
 - Hardened clipboard capture, background-job cancellation, usage-journal recovery and schema downgrade handling; improved Markdown previews and error diagnostics.
 

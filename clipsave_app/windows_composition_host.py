@@ -12,8 +12,9 @@ import logging
 import os
 
 from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, Qt, QTimer
-from PySide6.QtGui import QContextMenuEvent, QEnterEvent, QImage, QMouseEvent, QWheelEvent
+from PySide6.QtGui import QContextMenuEvent, QEnterEvent, QHoverEvent, QImage, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget
+from shiboken6 import isValid
 
 from .native_window_controller import windows_resize_hit_test
 from .windows_composition_input import WindowsCompositionInput
@@ -31,6 +32,11 @@ class WindowClass(C.Structure):
                ('lpszClassName', W.LPCWSTR), ('hIconSm', W.HICON)]
 
 
+class MouseTracking(C.Structure):
+    _fields_ = [('size', W.DWORD), ('flags', W.DWORD),
+                ('hwnd', W.HWND), ('hover_time', W.DWORD)]
+
+
 class WindowsCompositionHost:
     def __init__(self, window, bridge):
         self.window, self.bridge = window, bridge
@@ -44,6 +50,8 @@ class WindowsCompositionHost:
             'ClientToScreen': ([W.HWND, C.POINTER(W.POINT)], W.BOOL),
             'ScreenToClient': ([W.HWND, C.POINTER(W.POINT)], W.BOOL),
             'SetCapture': ([W.HWND], W.HWND), 'ReleaseCapture': ([], W.BOOL),
+            'GetCapture': ([], W.HWND),
+            'TrackMouseEvent': ([C.POINTER(MouseTracking)], W.BOOL),
             'SetFocus': ([W.HWND], W.HWND), 'GetFocus': ([], W.HWND),
             'GetForegroundWindow': ([], W.HWND),
             'SetForegroundWindow': ([W.HWND], W.BOOL),
@@ -67,6 +75,8 @@ class WindowsCompositionHost:
         self.frame_count = 0
         self.errors = []
         self.qt_capture = self.qt_hover = None
+        self._hover_position = self._hover_global = QPointF()
+        self._mouse_leave_tracking = False
         self.frame_timer = QTimer(window)
         self.frame_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.frame_timer.timeout.connect(self.frame_tick)
@@ -107,6 +117,7 @@ class WindowsCompositionHost:
             self.frame_timer.start()
 
     def hide(self):
+        self.clear_hover()
         self.visible = False
         self.frame_timer.stop()
         self.user.ShowWindow(self.hwnd, 0)
@@ -175,6 +186,12 @@ class WindowsCompositionHost:
                     return 1
             if message == 0x14:
                 return 1
+            if message == 0x2A3:  # WM_MOUSELEAVE, including entry into the caption.
+                self._mouse_leave_tracking = False
+                self.clear_hover()
+                return 0
+            if message == 6 and int(wp) & 0xffff == 0:  # WA_INACTIVE
+                self.clear_hover()
             if message in (0x200, 0x201, 0x202, 0x203, 0x204, 0x205, 0x206,
                            0x207, 0x208, 0x209, 0x20A):
                 self.forward_mouse(message, wp, lp)
@@ -204,7 +221,10 @@ class WindowsCompositionHost:
                 self.window.window_title_bar.update_maximize_state(bool(self.user.IsZoomed(hwnd)))
                 if minimized:
                     self.frame_timer.stop()
-                elif self.visible:
+                elif self.visible and not self.frame_timer.isActive():
+                    # QTimer.start() restarts an active timer. A burst of size
+                    # messages must not postpone every frame until dragging
+                    # stops; only resume a timer stopped by minimization.
                     self.frame_timer.start()
             if message == 0x10:
                 # Keep the application's notes/shutdown/close-to-tray policy.
@@ -218,9 +238,33 @@ class WindowsCompositionHost:
             return 0
         return self.user.DefWindowProcW(hwnd, message, wp, lp)
 
+    def clear_hover(self):
+        previous, self.qt_hover = self.qt_hover, None
+        if previous is None or not isValid(previous):
+            return
+        QCoreApplication.sendEvent(previous, QEvent(QEvent.Type.Leave))
+        if isValid(previous) and previous.testAttribute(Qt.WidgetAttribute.WA_Hover):
+            # Leave changes underMouse(), but styled widgets need HoverLeave
+            # to invalidate the pixels already cached in Qt's backing store.
+            QCoreApplication.sendEvent(previous, QHoverEvent(
+                QEvent.Type.HoverLeave, QPointF(-1, -1), self._hover_global,
+                self._hover_position))
+
     def forward_mouse(self, message, wp, lp):
         if not self.window.isEnabled() or QApplication.activeModalWidget() is not None:
             return
+        if not self._mouse_leave_tracking:
+            tracking = MouseTracking(C.sizeof(MouseTracking), 2, self.hwnd, 0)
+            self._mouse_leave_tracking = bool(self.user.TrackMouseEvent(C.byref(tracking)))
+        # Qt rebuilds sidebar buttons when counts/navigation change. Python
+        # references outlive their deleted C++ widgets, so discard stale hover
+        # and press targets before sending Leave or calculating coordinates.
+        if self.qt_hover is not None and not isValid(self.qt_hover):
+            self.qt_hover = None
+        if self.qt_capture is not None and not isValid(self.qt_capture):
+            self.qt_capture = None
+            if self.user.GetCapture() == self.hwnd:
+                self.user.ReleaseCapture()
         point = W.POINT(C.c_short(lp & 0xffff).value, C.c_short((lp >> 16) & 0xffff).value)
         if message == 0x20A:
             self.user.ScreenToClient(self.hwnd, C.byref(point))
@@ -235,14 +279,30 @@ class WindowsCompositionHost:
                 buttons |= button
         modifiers = self.input.modifiers()
         if target is not self.qt_hover:
-            if self.qt_hover is not None:
-                QCoreApplication.sendEvent(self.qt_hover, QEvent(QEvent.Type.Leave))
+            self.clear_hover()
             self.qt_hover = target
             QCoreApplication.sendEvent(target, QEnterEvent(QPointF(local), QPointF(scene), QPointF(global_point)))
+            if target.testAttribute(Qt.WidgetAttribute.WA_Hover):
+                QCoreApplication.sendEvent(target, QHoverEvent(
+                    QEvent.Type.HoverEnter, QPointF(local), QPointF(global_point),
+                    QPointF(-1, -1), modifiers))
+        self._hover_position, self._hover_global = QPointF(local), QPointF(global_point)
         if message == 0x20A:
-            event = QWheelEvent(QPointF(local), QPointF(global_point), QPoint(),
-                QPoint(0, C.c_short((wp >> 16) & 0xffff).value), buttons, modifiers,
-                Qt.ScrollPhase.NoScrollPhase, False)
+            delta = C.c_short((wp >> 16) & 0xffff).value
+            angle = QPoint(0, delta)
+            # sendEvent creates a non-spontaneous Qt wheel event; unlike the
+            # platform dispatcher it does not bubble ignored wheels through
+            # child labels/layouts to the enclosing scroll viewport.
+            while target is not None and isValid(target):
+                local = target.mapFrom(self.window, scene)
+                event = QWheelEvent(QPointF(local), QPointF(global_point), QPoint(),
+                    angle, buttons, modifiers, Qt.ScrollPhase.NoScrollPhase, False)
+                event.ignore()
+                QCoreApplication.sendEvent(target, event)
+                if event.isAccepted() or not isValid(target):
+                    break
+                target = target.parentWidget()
+            return
         else:
             pressed = message in (0x201, 0x204, 0x207)
             released = message in (0x202, 0x205, 0x208)

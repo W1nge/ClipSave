@@ -43,7 +43,7 @@ internal static partial class AcrylicBridge
     private static Windows.UI.Color TintColor(bool dark)
     {
         return dark
-            ? Windows.UI.Color.FromArgb(0x64, 0x18, 0x1B, 0x20)
+            ? Windows.UI.Color.FromArgb(0x62, 0x2D, 0x2D, 0x2D)
             : Windows.UI.Color.FromArgb(0x48, 0xF6, 0xF7, 0xF9);
     }
 
@@ -204,7 +204,7 @@ internal static partial class AcrylicBridge
             GaussianBlurEffect blurEffect = new()
             {
                 Name = "BackdropBlur",
-                BlurAmount = dark ? 10.0f : 20.0f,
+                BlurAmount = dark ? 8.0f : 20.0f,
                 BorderMode = EffectBorderMode.Hard,
                 Optimization = EffectOptimization.Speed,
                 Source = new CompositionEffectSourceParameter("Backdrop"),
@@ -212,7 +212,7 @@ internal static partial class AcrylicBridge
             SaturationEffect acrylicEffect = new()
             {
                 Name = "BackdropSaturation",
-                Saturation = dark ? 2.0f : 1.25f,
+                Saturation = dark ? 0.77f : 1.25f,
                 Source = blurEffect,
             };
             _blurEffectFactory = _compositor.CreateEffectFactory(acrylicEffect);

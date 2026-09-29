@@ -56,6 +56,7 @@ class BoundedTaskExecutor:
         self._pending_count = 0
         self._accepting = True
         self._shutdown_sentinels_enqueued = 0
+        self._retiring_workers: set[threading.Thread] = set()
         self._workers = [
             threading.Thread(
                 target=self._worker_loop,
@@ -100,8 +101,16 @@ class BoundedTaskExecutor:
         while True:
             task = self._queue.get()
             if task is None:
+                with self._lock:
+                    stopping = not self._accepting
+                    if stopping:
+                        # Record the decision before returning: is_alive()
+                        # alone cannot distinguish an exiting worker.
+                        self._retiring_workers.add(threading.current_thread())
                 self._queue.task_done()
-                return
+                if stopping:
+                    return
+                continue
             try:
                 if not task.handle.cancelled:
                     task.target(task.handle.cancel_event)
@@ -165,14 +174,21 @@ class BoundedTaskExecutor:
         and re-open submission, so a refused quit leaves a usable executor
         instead of a poisoned one.
         """
-        with self._queue.mutex:
-            self._queue.queue[:] = [
-                task for task in self._queue.queue if task is not None
-            ]
         with self._lock:
+            with self._queue.mutex:
+                retained = [task for task in self._queue.queue if task is not None]
+                removed = len(self._queue.queue) - len(retained)
+                self._queue.queue.clear()
+                self._queue.queue.extend(retained)
+                self._queue.unfinished_tasks -= removed
+                self._queue.not_full.notify_all()
+                if self._queue.unfinished_tasks == 0:
+                    self._queue.all_tasks_done.notify_all()
             self._shutdown_sentinels_enqueued = 0
             self._accepting = True
-            self._workers[:] = [worker for worker in self._workers if worker.is_alive()]
+            self._workers[:] = [worker for worker in self._workers
+                                if worker.is_alive() and worker not in self._retiring_workers]
+            self._retiring_workers.clear()
             for index in range(self.max_active - len(self._workers)):
                 replacement = threading.Thread(
                     target=self._worker_loop,

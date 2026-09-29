@@ -1,8 +1,10 @@
 import locale
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -11,6 +13,44 @@ from clipsave_app.constants import APP_VERSION
 
 
 class ReleaseContractTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell 7 is required')
+    def test_only_explicit_unpublished_drafts_can_be_rebuilt(self):
+        workflow = Path('.github/workflows/release.yml').read_text(encoding='utf-8')
+        step = workflow.split('      - name: Resolve release tag', 1)[1].split('      - name: Checkout tagged source', 1)[0]
+        resolver = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        # GitHub expands these before PowerShell parses the step.
+        resolver = re.sub(r'\$\{\{.*?\}\}', 'test', resolver)
+        mock = '''
+$ErrorActionPreference = 'Stop'
+function Invoke-WebRequest {
+    param($Headers, $Uri, [switch]$SkipHttpErrorCheck)
+    if ($Uri.Contains('/git/ref/tags/')) {
+        return [pscustomobject]@{StatusCode=200; Content='{}'}
+    }
+    return [pscustomobject]@{StatusCode=[int]$env:MOCK_STATUS; Content=$env:MOCK_RELEASE}
+}
+'''
+        for status, draft, replace, success, release, replaced in (
+            (200, True, True, True, True, True),
+            (200, False, True, False, False, False),
+            (200, True, False, True, False, False),
+            (404, False, False, True, True, False),
+        ):
+            with self.subTest(status=status, draft=draft, replace=replace), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                script = root / 'resolve.ps1'
+                script.write_text(mock + resolver, encoding='utf-8')
+                output = root / 'output.txt'
+                env = dict(os.environ, INPUT_TAG='v1.1.5', REPLACE_DRAFT=str(replace).lower(),
+                           MOCK_STATUS=str(status), MOCK_RELEASE='{"draft":' + str(draft).lower() + '}',
+                           GITHUB_OUTPUT=str(output))
+                result = subprocess.run([shutil.which('pwsh'), '-NoProfile', '-File', str(script)],
+                                        env=env, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode == 0, success, result.stderr.decode(errors='replace'))
+                flags = output.read_text(encoding='utf-8-sig') if output.exists() else ''
+                self.assertEqual('should_release=true' in flags, release)
+                self.assertEqual('replace_draft=true' in flags, replaced)
+
     def test_release_stays_draft_until_desktop_gates_pass(self):
         workflow = Path('.github/workflows/release.yml').read_text(encoding='utf-8')
         publish = next(line for line in workflow.splitlines() if 'gh release create ' in line)

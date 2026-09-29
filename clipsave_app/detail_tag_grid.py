@@ -1,10 +1,38 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QGridLayout, QPushButton, QSizePolicy, QWidget
+from PySide6.QtWidgets import QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QWidget
 
+from .elided_label import ElidedLabel
 from .ui_primitives import color_dot
+
+
+class DetailTagChip(QFrame):
+    remove_requested = Signal(str)
+
+    def __init__(self, name: str, color: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TagChip")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 4, 4)
+        layout.setSpacing(4)
+        dot = QLabel()
+        dot.setPixmap(color_dot(color, 10))
+        dot.setFixedSize(10, 10)
+        layout.addWidget(dot)
+        self.label = ElidedLabel(name)
+        layout.addWidget(self.label, 1)
+        self.remove_button = QPushButton("×")
+        self.remove_button.setObjectName("TagRemoveButton")
+        self.remove_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.remove_button.setToolTip(f"从当前条目移除标签：{name}")
+        self.remove_button.setAccessibleName(self.remove_button.toolTip())
+        self.remove_button.clicked.connect(lambda: self.remove_requested.emit(name))
+        layout.addWidget(self.remove_button)
+
+    def text(self) -> str:
+        return self.label.text()
 
 
 class DetailTagGrid(QWidget):
@@ -48,32 +76,15 @@ class DetailTagGrid(QWidget):
         while self.grid.count():
             item = self.grid.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
         self.more_button = None
         visible_names = self.names if self.expanded else self.names[:4]
         for index, name in enumerate(visible_names):
-            button = QPushButton()
-            button.setObjectName("TagChip")
-            button.setText(
-                button.fontMetrics().elidedText(
-                    name,
-                    Qt.TextElideMode.ElideRight,
-                    108,
-                )
-            )
-            button.setMinimumWidth(0)
-            button.setMaximumWidth(130)
-            button.setSizePolicy(
-                QSizePolicy.Policy.Expanding,
-                QSizePolicy.Policy.Fixed,
-            )
             color = self.colors[index] if index < len(self.colors) else "#64748b"
-            button.setIcon(QIcon(color_dot(color)))
-            button.setToolTip(f"{name}\n点击移除标签")
-            button.clicked.connect(
-                lambda _checked=False, tag=name: self.remove_requested.emit(tag)
-            )
-            self.grid.addWidget(button, index // 2, index % 2)
+            chip = DetailTagChip(name, color)
+            chip.remove_requested.connect(self.remove_requested)
+            self.grid.addWidget(chip, index // 2, index % 2)
         if len(self.names) > 4:
             more = QPushButton()
             more.setObjectName("TagMoreButton")

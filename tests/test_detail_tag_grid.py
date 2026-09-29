@@ -55,6 +55,6 @@ class DetailTagGridTests(unittest.TestCase):
         grid.remove_requested.connect(removed.append)
         grid.set_tags("work", "#64748b")
 
-        grid.grid.itemAt(0).widget().click()
+        grid.grid.itemAt(0).widget().remove_button.click()
 
         self.assertEqual(removed, ["work"])

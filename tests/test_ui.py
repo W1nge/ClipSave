@@ -105,6 +105,25 @@ class MainWindowTests(unittest.TestCase):
                     QApplication.sendEvent(bar, event)
                 self.assertEqual(self.window.pos(), QPoint(126, 114))
 
+    def test_long_collection_title_elides_with_details_open(self):
+        name = "用于整理本季度产品设计与开发讨论的收藏集资料"
+        collection_id = self.database.create_collection(name)
+        self.window.refresh_library()
+        self.window.navigate('collection', collection_id)
+        item_id = self.database.add_text('标题布局测试内容')
+        self.database.set_collection(item_id, collection_id)
+        self.window.refresh_library()
+        self.window.resize(800, 440)
+        self.window.show_item_detail(item_id)
+        self.assertTrue(wait_for(lambda: not self.window.detail_animation_controller.active))
+        label = self.window.page_title
+        self.assertEqual(label.text(), name)
+        self.assertEqual(label.toolTip(), name)
+        self.assertIn('…', label.display_text())
+        self.assertLessEqual(label.fontMetrics().horizontalAdvance(label.display_text()), label.width())
+        self.assertLessEqual(label.geometry().right(), self.window.result_count.geometry().left())
+        self.assertEqual(self.window.width(), 800)
+
     def test_panels_and_navigation(self):
         self.assertEqual(self.window.windowTitle(), "ClipSave")
         self.assertTrue(self.window.windowFlags() & Qt.WindowType.FramelessWindowHint)
@@ -1180,6 +1199,7 @@ class MainWindowTests(unittest.TestCase):
         content_heights = []
         preview_geometries = []
         meta_geometries = []
+        header_geometries = []
         card_rects = []
         card = overlay.cards[0]
         for progress in (0.0, 0.25, 0.5, 0.75, 1.0):
@@ -1190,6 +1210,7 @@ class MainWindowTests(unittest.TestCase):
             content_heights.append(self.window.detail.content_widget.height())
             preview_geometries.append(self.window.detail.preview_stack.geometry())
             meta_geometries.append(self.window.detail.meta.geometry())
+            header_geometries.append(self.window.detail.header.geometry())
             card_rects.append(overlay.card_rect(card.row))
 
         self.assertEqual(widths, sorted(widths))
@@ -1205,6 +1226,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(len(set(content_heights)), 1)
         self.assertEqual(len(set(preview_geometries)), 1)
         self.assertEqual(len(set(meta_geometries)), 1)
+        self.assertEqual(len(set(header_geometries)), 1)
         self.assertTrue(self.window.detail._width_transition_layout_frozen)
         for progress, actual in zip(
             (0.0, 0.25, 0.5, 0.75, 1.0),
@@ -1230,6 +1252,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.detail._width_transition_active)
         self.assertFalse(self.window.detail._width_transition_layout_frozen)
         self.assertTrue(self.window.detail.isVisible())
+        self.assertEqual(self.window.detail.header.geometry(), header_geometries[-1])
         self.assertEqual(
             self.window.detail.content_widget.width(),
             fixed_content_width,

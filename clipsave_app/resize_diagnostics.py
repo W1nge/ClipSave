@@ -145,7 +145,9 @@ class ResizeTrace(QObject):
         self.events.append(item)
 
     def eventFilter(self, watched, event):
-        if self.active:
+        # Qt can deliver teardown events after Python has cleared a wrapper
+        # involved in a parent/child reference cycle.
+        if getattr(self, "active", False):
             name = self._watched.get(watched)
             if name is not None and event.type() in (
                 QEvent.Type.Paint, QEvent.Type.Resize,
